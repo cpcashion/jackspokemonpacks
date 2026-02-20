@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jack's Pokemon Packs | AI Card Deal Finder</title>
+    <meta name="description"
+        content="Jack's Pokemon Packs — AI-powered agent that finds underpriced Pokemon cards across eBay, Mercari, OfferUp, and Facebook Marketplace.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;700&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <!-- Navigation -->
+    <nav class="nav" id="nav">
+        <div class="nav-left">
+            <span class="nav-logo-icon">⚡</span>
+            <span class="nav-logo-text">Jack's Pokemon Packs</span>
+        </div>
+        <div class="nav-links">
+            <a href="#hero" class="nav-link active">Home</a>
+            <a href="#scanner" class="nav-link">Live Scanner</a>
+            <a href="#deals" class="nav-link">Deals</a>
+        </div>
+        <div class="nav-status">
+            <span class="nav-pulse"></span>
+            <span id="navStatusText">Starting...</span>
+        </div>
+    </nav>
+
+    <!-- ═══════════ SECTION 1: HERO ═══════════ -->
+    <section class="hero" id="hero">
+        <div class="background-glow"></div>
+        <div class="particles" id="particles"></div>
+
+        <div class="hero-content">
+            <header class="hero-header">
+                <h1 class="logo">
+                    <span class="logo-icon">⚡</span>
+                    Jack's Pokemon Packs
+                </h1>
+                <p class="hero-subtitle">AI-Powered Card Deal Finder</p>
+            </header>
+
+            <div class="card-showcase">
+                <div class="card-container" id="card-container">
+                    <div class="card" id="pokemon-card">
+                        <div class="card-inner">
+                            <div class="card-face card-front">
+                                <div class="card-shine"></div>
+                                <div class="card-glare"></div>
+                                <div class="holographic-overlay"></div>
+                                <img src="card.png" alt="Holographic Pokemon Card" class="card-image">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <a href="#scanner" class="hero-cta">
+                <span class="cta-icon">🔍</span>
+                View Live Scanner
+                <span class="cta-arrow">↓</span>
+            </a>
+        </div>
+    </section>
+
+    <!-- ═══════════ SECTION 2: LIVE SCANNER ═══════════ -->
+    <section class="scanner-section" id="scanner">
+        <!-- Stats Bar -->
+        <div class="stats-bar">
+            <div class="stat-card">
+                <div class="stat-value" id="statListings">0</div>
+                <div class="stat-label">Listings Scanned</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statAnalyzed">0</div>
+                <div class="stat-label">Cards Analyzed by AI</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statDeals">0</div>
+                <div class="stat-label">Deals Found</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="statNextScan">—</div>
+                <div class="stat-label">Next Scan</div>
+            </div>
+        </div>
+
+        <!-- Live Activity Panel -->
+        <div class="activity-panel">
+            <div class="activity-header">
+                <h2>🔍 Live Scanner Activity</h2>
+                <div class="live-badge">
+                    <span class="live-dot"></span>
+                    LIVE
+                </div>
+            </div>
+
+            <!-- Current AI Analysis (featured) -->
+            <div class="ai-current" id="aiCurrent" style="display:none;">
+                <div class="ai-current-image">
+                    <img id="aiCurrentImg" src="" alt="Card being analyzed">
+                    <div class="ai-scanning-overlay" id="aiScanOverlay">
+                        <div class="scanning-line"></div>
+                        <span>AI Analyzing...</span>
+                    </div>
+                </div>
+                <div class="ai-current-info">
+                    <div class="ai-current-title" id="aiCurrentTitle">Analyzing...</div>
+                    <div class="ai-result" id="aiResult" style="display:none;">
+                        <div class="ai-result-row">
+                            <span class="ai-label">Card:</span>
+                            <span class="ai-value" id="aiCardName">—</span>
+                        </div>
+                        <div class="ai-result-row">
+                            <span class="ai-label">Set:</span>
+                            <span class="ai-value" id="aiCardSet">—</span>
+                        </div>
+                        <div class="ai-result-row">
+                            <span class="ai-label">Rarity:</span>
+                            <span class="ai-value" id="aiCardRarity">—</span>
+                        </div>
+                        <div class="ai-result-row">
+                            <span class="ai-label">Condition:</span>
+                            <span class="ai-value" id="aiCardCondition">—</span>
+                        </div>
+                        <div class="ai-result-row">
+                            <span class="ai-label">Confidence:</span>
+                            <span class="ai-value" id="aiCardConfidence">—</span>
+                        </div>
+                        <div class="ai-result-divider"></div>
+                        <div class="ai-result-row price-row">
+                            <span class="ai-label">Listed:</span>
+                            <span class="ai-value listed-price" id="aiListedPrice">—</span>
+                        </div>
+                        <div class="ai-result-row price-row">
+                            <span class="ai-label">Market Value:</span>
+                            <span class="ai-value market-price" id="aiMarketPrice">—</span>
+                        </div>
+                        <div class="ai-result-row" id="aiVerdictRow" style="display:none;">
+                            <span class="ai-verdict" id="aiVerdict"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Activity Log -->
+            <div class="activity-log" id="activityLog">
+                <div class="log-entry log-placeholder">
+                    <span class="log-icon">⏳</span>
+                    <span class="log-text">Waiting for scanner to start...</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ═══════════ SECTION 3: DEALS ═══════════ -->
+    <section class="deals-section" id="deals">
+        <div class="deals-header">
+            <h2>🎯 Discovered Deals</h2>
+            <div class="deal-filters">
+                <button class="filter-btn active" data-filter="all">All</button>
+                <button class="filter-btn" data-filter="incredible">🔥 Incredible</button>
+                <button class="filter-btn" data-filter="great">💎 Great</button>
+                <button class="filter-btn" data-filter="good">👍 Good</button>
+            </div>
+        </div>
+
+        <div class="deal-grid" id="dealGrid">
+            <div class="empty-state" id="emptyState">
+                <div class="empty-icon">🔍</div>
+                <h3>Scanning marketplaces...</h3>
+                <p>Deals will appear here as the AI discovers underpriced Pokemon cards across eBay, Mercari, OfferUp,
+                    and Facebook Marketplace.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Toast -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>

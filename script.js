@@ -351,7 +351,7 @@ let currentFilter = 'all';
 
 async function fetchDeals() {
     try {
-        const resp = await fetch('/api/deals?limit=100');
+        const resp = await fetch('/api/deals?limit=5000');
         const deals = await resp.json();
         allDeals = deals;
         if (currentFeed === 'deals') renderDeals();
@@ -360,7 +360,7 @@ async function fetchDeals() {
 
 async function fetchCards() {
     try {
-        const resp = await fetch('/api/cards?limit=200');
+        const resp = await fetch('/api/cards?limit=5000');
         const cards = await resp.json();
         allCards = cards;
         if (currentFeed === 'all') renderDeals();
@@ -460,17 +460,17 @@ function dealCardHTML(d) {
                 <span class="deal-market-price ${!d.market_price ? 'hidden' : ''}">$${(d.market_price || 0).toFixed(2)}</span>
             </div>
             
+            <div class="date-listed-label" style="font-size: 11px; color: var(--text-muted); margin-top: 10px;">
+                Listed: ${new Date(d.posted_at || d.created_at).toLocaleString()}
+            </div>
+            
             ${isDeal ? `
             <div class="discount-bar"><div class="discount-bar-fill" style="width:${Math.min((d.discount_pct || 0) * 100, 100)}%"></div></div>
             <div class="deal-discount-label">
                 <span>Save $${((d.market_price || 0) - (d.listing_price || 0)).toFixed(2)}</span>
                 <span class="deal-discount-value">${disc} OFF</span>
             </div>
-            ` : `
-            <div class="date-listed-label" style="font-size: 11px; color: var(--text-muted); margin-top: 10px;">
-                Listed: ${new Date(d.posted_at || d.created_at).toLocaleString()}
-            </div>
-            `}
+            ` : ''}
             
             <a href="${d.listing_url || '#'}" target="_blank" rel="noopener" class="deal-buy-btn">BUY NOW →</a>
         </div>

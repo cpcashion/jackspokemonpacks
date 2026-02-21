@@ -107,13 +107,13 @@ function insertDeal(d) {
     return db.prepare(`INSERT INTO deals(listing_id,card_id,listing_price,market_price,discount_pct,deal_tier,deal_score)
     VALUES(?,?,?,?,?,?,?)`).run(d.listingId, d.cardId, d.listingPrice, d.marketPrice, d.discountPct, d.dealTier, d.dealScore).lastInsertRowid;
 }
-function getRecentDeals(limit = 50) {
+function getRecentDeals(limit = 5000) {
     return db.prepare(`SELECT d.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.watchers,
     c.card_name,c.card_set,c.card_number,c.rarity,c.condition_est,c.is_holo,c.is_1st_ed,c.confidence
     FROM deals d JOIN listings l ON d.listing_id=l.id LEFT JOIN identified_cards c ON d.card_id=c.id
     ORDER BY d.created_at DESC LIMIT ?`).all(limit);
 }
-function getRecentCards(limit = 100) {
+function getRecentCards(limit = 5000) {
     return db.prepare(`SELECT c.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.posted_at,l.price,l.watchers
     FROM identified_cards c JOIN listings l ON c.listing_id=l.id
     ORDER BY c.created_at DESC LIMIT ?`).all(limit);
@@ -1062,14 +1062,14 @@ app.use(express.static(__dirname));
 
 // API: recent deals
 app.get('/api/deals', (req, res) => {
-    const limit = parseInt(req.query.limit || '50', 10);
+    const limit = parseInt(req.query.limit || '5000', 10);
     const deals = getRecentDeals(limit);
     res.json(deals.map(d => ({ ...d, image_urls: d.image_urls ? JSON.parse(d.image_urls) : [] })));
 });
 
 // API: all identified cards
 app.get('/api/cards', (req, res) => {
-    const limit = parseInt(req.query.limit || '100', 10);
+    const limit = parseInt(req.query.limit || '5000', 10);
     const cards = getRecentCards(limit);
     res.json(cards.map(c => ({ ...c, image_urls: c.image_urls ? JSON.parse(c.image_urls) : [] })));
 });

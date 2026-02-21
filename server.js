@@ -73,7 +73,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS listings (
     id TEXT PRIMARY KEY, marketplace TEXT, title TEXT, price REAL,
     image_urls TEXT, listing_url TEXT, posted_at TEXT, seller TEXT,
-    location TEXT, first_seen_at TEXT DEFAULT (datetime('now'))
+    location TEXT, first_seen_at TEXT DEFAULT (datetime('now')),
+    watchers INTEGER DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS identified_cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id TEXT,
@@ -95,8 +96,8 @@ db.exec(`
 
 function isListingSeen(id) { return !!db.prepare('SELECT 1 FROM listings WHERE id=?').get(id); }
 function insertListing(l) {
-    return db.prepare(`INSERT OR IGNORE INTO listings(id,marketplace,title,price,image_urls,listing_url,posted_at,seller,location)
-    VALUES(?,?,?,?,?,?,?,?,?)`).run(l.id, l.marketplace, l.title, l.price, JSON.stringify(l.imageUrls || []), l.listingUrl, l.postedAt, l.seller || '', l.location || '').changes > 0;
+    return db.prepare(`INSERT OR IGNORE INTO listings(id,marketplace,title,price,image_urls,listing_url,posted_at,seller,location,watchers)
+    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(l.id, l.marketplace, l.title, l.price, JSON.stringify(l.imageUrls || []), l.listingUrl, l.postedAt, l.seller || '', l.location || '', l.watchers || 0).changes > 0;
 }
 function insertCard(c) {
     return db.prepare(`INSERT INTO identified_cards(listing_id,card_name,card_set,card_number,rarity,condition_est,is_holo,is_1st_ed,confidence,market_price)
@@ -107,10 +108,15 @@ function insertDeal(d) {
     VALUES(?,?,?,?,?,?,?)`).run(d.listingId, d.cardId, d.listingPrice, d.marketPrice, d.discountPct, d.dealTier, d.dealScore).lastInsertRowid;
 }
 function getRecentDeals(limit = 50) {
-    return db.prepare(`SELECT d.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,
+    return db.prepare(`SELECT d.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.watchers,
     c.card_name,c.card_set,c.card_number,c.rarity,c.condition_est,c.is_holo,c.is_1st_ed,c.confidence
     FROM deals d JOIN listings l ON d.listing_id=l.id LEFT JOIN identified_cards c ON d.card_id=c.id
     ORDER BY d.created_at DESC LIMIT ?`).all(limit);
+}
+function getRecentCards(limit = 100) {
+    return db.prepare(`SELECT c.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.posted_at,l.price,l.watchers
+    FROM identified_cards c JOIN listings l ON c.listing_id=l.id
+    ORDER BY c.created_at DESC LIMIT ?`).all(limit);
 }
 function getStats() {
     const totalListings = db.prepare('SELECT COUNT(*) as c FROM listings').get().c;
@@ -434,6 +440,14 @@ async function scrapeEbay(searchTerm) {
             // Replace thumbnail with larger image
             if (imgSrc && imgSrc.includes('s-l')) imgSrc = imgSrc.replace(/s-l\d+/, 's-l500');
 
+            // Extract watcher count
+            let watchers = 0;
+            const hotnessText = $el.find('.s-item__hotness, .s-item__subtitle').text().trim().toLowerCase();
+            const watcherMatch = hotnessText.match(/(\d+)\+? watchers?/i) || hotnessText.match(/(\d+)\+? watching/i);
+            if (watcherMatch) {
+                watchers = parseInt(watcherMatch[1], 10);
+            }
+
             const itemId = link.match(/\/itm\/(\d+)/)?.[1];
             if (title && title !== 'Shop on eBay' && itemId && !title.includes('Shop on eBay')) {
                 const price = parsePrice(priceText);
@@ -441,7 +455,7 @@ async function scrapeEbay(searchTerm) {
                     listings.push({
                         id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
                         imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
-                        postedAt: new Date().toISOString(), seller: '', location: ''
+                        postedAt: new Date().toISOString(), seller: '', location: '', watchers
                     });
                 }
             }
@@ -1058,6 +1072,13 @@ app.get('/api/deals', (req, res) => {
     const limit = parseInt(req.query.limit || '50', 10);
     const deals = getRecentDeals(limit);
     res.json(deals.map(d => ({ ...d, image_urls: d.image_urls ? JSON.parse(d.image_urls) : [] })));
+});
+
+// API: all identified cards
+app.get('/api/cards', (req, res) => {
+    const limit = parseInt(req.query.limit || '100', 10);
+    const cards = getRecentCards(limit);
+    res.json(cards.map(c => ({ ...c, image_urls: c.image_urls ? JSON.parse(c.image_urls) : [] })));
 });
 
 // API: stats

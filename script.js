@@ -11,8 +11,6 @@
 
 // ═══════════ STATE ═══════════
 
-let allDeals = [];
-let currentFilter = 'all';
 let eventSource = null;
 
 // ═══════════ INIT ═══════════
@@ -24,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
     connectSSE();
     fetchDeals();
+    fetchCards();
     fetchStats();
     initFilters();
 
@@ -345,12 +344,26 @@ function addLogEntry(icon, message, cssClass) {
 
 // ═══════════ DEALS ═══════════
 
+let currentFeed = 'deals'; // 'deals' or 'all'
+let allDeals = [];
+let allCards = [];
+let currentFilter = 'all';
+
 async function fetchDeals() {
     try {
         const resp = await fetch('/api/deals?limit=100');
         const deals = await resp.json();
         allDeals = deals;
-        renderDeals();
+        if (currentFeed === 'deals') renderDeals();
+    } catch { }
+}
+
+async function fetchCards() {
+    try {
+        const resp = await fetch('/api/cards?limit=200');
+        const cards = await resp.json();
+        allCards = cards;
+        if (currentFeed === 'all') renderDeals();
     } catch { }
 }
 
@@ -387,8 +400,15 @@ function addDeal(deal) {
 function renderDeals() {
     const grid = document.getElementById('dealGrid');
     const empty = document.getElementById('emptyState');
+    const filterContainer = document.getElementById('tierFilters');
 
-    const filtered = allDeals.filter(d => currentFilter === 'all' || d.deal_tier === currentFilter);
+    // Hide/Show tier filters based on active tab
+    if (filterContainer) filterContainer.style.display = currentFeed === 'deals' ? 'flex' : 'none';
+
+    const sourceData = currentFeed === 'deals' ? allDeals : allCards;
+    const filtered = sourceData.filter(d =>
+        currentFeed === 'all' || currentFilter === 'all' || d.deal_tier === currentFilter
+    );
 
     if (!filtered.length) {
         grid.innerHTML = '';
@@ -403,44 +423,76 @@ function renderDeals() {
 function dealCardHTML(d) {
     const images = d.image_urls || [];
     const img = images[0] || '';
-    const tier = d.deal_tier || 'good';
-    const emoji = { incredible: '🔥', great: '💎', good: '👍' }[tier] || '📦';
-    const disc = d.discount_pct ? `${(d.discount_pct * 100).toFixed(0)}%` : '—';
+
+    // Distinguish between a deal object and a raw card object
+    const isDeal = !!d.deal_tier;
+    const tier = d.deal_tier || 'none';
+    const emoji = { incredible: '🔥', great: '💎', good: '👍' }[tier] || '🔍';
+
+    const disc = d.discount_pct ? `${(d.discount_pct * 100).toFixed(0)}%` : '';
     const name = d.card_name || d.title || 'Unknown';
     const tags = [];
+
     if (d.is_holo) tags.push('<span class="tag holo">✦ Holo</span>');
     if (d.is_1st_ed) tags.push('<span class="tag first-edition">1st Ed</span>');
     if (d.rarity && d.rarity !== 'Unknown') tags.push(`<span class="tag rarity">${d.rarity}</span>`);
+    if (d.condition_est && d.condition_est !== 'Unknown') tags.push(`<span class="tag condition">${d.condition_est}</span>`);
+    if (d.watchers > 0) tags.push(`<span class="tag watchers">👀 ${d.watchers} Watching</span>`);
 
-    return `<div class="deal-card tier-${tier}">
-        <span class="deal-tier-badge ${tier}">${emoji} ${tier.toUpperCase()}</span>
-        <div class="deal-card-image">${img ? `<img src="${img}" alt="${escapeHtml(name)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=\\'no-image\\'>🃏</div>'">` : '<div class="no-image">🃏</div>'}<span class="marketplace-badge">${d.marketplace || ''}</span></div>
+    return `<div class="deal-card ${isDeal ? `tier-${tier}` : 'tier-none'}">
+        <span class="deal-tier-badge ${tier}" ${!isDeal ? 'style="display:none;"' : ''}>${emoji} ${tier.toUpperCase()}</span>
+        <div class="deal-card-image">
+            ${img ? `<img src="${img}" alt="${escapeHtml(name)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=\\'no-image\\'>🃏</div>'">` : '<div class="no-image">🃏</div>'}
+            <span class="marketplace-badge">${d.marketplace || ''}</span>
+        </div>
         <div class="deal-card-info">
             <div class="deal-card-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
             <div class="deal-card-set">${escapeHtml(d.card_set || '')}</div>
             ${tags.length ? `<div class="deal-card-tags">${tags.join('')}</div>` : ''}
             <div class="deal-price-row">
-                <span class="deal-listed-price">$${(d.listing_price || 0).toFixed(2)}</span>
-                <span class="deal-market-price">$${(d.market_price || 0).toFixed(2)}</span>
+                <span class="deal-listed-price">$${(d.listing_price || d.price || 0).toFixed(2)}</span>
+                <span class="deal-market-price ${!d.market_price ? 'hidden' : ''}">$${(d.market_price || 0).toFixed(2)}</span>
             </div>
+            
+            ${isDeal ? `
             <div class="discount-bar"><div class="discount-bar-fill" style="width:${Math.min((d.discount_pct || 0) * 100, 100)}%"></div></div>
             <div class="deal-discount-label">
                 <span>Save $${((d.market_price || 0) - (d.listing_price || 0)).toFixed(2)}</span>
                 <span class="deal-discount-value">${disc} OFF</span>
             </div>
+            ` : `
+            <div class="date-listed-label" style="font-size: 11px; color: var(--text-muted); margin-top: 10px;">
+                Listed: ${new Date(d.posted_at || d.created_at).toLocaleString()}
+            </div>
+            `}
+            
             <a href="${d.listing_url || '#'}" target="_blank" rel="noopener" class="deal-buy-btn">BUY NOW →</a>
         </div>
     </div>`;
 }
 
-// ═══════════ FILTERS ═══════════
+// ═══════════ FILTERS & TABS ═══════════
 
 function initFilters() {
+    // Tier Filters (Only for Deals feed)
     document.querySelectorAll('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             currentFilter = btn.dataset.filter;
+            renderDeals();
+        });
+    });
+
+    // Feed Tabs (Deals vs All Finds)
+    document.querySelectorAll('.feed-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.feed-tab').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentFeed = btn.dataset.feed;
+
+            // Depending on which tab, display that data
+            if (currentFeed === 'all' && !allCards.length) fetchCards();
             renderDeals();
         });
     });

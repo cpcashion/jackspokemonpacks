@@ -160,12 +160,18 @@
         </div>
     </section>
 
-    <!-- ═══════════ SECTION 3: DEALS ═══════════ -->
+    <!-- ═══════════ SECTION 3: DISCOVERIES ═══════════ -->
     <section class="deals-section" id="deals">
         <div class="deals-header">
-            <h2>🎯 Discovered Deals</h2>
-            <div class="deal-filters">
-                <button class="filter-btn active" data-filter="all">All</button>
+            <h2>🎯 Agent Discoveries</h2>
+
+            <div class="feed-tabs">
+                <button class="feed-tab active" data-feed="deals" id="tabDeals">🔥 Deals Only</button>
+                <button class="feed-tab" data-feed="all" id="tabAll">👀 All Finds</button>
+            </div>
+
+            <div class="deal-filters" id="tierFilters">
+                <button class="filter-btn active" data-filter="all">All Tiers</button>
                 <button class="filter-btn" data-filter="incredible">🔥 Incredible</button>
                 <button class="filter-btn" data-filter="great">💎 Great</button>
                 <button class="filter-btn" data-filter="good">👍 Good</button>

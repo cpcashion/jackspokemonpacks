@@ -283,7 +283,8 @@ async function lookupPrice(cardName, cardSet, cardNumber) {
         await sleep(RATE_LIMITS.priceCheck);
         const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
         const url = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
-        const resp = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36', Accept: 'text/html' }, timeout: 15000 });
+        const proxyUrl = getProxyUrl(url);
+        const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 20000 });
         const { load } = await import('cheerio');
         const $ = load(resp.data);
         let price = null;
@@ -306,7 +307,7 @@ async function lookupPrice(cardName, cardSet, cardNumber) {
 function scoreDeal({ listingPrice, marketPrice, rarity, isHolo, is1stEd, postedAt, confidence }) {
     if (!marketPrice || marketPrice <= 0 || !listingPrice || listingPrice <= 0) return null;
     const disc = (marketPrice - listingPrice) / marketPrice;
-    if (disc < 0.30) return null; // minimum 30% off
+    if (disc < 0.20) return null; // minimum 20% off
     let score = disc * 100;
 
     const mult = {
@@ -326,7 +327,7 @@ function scoreDeal({ listingPrice, marketPrice, rarity, isHolo, is1stEd, postedA
 
     let tier;
     if (disc >= 0.70) tier = 'incredible';
-    else if (disc >= 0.50) tier = 'great';
+    else if (disc >= 0.40) tier = 'great';
     else tier = 'good';
 
     return {

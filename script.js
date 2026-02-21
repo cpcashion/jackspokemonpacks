@@ -266,8 +266,7 @@ function showAiPanel(imageUrl, title, listingPrice) {
     verdictRow.style.display = 'none';
     showScanningOverlay(true);
 
-    // Scroll the scanner section into view gently
-    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // Removed scrollIntoView to prevent the page from jumping while scanning
 }
 
 function showScanningOverlay(show) {
@@ -342,9 +341,13 @@ function addLogEntry(icon, message, cssClass) {
     while (log.children.length > 80) log.removeChild(log.firstChild);
 }
 
-// ═══════════ DEALS ═══════════
+// ═══════════ DEALS & TRACKER ═══════════
 
-let currentFeed = 'deals'; // 'deals' or 'all'
+const FIRST_151 = [
+    "Bulbasaur", "Ivysaur", "Venusaur", "Charmander", "Charmeleon", "Charizard", "Squirtle", "Wartortle", "Blastoise", "Caterpie", "Metapod", "Butterfree", "Weedle", "Kakuna", "Beedrill", "Pidgey", "Pidgeotto", "Pidgeot", "Rattata", "Raticate", "Spearow", "Fearow", "Ekans", "Arbok", "Pikachu", "Raichu", "Sandshrew", "Sandslash", "Nidoran♀", "Nidorina", "Nidoqueen", "Nidoran♂", "Nidorino", "Nidoking", "Clefairy", "Clefable", "Vulpix", "Ninetales", "Jigglypuff", "Wigglytuff", "Zubat", "Golbat", "Oddish", "Gloom", "Vileplume", "Paras", "Parasect", "Venonat", "Venomoth", "Diglett", "Dugtrio", "Meowth", "Persian", "Psyduck", "Golduck", "Mankey", "Primeape", "Growlithe", "Arcanine", "Poliwag", "Poliwhirl", "Poliwrath", "Abra", "Kadabra", "Alakazam", "Machop", "Machoke", "Machamp", "Bellsprout", "Weepinbell", "Victreebel", "Tentacool", "Tentacruel", "Geodude", "Graveler", "Golem", "Ponyta", "Rapidash", "Slowpoke", "Slowbro", "Magnemite", "Magneton", "Farfetch'd", "Doduo", "Dodrio", "Seel", "Dewgong", "Grimer", "Muk", "Shellder", "Cloyster", "Gastly", "Haunter", "Gengar", "Onix", "Drowzee", "Hypno", "Krabby", "Kingler", "Voltorb", "Electrode", "Exeggcute", "Exeggutor", "Cubone", "Marowak", "Hitmonlee", "Hitmonchan", "Lickitung", "Koffing", "Weezing", "Rhyhorn", "Rhydon", "Chansey", "Tangela", "Kangaskhan", "Horsea", "Seadra", "Goldeen", "Seaking", "Staryu", "Starmie", "Mr. Mime", "Scyther", "Jynx", "Electabuzz", "Magmar", "Pinsir", "Tauros", "Magikarp", "Gyarados", "Lapras", "Ditto", "Eevee", "Vaporeon", "Jolteon", "Flareon", "Porygon", "Omanyte", "Omastar", "Kabuto", "Kabutops", "Aerodactyl", "Snorlax", "Articuno", "Zapdos", "Moltres", "Dratini", "Dragonair", "Dragonite", "Mewtwo", "Mew"
+];
+
+let currentFeed = 'deals'; // 'deals' or 'all' or 'first-edition' or 'tracker-151'
 let allDeals = [];
 let allCards = [];
 let currentFilter = 'all';
@@ -405,6 +408,12 @@ function renderDeals() {
     // Hide/Show tier filters based on active tab
     if (filterContainer) filterContainer.style.display = currentFeed === 'deals' ? 'flex' : 'none';
 
+    if (currentFeed === 'tracker-151') {
+        renderTracker151();
+        return;
+    }
+
+    grid.className = 'deal-grid'; // Ensure standard grid class is active
     const sourceData = currentFeed === 'deals' ? allDeals : allCards;
 
     let filtered = [];
@@ -477,6 +486,52 @@ function dealCardHTML(d) {
     </div>`;
 }
 
+function renderTracker151() {
+    const grid = document.getElementById('dealGrid');
+    const empty = document.getElementById('emptyState');
+    if (empty) empty.style.display = 'none';
+
+    grid.className = 'tracker-151-grid';
+
+    const foundNames = new Set(
+        allCards.map(c => c.card_name).filter(Boolean).map(n => n.toLowerCase())
+    );
+
+    let foundCount = 0;
+    const slotsHtml = FIRST_151.map((pokemon, index) => {
+        const pkmnLower = pokemon.toLowerCase();
+
+        // Find if any card in our database includes this pokemon's name
+        const isFound = Array.from(foundNames).some(name => {
+            // Match exact names or names that start with the pokemon name (e.g., "Charizard EX")
+            const parts = name.split(/[^a-z0-9]/);
+            return parts.includes(pkmnLower) || name.includes(` ${pkmnLower} `) || name.startsWith(`${pkmnLower} `) || name === pkmnLower;
+        });
+
+        if (isFound) foundCount++;
+
+        return `
+        <div class="tracker-slot ${isFound ? 'found' : 'missing'}">
+            <div class="tracker-number">#${(index + 1).toString().padStart(3, '0')}</div>
+            <div class="tracker-name">${pokemon}</div>
+        </div>
+        `;
+    }).join('');
+
+    const pct = Math.round((foundCount / 151) * 100);
+
+    grid.innerHTML = `
+        <div class="tracker-stats-banner">
+            <h3>Original 151 Pokedex</h3>
+            <div class="tracker-progress-bar">
+                <div class="tracker-progress-fill" style="width: ${pct}%"></div>
+            </div>
+            <div class="tracker-fraction">${foundCount} / 151</div>
+        </div>
+        ${slotsHtml}
+    `;
+}
+
 // ═══════════ FILTERS & TABS ═══════════
 
 function initFilters() {
@@ -498,8 +553,11 @@ function initFilters() {
             currentFeed = btn.dataset.feed;
 
             // Depending on which tab, display that data
-            if ((currentFeed === 'all' || currentFeed === 'first-edition') && !allCards.length) fetchCards();
-            renderDeals();
+            if ((currentFeed === 'all' || currentFeed === 'first-edition' || currentFeed === 'tracker-151') && !allCards.length) {
+                fetchCards();
+            } else {
+                renderDeals();
+            }
         });
     });
 }

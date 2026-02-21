@@ -21,9 +21,9 @@ import cron from 'node-cron';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '3', 10);
+const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '5', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '7adca437ac49aac8a7f997ec67948455';
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -365,17 +365,21 @@ function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.
 
 function makeHeaders(extra = {}) {
     return {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': randomUA(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
         'Cache-Control': 'no-cache',
+        'Sec-Ch-Ua': '"Not A(Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"macOS"',
+        'Upgrade-Insecure-Requests': '1',
         ...extra
     };
 }
 
-// -- ScraperAPI Helper --
+// -- ScraperAPI Helper (optional, conserve quota) --
 function getProxyUrl(url) {
     if (!SCRAPER_API_KEY) return url;
     return `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
@@ -388,10 +392,10 @@ async function scrapeEbay(searchTerm) {
         const encoded = encodeURIComponent(searchTerm);
         // Use _ipg=60 for more results, _sop=10 for newly listed, _sacat=183454 for Pokemon TCG category
         const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc&_ipg=60`;
+        const fetchUrl = getProxyUrl(url);
         console.log(`  [eBay] Fetching: ${url}`);
-        const proxyUrl = getProxyUrl(url);
 
-        const resp = await axios.get(proxyUrl, {
+        const resp = await axios.get(fetchUrl, {
             headers: makeHeaders({ 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' }),
             timeout: 20000,
             maxRedirects: 5,
@@ -493,9 +497,8 @@ async function scrapeMercari(searchTerm) {
         const encoded = encodeURIComponent(searchTerm);
         const url = `https://www.mercari.com/search/?keyword=${encoded}&category_id=2536&sort=created_time&order=desc&status=on_sale`;
         console.log(`  [Mercari] Fetching: ${url.substring(0, 80)}...`);
-        const proxyUrl = getProxyUrl(url);
 
-        const resp = await axios.get(proxyUrl, {
+        const resp = await axios.get(url, {
             headers: makeHeaders({
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
@@ -571,8 +574,7 @@ async function scrapeOfferUp(searchTerm) {
     try {
         console.log(`  [OfferUp] Trying web scraper for "${searchTerm}"...`);
         const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
-        const proxyUrl = getProxyUrl(url);
-        const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 30000 });
+        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 30000 });
         console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
         const { load } = await import('cheerio');
         const $ = load(resp.data);
@@ -783,7 +785,7 @@ async function runScanCycle() {
 
     // Pick random subset of search terms per cycle
     const shuffled = [...SEARCH_TERMS].sort(() => Math.random() - 0.5);
-    const cycleTerms = shuffled.slice(0, 8); // Significantly increased scope
+    const cycleTerms = shuffled.slice(0, 3); // Reduced to conserve ScraperAPI quota
 
     broadcastActivity('search_terms', `Searching for: ${cycleTerms.join(', ')}`);
 
@@ -930,11 +932,13 @@ async function runScanCycle() {
                 continue;
             }
 
+            /*
             if (quick.worth_detailed_analysis === false && (!quick.estimated_value || quick.estimated_value < 5)) {
                 console.log(`  [Vision] Skip: Low value card (< $5) (${quick.estimated_value}) ("${listing.title.substring(0, 40)}")`);
                 broadcastActivity('skip_listing', `Low-value card (< $5), skipping`, { cardName: quick.card_name });
                 continue;
             }
+            */
 
             console.log(`  [Vision] Passed quick check: ${quick.card_name || 'Unknown'} - doing full analysis...`);
 

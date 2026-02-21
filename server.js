@@ -18,12 +18,36 @@ import Database from 'better-sqlite3';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import cron from 'node-cron';
+import puppeteer from 'puppeteer';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '5', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '';
+
+// ═══════════════════════════════════════════════════════════════
+//  SHARED PUPPETEER BROWSER
+// ═══════════════════════════════════════════════════════════════
+
+let browser = null;
+async function getBrowser() {
+    if (browser && browser.isConnected()) return browser;
+    console.log('  [Puppeteer] Launching headless Chrome...');
+    browser = await puppeteer.launch({
+        headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--window-size=1920,1080',
+        ],
+    });
+    console.log('  [Puppeteer] Browser launched successfully.');
+    return browser;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -35,13 +59,20 @@ const SEARCH_TERMS = [
     'pokemon tcg',
     'pokemon card rare',
     'charizard card',
-    'pokemon first edition',
     'pokemon holographic card',
     'pokemon card vintage',
     'pokemon card psa',
     'pokemon card shadowless',
     'pokemon card collection',
     'pokemon booster box',
+];
+
+// 1st Edition terms — always included in every cycle
+const FIRST_EDITION_TERMS = [
+    'pokemon 1st edition',
+    'pokemon first edition base set',
+    'pokemon first edition holo',
+    '1st edition shadowless pokemon',
 ];
 
 const HIGH_VALUE_CARDS = [
@@ -379,113 +410,99 @@ function makeHeaders(extra = {}) {
     };
 }
 
-// -- ScraperAPI Helper (optional, conserve quota) --
-function getProxyUrl(url) {
-    if (!SCRAPER_API_KEY) return url;
-    return `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
-}
-
-// -- eBay (Primary & most reliable scraper) --
+// -- eBay (Puppeteer-based — free, unlimited, bypasses bot detection) --
 async function scrapeEbay(searchTerm) {
     const listings = [];
+    let page = null;
     try {
         const encoded = encodeURIComponent(searchTerm);
-        // Use _ipg=60 for more results, _sop=10 for newly listed, _sacat=183454 for Pokemon TCG category
         const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc&_ipg=60`;
-        const fetchUrl = getProxyUrl(url);
-        console.log(`  [eBay] Fetching: ${url}`);
+        console.log(`  [eBay] Fetching via Puppeteer: ${url}`);
 
-        const resp = await axios.get(fetchUrl, {
-            headers: makeHeaders({ 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' }),
-            timeout: 20000,
-            maxRedirects: 5,
+        const br = await getBrowser();
+        page = await br.newPage();
+        await page.setUserAgent(randomUA());
+        await page.setViewport({ width: 1920, height: 1080 });
+
+        // Block images/fonts/css to speed up loading
+        await page.setRequestInterception(true);
+        page.on('request', req => {
+            const type = req.resourceType();
+            if (['image', 'font', 'stylesheet', 'media'].includes(type)) req.abort();
+            else req.continue();
         });
 
-        console.log(`  [eBay] Response: ${resp.status}, size: ${resp.data.length} bytes`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
-        const { load } = await import('cheerio');
-        const $ = load(resp.data);
+        // Wait for search results to render
+        await page.waitForSelector('[data-viewport], li.s-item', { timeout: 8000 }).catch(() => { });
 
-        // Check if we got a valid search results page
-        const resultCount = $('.srp-controls__count-heading').text().trim();
-        console.log(`  [eBay] Results header: "${resultCount}"`);
+        // Extract listings from the fully rendered page
+        const items = await page.evaluate(() => {
+            const results = [];
+            const els = document.querySelectorAll('[data-viewport], li.s-item');
+            els.forEach((el, i) => {
+                if (i >= 40) return;
 
-        // Try multiple selector strategies
-        let items = $('li.s-item');
-        console.log(`  [eBay] Found ${items.length} items with li.s-item selector`);
-
-        if (items.length === 0) {
-            // Fallback selectors
-            items = $('[data-viewport]');
-            console.log(`  [eBay] Fallback: Found ${items.length} items with [data-viewport]`);
-        }
-
-        items.each((i, el) => {
-            if (i >= 40) return false;
-            const $el = $(el);
-
-            // Try multiple title selectors and strip out the screen-reader text
-            let titleEl = $el.find('.s-item__title span').first();
-            if (titleEl.length) titleEl.find('.clipped').remove();
-            let title = titleEl.text().trim();
-
-            if (!title) {
-                let fallbackEl = $el.find('.s-item__title').first();
-                if (fallbackEl.length) fallbackEl.find('.clipped').remove();
-                title = fallbackEl.text().trim();
-            }
-            if (!title) title = $el.find('[role="heading"]').first().text().trim();
-
-            // Final fallback strip for lingering eBay accessibility text
-            title = title.replace(/Opens in a new window or tab/gi, '').replace(/New Listing/gi, '').trim();
-
-            // Try multiple price selectors
-            let priceText = $el.find('.s-item__price').first().text().trim();
-            if (!priceText) priceText = $el.find('[class*="price"]').first().text().trim();
-
-            // Try multiple link selectors
-            let link = $el.find('.s-item__link').attr('href') || '';
-            if (!link) link = $el.find('a[href*="/itm/"]').attr('href') || '';
-
-            // Try multiple image selectors
-            let imgSrc = $el.find('.s-item__image-img').attr('src') || '';
-            if (!imgSrc) imgSrc = $el.find('img[src*="ebayimg"]').attr('src') || '';
-            if (!imgSrc) imgSrc = $el.find('img').attr('src') || '';
-            // Replace thumbnail with larger image
-            if (imgSrc && imgSrc.includes('s-l')) imgSrc = imgSrc.replace(/s-l\d+/, 's-l500');
-
-            // Extract watcher count
-            let watchers = 0;
-            const hotnessText = $el.find('.s-item__hotness, .s-item__subtitle').text().trim().toLowerCase();
-            const watcherMatch = hotnessText.match(/(\d+)\+? watchers?/i) || hotnessText.match(/(\d+)\+? watching/i);
-            if (watcherMatch) {
-                watchers = parseInt(watcherMatch[1], 10);
-            }
-
-            const itemId = link.match(/\/itm\/(\d+)/)?.[1];
-            if (title && title !== 'Shop on eBay' && itemId && !title.includes('Shop on eBay')) {
-                const price = parsePrice(priceText);
-                if (price > 0 && price < 5000) { // reasonable price range
-                    listings.push({
-                        id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
-                        imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
-                        postedAt: new Date().toISOString(), seller: '', location: '', watchers
-                    });
+                // Title
+                let title = '';
+                const titleEl = el.querySelector('.s-item__title span') || el.querySelector('.s-item__title') || el.querySelector('[role="heading"]');
+                if (titleEl) {
+                    const clipped = titleEl.querySelector('.clipped');
+                    if (clipped) clipped.remove();
+                    title = titleEl.textContent.trim();
                 }
-            }
+                title = title.replace(/Opens in a new window or tab/gi, '').replace(/New Listing/gi, '').trim();
+
+                // Price
+                const priceEl = el.querySelector('.s-item__price') || el.querySelector('[class*="price"]');
+                const priceText = priceEl ? priceEl.textContent.trim() : '';
+
+                // Link
+                const linkEl = el.querySelector('.s-item__link') || el.querySelector('a[href*="/itm/"]');
+                const link = linkEl ? linkEl.href : '';
+
+                // Image
+                let imgSrc = '';
+                const imgEl = el.querySelector('.s-item__image-img') || el.querySelector('img[src*="ebayimg"]') || el.querySelector('img');
+                if (imgEl) imgSrc = imgEl.src || imgEl.dataset.src || '';
+                if (imgSrc && imgSrc.includes('s-l')) imgSrc = imgSrc.replace(/s-l\d+/, 's-l500');
+
+                // Watchers
+                let watchers = 0;
+                const hotnessEl = el.querySelector('.s-item__hotness, .s-item__subtitle');
+                if (hotnessEl) {
+                    const hotnessText = hotnessEl.textContent.trim().toLowerCase();
+                    const m = hotnessText.match(/(\d+)\+? watchers?/i) || hotnessText.match(/(\d+)\+? watching/i);
+                    if (m) watchers = parseInt(m[1], 10);
+                }
+
+                const itemIdMatch = link.match(/\/itm\/(\d+)/);
+                const itemId = itemIdMatch ? itemIdMatch[1] : null;
+
+                if (title && title !== 'Shop on eBay' && itemId && !title.includes('Shop on eBay')) {
+                    results.push({ title, priceText, link, imgSrc, itemId, watchers });
+                }
+            });
+            return results;
         });
+
+        for (const item of items) {
+            const price = parsePrice(item.priceText);
+            if (price > 0 && price < 5000) {
+                listings.push({
+                    id: `ebay_${item.itemId}`, marketplace: 'ebay', title: item.title, price,
+                    imageUrls: item.imgSrc ? [item.imgSrc] : [], listingUrl: item.link.split('?')[0],
+                    postedAt: new Date().toISOString(), seller: '', location: '', watchers: item.watchers
+                });
+            }
+        }
 
         console.log(`  [eBay] Parsed ${listings.length} valid listings from "${searchTerm}"`);
-
-        // If zero results, log a snippet of the HTML for debugging
-        if (listings.length === 0 && resp.data.length > 0) {
-            const bodySnippet = resp.data.substring(0, 500).replace(/\s+/g, ' ');
-            console.log(`  [eBay] DEBUG — HTML snippet: ${bodySnippet}`);
-        }
-
     } catch (err) {
-        console.error(`  [eBay] Error scraping "${searchTerm}":`, err.message);
-        if (err.response) console.error(`  [eBay] HTTP ${err.response.status}`);
+        console.error(`  [eBay] Puppeteer error scraping "${searchTerm}":`, err.message);
+    } finally {
+        if (page) await page.close().catch(() => { });
     }
     return listings;
 }
@@ -785,7 +802,11 @@ async function runScanCycle() {
 
     // Pick random subset of search terms per cycle
     const shuffled = [...SEARCH_TERMS].sort(() => Math.random() - 0.5);
-    const cycleTerms = shuffled.slice(0, 3); // Reduced to conserve ScraperAPI quota
+    const cycleTerms = shuffled.slice(0, 3);
+
+    // Always include a 1st edition term in every cycle
+    const firstEdTerm = FIRST_EDITION_TERMS[Math.floor(Math.random() * FIRST_EDITION_TERMS.length)];
+    if (!cycleTerms.includes(firstEdTerm)) cycleTerms.push(firstEdTerm);
 
     broadcastActivity('search_terms', `Searching for: ${cycleTerms.join(', ')}`);
 

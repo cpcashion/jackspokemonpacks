@@ -962,12 +962,13 @@ async function runScanCycle() {
             */
 
             console.log(`  [Vision] Passed quick check: ${quick.card_name || 'Unknown'} - doing full analysis...`);
+            scanState.cardsAnalyzed++;
+            broadcast({ type: 'status', scanState: { ...scanState } });
 
             // Full analysis
             broadcastActivity('ai_analyzing', `AI identifying card from image...`, { imageUrl, listingTitle: listing.title });
             await sleep(500);
             const result = await analyzeCardImage(imageUrl);
-            scanState.cardsAnalyzed++;
 
             if (!result?.cards?.length) {
                 broadcastActivity('ai_no_result', `Could not identify card`, { listingTitle: listing.title });

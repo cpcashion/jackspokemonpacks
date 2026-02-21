@@ -23,6 +23,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '3', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '7adca437ac49aac8a7f997ec67948455';
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -131,8 +132,8 @@ function getCachedPrice(name, set) {
 let geminiModel = null;
 if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite-001' });
-    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash Lite)');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.5 Flash)');
 } else {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
@@ -364,6 +365,12 @@ function makeHeaders(extra = {}) {
     };
 }
 
+// -- ScraperAPI Helper --
+function getProxyUrl(url) {
+    if (!SCRAPER_API_KEY) return url;
+    return `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
+}
+
 // -- eBay (Primary & most reliable scraper) --
 async function scrapeEbay(searchTerm) {
     const listings = [];
@@ -372,8 +379,9 @@ async function scrapeEbay(searchTerm) {
         // Use _ipg=60 for more results, _sop=10 for newly listed, _sacat=183454 for Pokemon TCG category
         const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc&_ipg=60`;
         console.log(`  [eBay] Fetching: ${url}`);
+        const proxyUrl = getProxyUrl(url);
 
-        const resp = await axios.get(url, {
+        const resp = await axios.get(proxyUrl, {
             headers: makeHeaders({ 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' }),
             timeout: 20000,
             maxRedirects: 5,
@@ -457,8 +465,9 @@ async function scrapeMercari(searchTerm) {
         const encoded = encodeURIComponent(searchTerm);
         const url = `https://www.mercari.com/search/?keyword=${encoded}&category_id=2536&sort=created_time&order=desc&status=on_sale`;
         console.log(`  [Mercari] Fetching: ${url.substring(0, 80)}...`);
+        const proxyUrl = getProxyUrl(url);
 
-        const resp = await axios.get(url, {
+        const resp = await axios.get(proxyUrl, {
             headers: makeHeaders({
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
@@ -527,8 +536,8 @@ async function scrapeOfferUp(searchTerm) {
     const listings = [];
     try {
         console.log(`  [OfferUp] Trying API for "${searchTerm}"...`);
-        const resp = await axios.get('https://offerup.com/api/search/v4/feed', {
-            params: { q: searchTerm, platform: 'web', limit: 30, sort: '-posted' },
+        const proxyUrl = getProxyUrl(`https://offerup.com/api/search/v4/feed?q=${encodeURIComponent(searchTerm)}&platform=web&limit=30&sort=-posted`);
+        const resp = await axios.get(proxyUrl, {
             headers: makeHeaders({
                 'Accept': 'application/json',
                 'Referer': 'https://offerup.com/',
@@ -557,7 +566,8 @@ async function scrapeOfferUp(searchTerm) {
         try {
             console.log(`  [OfferUp] Trying web fallback...`);
             const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
-            const resp = await axios.get(url, { headers: makeHeaders(), timeout: 15000 });
+            const proxyUrl = getProxyUrl(url);
+            const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 30000 });
             console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
             const { load } = await import('cheerio');
             const $ = load(resp.data);

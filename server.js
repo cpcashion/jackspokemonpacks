@@ -512,24 +512,30 @@ async function scrapeMercari(searchTerm) {
         const { load } = await import('cheerio');
         const $ = load(resp.data);
 
-        // Try Next.js data
-        const nextData = $('script#__NEXT_DATA__').text();
-        if (nextData) {
-            try {
-                const parsed = JSON.parse(nextData);
-                const items = parsed?.props?.pageProps?.searchResults?.items ||
-                    parsed?.props?.pageProps?.items ||
-                    parsed?.props?.pageProps?.initialData?.items || [];
-                console.log(`  [Mercari] Found ${items.length} items in __NEXT_DATA__`);
-                for (const item of items.slice(0, 30)) {
-                    listings.push({
-                        id: `mercari_${item.id}`, marketplace: 'mercari', title: item.name || item.title || '',
-                        price: parsePrice(item.price), imageUrls: (item.photos || []).map(p => p.url || p).filter(Boolean),
-                        listingUrl: `https://www.mercari.com/us/item/${item.id}`, postedAt: item.created || new Date().toISOString()
-                    });
-                }
-            } catch (e) { console.log(`  [Mercari] JSON parse error: ${e.message}`); }
-        }
+        // Use reliable DOM selectors instead of __NEXT_DATA__
+        const itemLinks = $('a[data-testid="ItemContainer"]');
+        console.log(`  [Mercari] DOM: found ${itemLinks.length} item links`);
+        itemLinks.each((i, el) => {
+            if (i >= 30) return false;
+            const $el = $(el);
+            const href = $el.attr('href') || $el.attr('data-href') || '';
+            const id = href.match(/\/item\/([a-z0-9]+)/i)?.[1];
+
+            const title = $el.find('[data-testid="ItemName"]').text().trim() || $el.text().trim().substring(0, 100);
+            const price = $el.find('[data-testid="ItemPrice"]').text().trim();
+
+            let img = $el.find('img[data-testid="ItemThumbnail"]').attr('src');
+            if (!img) img = $el.find('img').attr('src') || '';
+
+            if (id && title) {
+                listings.push({
+                    id: `mercari_${id}`, marketplace: 'mercari', title, price: parsePrice(price),
+                    imageUrls: img ? [img] : [], listingUrl: `https://www.mercari.com${href}`, postedAt: new Date().toISOString()
+                });
+            }
+        });
+
+        console.log(`  [Mercari] Parsed ${listings.length} listings from "${searchTerm}"`);
 
         // Fallback: try any item links
         if (!listings.length) {
@@ -563,80 +569,49 @@ async function scrapeMercari(searchTerm) {
 async function scrapeOfferUp(searchTerm) {
     const listings = [];
     try {
-        console.log(`  [OfferUp] Trying API for "${searchTerm}"...`);
-        const proxyUrl = getProxyUrl(`https://offerup.com/api/search/v4/feed?q=${encodeURIComponent(searchTerm)}&platform=web&limit=30&sort=-posted`);
-        const resp = await axios.get(proxyUrl, {
-            headers: makeHeaders({
-                'Accept': 'application/json',
-                'Referer': 'https://offerup.com/',
-                'Origin': 'https://offerup.com',
-            }),
-            timeout: 15000,
-        });
-        console.log(`  [OfferUp] API Response: ${resp.status}`);
-        const items = resp.data?.data?.feed_items || resp.data?.feed_items || [];
-        console.log(`  [OfferUp] API returned ${items.length} items`);
-        for (const fi of items.slice(0, 30)) {
-            const item = fi.item || fi.listing || fi;
-            if (!item?.id) continue;
-            const photos = (item.photos || item.images || []);
-            listings.push({
-                id: `offerup_${item.id}`, marketplace: 'offerup', title: item.title || '',
-                price: parsePrice(item.price || item.amount),
-                imageUrls: photos.map(p => p.uuid ? `https://images.offerup.com/${p.uuid}/600x600` : (p.url || p)).filter(Boolean).slice(0, 5),
-                listingUrl: `https://offerup.com/item/detail/${item.id}`,
-                postedAt: item.post_date || new Date().toISOString(), seller: item.owner?.name || ''
-            });
-        }
-    } catch (err) {
-        console.error(`  [OfferUp] API Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
-        // Web fallback
-        try {
-            console.log(`  [OfferUp] Trying web fallback...`);
-            const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
-            const proxyUrl = getProxyUrl(url);
-            const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 30000 });
-            console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
-            const { load } = await import('cheerio');
-            const $ = load(resp.data);
+        console.log(`  [OfferUp] Trying web scraper for "${searchTerm}"...`);
+        const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
+        const proxyUrl = getProxyUrl(url);
+        const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 30000 });
+        console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
+        const { load } = await import('cheerio');
+        const $ = load(resp.data);
 
-            // Try __NEXT_DATA__ first
-            const nextData = $('script#__NEXT_DATA__').text();
-            if (nextData) {
-                try {
-                    const parsed = JSON.parse(nextData);
-                    const foundItems = [];
-                    // OfferUp nests items deeply in ModularFeedListing objects
-                    function findListings(obj) {
-                        if (!obj || typeof obj !== 'object') return;
-                        if (obj.__typename === 'ModularFeedListing' && obj.listingId) {
-                            foundItems.push(obj);
-                        }
-                        for (const key in obj) {
-                            findListings(obj[key]);
-                        }
-                    }
-                    findListings(parsed);
+        // Try standard DOM extraction since __NEXT_DATA__ sometimes lacks items
+        let count = 0;
+        $('a[href*="/item/detail/"]').each((i, el) => {
+            if (count >= 30) return false;
 
-                    console.log(`  [OfferUp] Found ${foundItems.length} items in __NEXT_DATA__`);
-                    for (const item of foundItems.slice(0, 30)) {
-                        const imgUrl = item.image?.url || '';
-                        listings.push({
-                            id: `offerup_${item.listingId}`, marketplace: 'offerup', title: item.title || '',
-                            price: parsePrice(item.price),
-                            imageUrls: imgUrl ? [imgUrl] : [],
-                            listingUrl: `https://offerup.com/item/detail/${item.listingId}`,
-                            postedAt: new Date().toISOString()
-                        });
-                    }
-                } catch (e) {
-                    console.error(`  [OfferUp] JSON parse error: ${e.message}`);
-                }
+            const title = $(el).find('p[title]').attr('title') || $(el).text();
+
+            // Find price text containing $
+            const priceText = $(el).find('p').filter((idx, pEl) => $(pEl).text().includes('$')).first().text();
+
+            let imgUrl = $(el).find('img').attr('src');
+
+            const href = $(el).attr('href') || '';
+            const itemId = href.match(/\/item\/detail\/([a-z0-9]+)/i)?.[1] || count.toString();
+
+            if (title && priceText && title.toLowerCase().includes(searchTerm.split(' ')[0])) {
+                listings.push({
+                    id: `offerup_${itemId}`,
+                    marketplace: 'offerup',
+                    title: title.trim().substring(0, 100),
+                    price: parsePrice(priceText),
+                    imageUrls: imgUrl ? [imgUrl] : [],
+                    listingUrl: href.startsWith('http') ? href : `https://offerup.com${href}`,
+                    postedAt: new Date().toISOString()
+                });
+                count++;
             }
-        } catch (err2) { console.error(`  [OfferUp] Web Error: ${err2.message}`); }
-    }
+        });
+
+        console.log(`  [OfferUp] Found ${count} items from DOM.`);
+    } catch (err) { console.error(`  [OfferUp] Web Error: ${err.message}`); }
+
     console.log(`  [OfferUp] Parsed ${listings.length} listings from "${searchTerm}"`);
     return listings;
+
 }
 
 // -- Facebook Marketplace (HTTP-based, no Puppeteer) --
@@ -644,7 +619,8 @@ async function scrapeFacebook(searchTerm) {
     const listings = [];
     try {
         // Use the mobile/basic version of Facebook Marketplace which is lighter
-        const url = `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(searchTerm)}&daysSinceListed=1&sortBy=creation_time_descend`;
+        // Removed daysSinceListed=1 as it was too restrictive
+        const url = `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(searchTerm)}&sortBy=creation_time_descend`;
         console.log(`  [Facebook] Fetching: ${url.substring(0, 80)}...`);
 
         const resp = await axios.get(url, {
@@ -954,9 +930,9 @@ async function runScanCycle() {
                 continue;
             }
 
-            if (quick.worth_detailed_analysis === false && (!quick.estimated_value || quick.estimated_value < 20)) {
-                console.log(`  [Vision] Skip: Low value card (${quick.estimated_value}) ("${listing.title.substring(0, 40)}")`);
-                broadcastActivity('skip_listing', `Low-value card, skipping`, { cardName: quick.card_name });
+            if (quick.worth_detailed_analysis === false && (!quick.estimated_value || quick.estimated_value < 5)) {
+                console.log(`  [Vision] Skip: Low value card (< $5) (${quick.estimated_value}) ("${listing.title.substring(0, 40)}")`);
+                broadcastActivity('skip_listing', `Low-value card (< $5), skipping`, { cardName: quick.card_name });
                 continue;
             }
 

@@ -406,9 +406,15 @@ function renderDeals() {
     if (filterContainer) filterContainer.style.display = currentFeed === 'deals' ? 'flex' : 'none';
 
     const sourceData = currentFeed === 'deals' ? allDeals : allCards;
-    const filtered = sourceData.filter(d =>
-        currentFeed === 'all' || currentFilter === 'all' || d.deal_tier === currentFilter
-    );
+
+    let filtered = [];
+    if (currentFeed === 'first-edition') {
+        filtered = allCards.filter(d => d.is_1st_ed === 1 || d.is_1st_ed === true);
+    } else {
+        filtered = sourceData.filter(d =>
+            currentFeed === 'all' || currentFilter === 'all' || d.deal_tier === currentFilter
+        );
+    }
 
     if (!filtered.length) {
         grid.innerHTML = '';
@@ -492,7 +498,7 @@ function initFilters() {
             currentFeed = btn.dataset.feed;
 
             // Depending on which tab, display that data
-            if (currentFeed === 'all' && !allCards.length) fetchCards();
+            if ((currentFeed === 'all' || currentFeed === 'first-edition') && !allCards.length) fetchCards();
             renderDeals();
         });
     });

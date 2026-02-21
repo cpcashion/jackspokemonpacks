@@ -138,7 +138,10 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
 
-const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
+const CARD_ID_PROMPT = `You are an expert Pokemon TCG card grader and identifier. Analyze this image and identify any Pokemon cards.
+CRITICAL INSTRUCTION: You must intensely scrutinize the card for ANY physical damage. Look extremely closely at the edges for whitening, and scan the entire surface for creases, bends, or scratches. 
+If you see a crease (a white stress line or fold), the condition is "Damaged". If there is heavy edge wear, it is "Heavily Played".
+You must drastically reduce your \`estimated_value_usd\` if the card is damaged (a damaged card is often worth only 10-20% of its Mint value).
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -147,12 +150,12 @@ Return ONLY valid JSON (no markdown fences):
     "card_set": "Set name",
     "card_number": "e.g. 4/102",
     "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Illustration Rare|Unknown",
-    "condition_estimate": "Mint|Near Mint|Lightly Played|Unknown",
+    "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
     "is_holographic": true/false,
     "is_first_edition": true/false,
-    "estimated_value_usd": number,
+    "estimated_value_usd": number (MUST BE HEAVILY PENALIZED IF DAMAGED),
     "confidence": 0.0 to 1.0,
-    "notes": "any observations"
+    "notes": "List any specific damage observed (e.g., 'Large crease on right edge', 'Heavy edge whitening')"
   }],
   "is_pokemon_card": true/false
 }`;

@@ -59,7 +59,7 @@ const HIGH_VALUE_CARDS = [
     { name: 'Mew', set: 'Gold Star', minValue: 800 },
 ];
 
-const RATE_LIMITS = { ebay: 3000, mercari: 15000, offerup: 15000, facebook: 5000, priceCheck: 1500 };
+const RATE_LIMITS = { ebay: 1000, mercari: 2000, offerup: 2000, facebook: 2000, priceCheck: 500 };
 
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE
@@ -420,10 +420,20 @@ async function scrapeEbay(searchTerm) {
             if (i >= 40) return false;
             const $el = $(el);
 
-            // Try multiple title selectors
-            let title = $el.find('.s-item__title span').first().text().trim();
-            if (!title) title = $el.find('.s-item__title').first().text().trim();
+            // Try multiple title selectors and strip out the screen-reader text
+            let titleEl = $el.find('.s-item__title span').first();
+            if (titleEl.length) titleEl.find('.clipped').remove();
+            let title = titleEl.text().trim();
+
+            if (!title) {
+                let fallbackEl = $el.find('.s-item__title').first();
+                if (fallbackEl.length) fallbackEl.find('.clipped').remove();
+                title = fallbackEl.text().trim();
+            }
             if (!title) title = $el.find('[role="heading"]').first().text().trim();
+
+            // Final fallback strip for lingering eBay accessibility text
+            title = title.replace(/Opens in a new window or tab/gi, '').replace(/New Listing/gi, '').trim();
 
             // Try multiple price selectors
             let priceText = $el.find('.s-item__price').first().text().trim();
@@ -797,7 +807,7 @@ async function runScanCycle() {
 
     // Pick random subset of search terms per cycle
     const shuffled = [...SEARCH_TERMS].sort(() => Math.random() - 0.5);
-    const cycleTerms = shuffled.slice(0, 3);
+    const cycleTerms = shuffled.slice(0, 8); // Significantly increased scope
 
     broadcastActivity('search_terms', `Searching for: ${cycleTerms.join(', ')}`);
 
@@ -825,8 +835,15 @@ async function runScanCycle() {
         const seen = new Set();
         allListings = allListings.filter(l => { if (seen.has(l.id)) return false; seen.add(l.id); return true; });
 
-        // Filter new
-        const newListings = allListings.filter(l => !isListingSeen(l.id));
+        // Filter new and remove spam keywords
+        const spamWords = ['proxy', 'custom', 'orica', 'metal', 'reprint', 'pocket card', 'fantastic parade', 'fan art', 'replica', 'fake', 'novelty'];
+
+        const newListings = allListings.filter(l => {
+            if (isListingSeen(l.id)) return false;
+            const titleLower = (l.title || '').toLowerCase();
+            return !spamWords.some(w => titleLower.includes(w));
+        });
+
         for (const l of newListings) insertListing(l);
         cycleNewListings += newListings.length;
         scanState.totalListings += newListings.length;
@@ -841,7 +858,7 @@ async function runScanCycle() {
         console.log(`  [Analysis] Starting analysis of ${newListings.length} new listings`);
         for (const listing of newListings) {
             console.log(`  [Debug] Listing: title="${(listing.title || '').substring(0, 60)}" price=${listing.price} images=${listing.imageUrls?.length || 0} marketplace=${listing.marketplace}`);
-            await sleep(4100); // 15 RPM limit for Gemini Free Tier
+            await sleep(800); // 120 RPM limit since Gemini Billing is enabled
 
             // === BRANCH A: No image — use title-based AI analysis ===
             if (!listing.imageUrls?.length) {

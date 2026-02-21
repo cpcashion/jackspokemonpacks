@@ -58,7 +58,7 @@ const HIGH_VALUE_CARDS = [
     { name: 'Mew', set: 'Gold Star', minValue: 800 },
 ];
 
-const RATE_LIMITS = { ebay: 1200, mercari: 2000, offerup: 2000, facebook: 5000, priceCheck: 1500 };
+const RATE_LIMITS = { ebay: 3000, mercari: 15000, offerup: 15000, facebook: 5000, priceCheck: 1500 };
 
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE
@@ -131,8 +131,8 @@ function getCachedPrice(name, set) {
 let geminiModel = null;
 if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash)');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite-001' });
+    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash Lite)');
 } else {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
@@ -159,16 +159,36 @@ Return ONLY valid JSON (no markdown fences):
 const QUICK_CHECK_PROMPT = `Is this a Pokemon trading card image? Reply ONLY with valid JSON (no markdown):
 {"is_pokemon_card": true/false, "card_name": "name or null", "estimated_value": 0, "worth_detailed_analysis": true/false}`;
 
+const TITLE_ANALYSIS_PROMPT = `You are an expert Pokemon TCG dealer. Analyze this marketplace listing title and price to identify specific Pokemon cards being sold.
+
+Listing Title: "{TITLE}"
+Asking Price: ${'{PRICE}'}
+
+If this listing is selling specific Pokemon cards (not just generic "card lot" or "random cards"), identify each card mentioned.
+For card lots (e.g., "100 random cards"), estimate the true market value.
+Consider: condition hints ("NM", "PSA10", "LP"), edition ("1st edition", "shadowless"), and rarity clues.
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "cards": [{"card_name": "Pokemon name", "card_set": "Set name or Unknown", "card_number": "", "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Unknown", "condition_estimate": "Mint|Near Mint|Lightly Played|Unknown", "is_holographic": true/false, "is_first_edition": true/false, "estimated_value_usd": number, "confidence": 0.0 to 1.0, "notes": ""}],
+  "is_pokemon_card": true/false,
+  "is_bulk_lot": true/false,
+  "estimated_total_value": number
+}`;
+
 async function fetchImageAsBase64(url) {
     try {
         if (!url || url.startsWith('data:')) return null;
         const resp = await axios.get(url, {
             responseType: 'arraybuffer', timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7 AppleWebKit/537.36)' }
         });
         const mime = (resp.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
         return { base64: Buffer.from(resp.data).toString('base64'), mimeType: mime };
-    } catch { return null; }
+    } catch (e) {
+        console.error(`  [fetchImage] Error fetching ${url.substring(0, 50)}...: ${e.message}`);
+        return null;
+    }
 }
 
 function parseAiJson(text) {
@@ -178,6 +198,7 @@ function parseAiJson(text) {
     } catch {
         const m = text.match(/\{[\s\S]*\}/);
         if (m) try { return JSON.parse(m[0]); } catch { }
+        console.error(`  [parseAiJson] Failed to parse: ${text.substring(0, 100)}...`);
         return null;
     }
 }
@@ -186,11 +207,17 @@ async function quickCheckImage(imageUrl) {
     if (!geminiModel) return { is_pokemon_card: true, worth_detailed_analysis: true }; // assume yes if no AI
     try {
         const img = await fetchImageAsBase64(imageUrl);
-        if (!img) return null;
+        if (!img) {
+            console.error(`  [quickCheck] Failed to fetch image: ${imageUrl.substring(0, 50)}...`);
+            return null;
+        }
         const result = await geminiModel.generateContent([QUICK_CHECK_PROMPT,
             { inlineData: { data: img.base64, mimeType: img.mimeType } }]);
         return parseAiJson(result.response.text());
-    } catch { return null; }
+    } catch (e) {
+        console.error(`  [quickCheck] Gemini API error: ${e.message}`);
+        return null;
+    }
 }
 
 async function analyzeCardImage(imageUrl) {
@@ -203,6 +230,23 @@ async function analyzeCardImage(imageUrl) {
         return parseAiJson(result.response.text());
     } catch (err) {
         console.error('  [Vision] Error:', err.message);
+        return null;
+    }
+}
+
+// Text-based card identification using AI (no image needed)
+async function analyzeListingTitle(title, price) {
+    if (!geminiModel) return null;
+    try {
+        const prompt = TITLE_ANALYSIS_PROMPT.replace('{TITLE}', title).replace('{PRICE}', price?.toFixed(2) || '0');
+        const result = await geminiModel.generateContent([prompt]);
+        const parsed = parseAiJson(result.response.text());
+        if (parsed) {
+            console.log(`  [AI-Title] Analyzed "${title.substring(0, 50)}": ${parsed.cards?.length || 0} cards, pokemon=${parsed.is_pokemon_card}`);
+        }
+        return parsed;
+    } catch (err) {
+        console.error(`  [AI-Title] Error:`, err.message);
         return null;
     }
 }
@@ -297,61 +341,149 @@ function scoreDeal({ listingPrice, marketPrice, rarity, isHolo, is1stEd, postedA
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function parsePrice(p) { if (typeof p === 'number') return p; return parseFloat((p || '').replace(/[^0-9.]/g, '')) || 0; }
 
-// -- eBay --
+// Rotating user agents to avoid detection
+const USER_AGENTS = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0',
+];
+function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+
+function makeHeaders(extra = {}) {
+    return {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        ...extra
+    };
+}
+
+// -- eBay (Primary & most reliable scraper) --
 async function scrapeEbay(searchTerm) {
     const listings = [];
     try {
         const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc`;
+        // Use _ipg=60 for more results, _sop=10 for newly listed, _sacat=183454 for Pokemon TCG category
+        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc&_ipg=60`;
+        console.log(`  [eBay] Fetching: ${url}`);
+
         const resp = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                Accept: 'text/html', 'Accept-Language': 'en-US,en;q=0.9'
-            }, timeout: 15000
+            headers: makeHeaders({ 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate' }),
+            timeout: 20000,
+            maxRedirects: 5,
         });
+
+        console.log(`  [eBay] Response: ${resp.status}, size: ${resp.data.length} bytes`);
+
         const { load } = await import('cheerio');
         const $ = load(resp.data);
-        $('li.s-item').each((i, el) => {
-            if (i >= 30) return false;
+
+        // Check if we got a valid search results page
+        const resultCount = $('.srp-controls__count-heading').text().trim();
+        console.log(`  [eBay] Results header: "${resultCount}"`);
+
+        // Try multiple selector strategies
+        let items = $('li.s-item');
+        console.log(`  [eBay] Found ${items.length} items with li.s-item selector`);
+
+        if (items.length === 0) {
+            // Fallback selectors
+            items = $('[data-viewport]');
+            console.log(`  [eBay] Fallback: Found ${items.length} items with [data-viewport]`);
+        }
+
+        items.each((i, el) => {
+            if (i >= 40) return false;
             const $el = $(el);
-            const title = $el.find('.s-item__title span').first().text().trim();
-            const priceText = $el.find('.s-item__price').first().text().trim();
-            const link = $el.find('.s-item__link').attr('href') || '';
-            const imgSrc = $el.find('.s-item__image-img').attr('src') || '';
+
+            // Try multiple title selectors
+            let title = $el.find('.s-item__title span').first().text().trim();
+            if (!title) title = $el.find('.s-item__title').first().text().trim();
+            if (!title) title = $el.find('[role="heading"]').first().text().trim();
+
+            // Try multiple price selectors
+            let priceText = $el.find('.s-item__price').first().text().trim();
+            if (!priceText) priceText = $el.find('[class*="price"]').first().text().trim();
+
+            // Try multiple link selectors
+            let link = $el.find('.s-item__link').attr('href') || '';
+            if (!link) link = $el.find('a[href*="/itm/"]').attr('href') || '';
+
+            // Try multiple image selectors
+            let imgSrc = $el.find('.s-item__image-img').attr('src') || '';
+            if (!imgSrc) imgSrc = $el.find('img[src*="ebayimg"]').attr('src') || '';
+            if (!imgSrc) imgSrc = $el.find('img').attr('src') || '';
+            // Replace thumbnail with larger image
+            if (imgSrc && imgSrc.includes('s-l')) imgSrc = imgSrc.replace(/s-l\d+/, 's-l500');
+
             const itemId = link.match(/\/itm\/(\d+)/)?.[1];
-            if (title && title !== 'Shop on eBay' && itemId) {
-                listings.push({
-                    id: `ebay_${itemId}`, marketplace: 'ebay', title, price: parsePrice(priceText),
-                    imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
-                    postedAt: new Date().toISOString(), seller: '', location: ''
-                });
+            if (title && title !== 'Shop on eBay' && itemId && !title.includes('Shop on eBay')) {
+                const price = parsePrice(priceText);
+                if (price > 0 && price < 5000) { // reasonable price range
+                    listings.push({
+                        id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
+                        imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
+                        postedAt: new Date().toISOString(), seller: '', location: ''
+                    });
+                }
             }
         });
-    } catch (err) { console.error('  [eBay] Error:', err.message); }
+
+        console.log(`  [eBay] Parsed ${listings.length} valid listings from "${searchTerm}"`);
+
+        // If zero results, log a snippet of the HTML for debugging
+        if (listings.length === 0 && resp.data.length > 0) {
+            const bodySnippet = resp.data.substring(0, 500).replace(/\s+/g, ' ');
+            console.log(`  [eBay] DEBUG — HTML snippet: ${bodySnippet}`);
+        }
+
+    } catch (err) {
+        console.error(`  [eBay] Error scraping "${searchTerm}":`, err.message);
+        if (err.response) console.error(`  [eBay] HTTP ${err.response.status}`);
+    }
     return listings;
 }
 
-// -- Mercari --
+// -- Mercari (attempt with better headers) --
 async function scrapeMercari(searchTerm) {
     const listings = [];
     try {
         const encoded = encodeURIComponent(searchTerm);
         const url = `https://www.mercari.com/search/?keyword=${encoded}&category_id=2536&sort=created_time&order=desc&status=on_sale`;
+        console.log(`  [Mercari] Fetching: ${url.substring(0, 80)}...`);
+
         const resp = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                Accept: 'text/html', 'Accept-Language': 'en-US,en;q=0.9'
-            }, timeout: 15000
+            headers: makeHeaders({
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+            }),
+            timeout: 15000,
+            maxRedirects: 5,
         });
+
+        console.log(`  [Mercari] Response: ${resp.status}, size: ${resp.data.length} bytes`);
+
         const { load } = await import('cheerio');
         const $ = load(resp.data);
 
-        // Try Next.js data first
+        // Try Next.js data
         const nextData = $('script#__NEXT_DATA__').text();
         if (nextData) {
             try {
                 const parsed = JSON.parse(nextData);
-                const items = parsed?.props?.pageProps?.searchResults?.items || parsed?.props?.pageProps?.items || [];
+                const items = parsed?.props?.pageProps?.searchResults?.items ||
+                    parsed?.props?.pageProps?.items ||
+                    parsed?.props?.pageProps?.initialData?.items || [];
+                console.log(`  [Mercari] Found ${items.length} items in __NEXT_DATA__`);
                 for (const item of items.slice(0, 30)) {
                     listings.push({
                         id: `mercari_${item.id}`, marketplace: 'mercari', title: item.name || item.title || '',
@@ -359,17 +491,19 @@ async function scrapeMercari(searchTerm) {
                         listingUrl: `https://www.mercari.com/us/item/${item.id}`, postedAt: item.created || new Date().toISOString()
                     });
                 }
-            } catch { }
+            } catch (e) { console.log(`  [Mercari] JSON parse error: ${e.message}`); }
         }
 
-        // Fallback DOM
+        // Fallback: try any item links
         if (!listings.length) {
-            $('a[href*="/us/item/"]').each((i, el) => {
+            const itemLinks = $('a[href*="/item/"]');
+            console.log(`  [Mercari] DOM fallback: found ${itemLinks.length} item links`);
+            itemLinks.each((i, el) => {
                 if (i >= 30) return false;
                 const $el = $(el);
                 const href = $el.attr('href') || '';
                 const id = href.match(/\/item\/([a-z0-9]+)/i)?.[1];
-                const title = $el.find('[class*="ItemName"], [class*="title"]').text().trim() || $el.attr('aria-label') || '';
+                const title = $el.find('[class*="ItemName"], [class*="title"]').text().trim() || $el.attr('aria-label') || $el.text().trim().substring(0, 100);
                 const price = $el.find('[class*="Price"], [class*="price"]').text().trim();
                 const img = $el.find('img').attr('src') || '';
                 if (id && title) {
@@ -380,22 +514,31 @@ async function scrapeMercari(searchTerm) {
                 }
             });
         }
-    } catch (err) { console.error('  [Mercari] Error:', err.message); }
+
+        console.log(`  [Mercari] Parsed ${listings.length} listings from "${searchTerm}"`);
+    } catch (err) {
+        console.error(`  [Mercari] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
+    }
     return listings;
 }
 
-// -- OfferUp --
+// -- OfferUp (attempt with better headers) --
 async function scrapeOfferUp(searchTerm) {
     const listings = [];
     try {
+        console.log(`  [OfferUp] Trying API for "${searchTerm}"...`);
         const resp = await axios.get('https://offerup.com/api/search/v4/feed', {
             params: { q: searchTerm, platform: 'web', limit: 30, sort: '-posted' },
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                Accept: 'application/json', Referer: 'https://offerup.com/'
-            }, timeout: 15000
+            headers: makeHeaders({
+                'Accept': 'application/json',
+                'Referer': 'https://offerup.com/',
+                'Origin': 'https://offerup.com',
+            }),
+            timeout: 15000,
         });
+        console.log(`  [OfferUp] API Response: ${resp.status}`);
         const items = resp.data?.data?.feed_items || resp.data?.feed_items || [];
+        console.log(`  [OfferUp] API returned ${items.length} items`);
         for (const fi of items.slice(0, 30)) {
             const item = fi.item || fi.listing || fi;
             if (!item?.id) continue;
@@ -409,80 +552,180 @@ async function scrapeOfferUp(searchTerm) {
             });
         }
     } catch (err) {
+        console.error(`  [OfferUp] API Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
         // Web fallback
         try {
+            console.log(`  [OfferUp] Trying web fallback...`);
             const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
-            const resp = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' }, timeout: 15000 });
+            const resp = await axios.get(url, { headers: makeHeaders(), timeout: 15000 });
+            console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
             const { load } = await import('cheerio');
             const $ = load(resp.data);
-            $('a[href*="/item/detail/"]').each((i, el) => {
+
+            // Try __NEXT_DATA__ first
+            const nextData = $('script#__NEXT_DATA__').text();
+            if (nextData) {
+                try {
+                    const parsed = JSON.parse(nextData);
+                    const foundItems = [];
+                    // OfferUp nests items deeply in ModularFeedListing objects
+                    function findListings(obj) {
+                        if (!obj || typeof obj !== 'object') return;
+                        if (obj.__typename === 'ModularFeedListing' && obj.listingId) {
+                            foundItems.push(obj);
+                        }
+                        for (const key in obj) {
+                            findListings(obj[key]);
+                        }
+                    }
+                    findListings(parsed);
+
+                    console.log(`  [OfferUp] Found ${foundItems.length} items in __NEXT_DATA__`);
+                    for (const item of foundItems.slice(0, 30)) {
+                        const imgUrl = item.image?.url || '';
+                        listings.push({
+                            id: `offerup_${item.listingId}`, marketplace: 'offerup', title: item.title || '',
+                            price: parsePrice(item.price),
+                            imageUrls: imgUrl ? [imgUrl] : [],
+                            listingUrl: `https://offerup.com/item/detail/${item.listingId}`,
+                            postedAt: new Date().toISOString()
+                        });
+                    }
+                } catch (e) {
+                    console.error(`  [OfferUp] JSON parse error: ${e.message}`);
+                }
+            }
+        } catch (err2) { console.error(`  [OfferUp] Web Error: ${err2.message}`); }
+    }
+    console.log(`  [OfferUp] Parsed ${listings.length} listings from "${searchTerm}"`);
+    return listings;
+}
+
+// -- Facebook Marketplace (HTTP-based, no Puppeteer) --
+async function scrapeFacebook(searchTerm) {
+    const listings = [];
+    try {
+        // Use the mobile/basic version of Facebook Marketplace which is lighter
+        const url = `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(searchTerm)}&daysSinceListed=1&sortBy=creation_time_descend`;
+        console.log(`  [Facebook] Fetching: ${url.substring(0, 80)}...`);
+
+        const resp = await axios.get(url, {
+            headers: makeHeaders({
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+            }),
+            timeout: 20000,
+            maxRedirects: 5,
+        });
+
+        console.log(`  [Facebook] Response: ${resp.status}, size: ${resp.data.length} bytes`);
+
+        // Facebook embeds data in script tags — try to extract marketplace items
+        const dataMatches = resp.data.match(/marketplace_search.*?"edges":\s*\[(.*?)\]/gs);
+        if (dataMatches) {
+            console.log(`  [Facebook] Found marketplace data in scripts`);
+            // Try to parse JSON from the script data
+            for (const match of dataMatches) {
+                try {
+                    const itemMatches = match.matchAll(/"marketplace_listing_title":"([^"]+)".*?"listing_price":\{[^}]*"amount":"(\d+\.?\d*)"/g);
+                    for (const m of itemMatches) {
+                        const id = `facebook_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+                        listings.push({
+                            id, marketplace: 'facebook', title: m[1], price: parseFloat(m[2]),
+                            imageUrls: [], listingUrl: url, postedAt: new Date().toISOString()
+                        });
+                    }
+                } catch { }
+            }
+        }
+
+        // Also try the standard HTML parsing
+        if (!listings.length) {
+            const { load } = await import('cheerio');
+            const $ = load(resp.data);
+            $('a[href*="/marketplace/item/"]').each((i, el) => {
                 if (i >= 30) return false;
                 const href = $(el).attr('href') || '';
-                const id = href.match(/\/detail\/(\d+)/)?.[1];
-                const title = $(el).find('[class*="title"], span').first().text().trim();
-                const price = $(el).find('[class*="price"]').text().trim();
+                const itemId = href.match(/\/item\/(\d+)/)?.[1];
+                if (!itemId) return;
+                const text = $(el).text();
+                const priceMatch = text.match(/\$[\d,]+\.?\d*/);
+                const title = text.replace(/\$[\d,]+\.?\d*/, '').trim().substring(0, 200);
                 const img = $(el).find('img').attr('src') || '';
-                if (id) listings.push({
-                    id: `offerup_${id}`, marketplace: 'offerup', title, price: parsePrice(price),
-                    imageUrls: img ? [img] : [], listingUrl: `https://offerup.com${href}`, postedAt: new Date().toISOString()
-                });
+                if (title) {
+                    listings.push({
+                        id: `facebook_${itemId}`, marketplace: 'facebook', title,
+                        price: priceMatch ? parsePrice(priceMatch[0]) : 0,
+                        imageUrls: img ? [img] : [], listingUrl: `https://www.facebook.com/marketplace/item/${itemId}`,
+                        postedAt: new Date().toISOString()
+                    });
+                }
             });
-        } catch (err2) { console.error('  [OfferUp] Error:', err2.message); }
+        }
+
+        console.log(`  [Facebook] Parsed ${listings.length} listings from "${searchTerm}"`);
+    } catch (err) {
+        console.error(`  [Facebook] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
     }
     return listings;
 }
 
-// -- Facebook Marketplace --
-let fbBrowser = null;
-async function scrapeFacebook(searchTerm) {
+// -- eBay RSS Feed (very reliable, no anti-bot) --
+async function scrapeEbayRSS(searchTerm) {
     const listings = [];
     try {
-        const puppeteer = await import('puppeteer');
-        if (!fbBrowser) {
-            fbBrowser = await puppeteer.default.launch({
-                headless: 'new',
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-notifications']
-            });
-        }
-        const page = await fbBrowser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36');
-        await page.setViewport({ width: 1920, height: 1080 });
-        await page.setRequestInterception(true);
-        page.on('request', r => ['image', 'stylesheet', 'font', 'media'].includes(r.resourceType()) ? r.abort() : r.continue());
+        const encoded = encodeURIComponent(searchTerm);
+        // eBay RSS feed — always works, no anti-bot protection
+        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&_rss=1`;
+        console.log(`  [eBay-RSS] Fetching RSS for "${searchTerm}"`);
 
-        const url = `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(searchTerm)}&daysSinceListed=1&sortBy=creation_time_descend`;
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-        await sleep(3000);
-        try { const btn = await page.$('[aria-label="Close"]'); if (btn) await btn.click(); } catch { }
-
-        const items = await page.evaluate(() => {
-            const results = [];
-            document.querySelectorAll('a[href*="/marketplace/item/"]').forEach((card, i) => {
-                if (i >= 30) return;
-                const href = card.getAttribute('href') || '';
-                const itemId = href.match(/\/item\/(\d+)/)?.[1];
-                if (!itemId) return;
-                const spans = card.querySelectorAll('span');
-                let title = '', price = '';
-                spans.forEach(s => { const t = s.textContent.trim(); if (t.startsWith('$') && !price) price = t; else if (t.length > 3 && !title) title = t; });
-                const img = card.querySelector('img');
-                results.push({ id: itemId, title, price, img: img?.src || '', href: `https://www.facebook.com/marketplace/item/${itemId}` });
-            });
-            return results;
+        const resp = await axios.get(url, {
+            headers: { 'User-Agent': randomUA(), 'Accept': 'application/rss+xml,application/xml,text/xml' },
+            timeout: 20000,
         });
-        for (const item of items) {
-            listings.push({
-                id: `facebook_${item.id}`, marketplace: 'facebook', title: item.title, price: parsePrice(item.price),
-                imageUrls: item.img ? [item.img] : [], listingUrl: item.href, postedAt: new Date().toISOString()
-            });
-        }
-        await page.close();
-    } catch (err) { console.error('  [Facebook] Error:', err.message); }
+
+        console.log(`  [eBay-RSS] Response: ${resp.status}, size: ${resp.data.length} bytes`);
+
+        const { load } = await import('cheerio');
+        const $ = load(resp.data, { xmlMode: true });
+
+        $('item').each((i, el) => {
+            if (i >= 40) return false;
+            const $el = $(el);
+            const title = $el.find('title').text().trim();
+            const link = $el.find('link').text().trim();
+            const itemId = link.match(/\/itm\/(\d+)/)?.[1];
+
+            // Extract price — usually in the title or description
+            const desc = $el.find('description').text();
+            const priceMatch = desc.match(/Price:\s*US\s*\$([\d,.]+)/i) ||
+                desc.match(/\$([\d,.]+)/);
+            const price = priceMatch ? parsePrice(priceMatch[1]) : 0;
+
+            // Extract image from description HTML
+            const imgMatch = desc.match(/src="([^"]*ebayimg[^"]*)"/i);
+            const imgSrc = imgMatch ? imgMatch[1].replace(/s-l\d+/, 's-l500') : '';
+
+            if (title && itemId && price > 0) {
+                listings.push({
+                    id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
+                    imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
+                    postedAt: new Date().toISOString(), seller: '', location: ''
+                });
+            }
+        });
+
+        console.log(`  [eBay-RSS] Parsed ${listings.length} listings`);
+    } catch (err) {
+        console.error(`  [eBay-RSS] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
+    }
     return listings;
 }
 
 const SCRAPERS = [
     { name: 'ebay', fn: scrapeEbay, rateLimit: RATE_LIMITS.ebay, enabled: true },
+    { name: 'ebay-rss', fn: scrapeEbayRSS, rateLimit: RATE_LIMITS.ebay, enabled: true },
     { name: 'mercari', fn: scrapeMercari, rateLimit: RATE_LIMITS.mercari, enabled: true },
     { name: 'offerup', fn: scrapeOfferUp, rateLimit: RATE_LIMITS.offerup, enabled: true },
     { name: 'facebook', fn: scrapeFacebook, rateLimit: RATE_LIMITS.facebook, enabled: true },
@@ -563,11 +806,91 @@ async function runScanCycle() {
         broadcastActivity('new_listings', `${scraper.name}: ${newListings.length} new listings (${allListings.length} total)`,
             { marketplace: scraper.name, newCount: newListings.length, totalCount: allListings.length });
 
-        // Analyze new listings with Vision AI
+        // Analyze new listings with Vision AI or Title-based AI
+        let imagesAnalyzed = 0;
+        let titleAnalyzed = 0;
+        let noImageCount = 0;
+        console.log(`  [Analysis] Starting analysis of ${newListings.length} new listings`);
         for (const listing of newListings) {
-            if (!listing.imageUrls?.length) continue;
-            const imageUrl = listing.imageUrls[0];
+            console.log(`  [Debug] Listing: title="${(listing.title || '').substring(0, 60)}" price=${listing.price} images=${listing.imageUrls?.length || 0} marketplace=${listing.marketplace}`);
+            await sleep(4100); // 15 RPM limit for Gemini Free Tier
 
+            // === BRANCH A: No image — use title-based AI analysis ===
+            if (!listing.imageUrls?.length) {
+                noImageCount++;
+                if (listing.title && listing.price > 0 && geminiModel) {
+                    titleAnalyzed++;
+                    broadcastActivity('analyzing_title', `AI analyzing: "${listing.title.substring(0, 70)}" ($${listing.price})`, {
+                        marketplace: listing.marketplace, listingTitle: listing.title,
+                        listingPrice: listing.price, listingUrl: listing.listingUrl,
+                    });
+                    const titleResult = await analyzeListingTitle(listing.title, listing.price);
+                    if (titleResult?.is_pokemon_card && titleResult.cards?.length > 0) {
+                        for (const card of titleResult.cards) {
+                            if (!card.card_name) continue;
+                            broadcastActivity('card_identified', `Identified: ${card.card_name} (${card.rarity || 'Unknown'})`, {
+                                cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity,
+                                confidence: card.confidence, aiEstimate: card.estimated_value_usd,
+                                listingPrice: listing.price, marketplace: listing.marketplace,
+                            });
+                            let marketPrice = (typeof card.estimated_value_usd === 'number' && card.estimated_value_usd > 0) ? card.estimated_value_usd : null;
+                            const lookedUp = await lookupPrice(card.card_name, card.card_set, card.card_number);
+                            if (lookedUp) marketPrice = lookedUp;
+                            if (!marketPrice) continue;
+                            broadcastActivity('price_comparison', `${card.card_name}: Listed $${listing.price.toFixed(2)} vs Market $${marketPrice.toFixed(2)}`, {
+                                cardName: card.card_name, listingPrice: listing.price, marketPrice,
+                                marketplace: listing.marketplace, listingUrl: listing.listingUrl,
+                            });
+                            const cardId = insertCard({
+                                listingId: listing.id, cardName: card.card_name, cardSet: card.card_set,
+                                cardNumber: card.card_number, rarity: card.rarity, conditionEst: card.condition_estimate,
+                                isHolo: card.is_holographic, is1stEd: card.is_first_edition, confidence: card.confidence, marketPrice
+                            });
+                            scanState.cardsAnalyzed++;
+                            const deal = scoreDeal({
+                                listingPrice: listing.price, marketPrice, rarity: card.rarity,
+                                isHolo: card.is_holographic, is1stEd: card.is_first_edition,
+                                postedAt: listing.postedAt, confidence: card.confidence
+                            });
+                            if (deal) {
+                                if (listing.price / marketPrice < 0.05 && marketPrice > 100) continue;
+                                const dealId = insertDeal({
+                                    listingId: listing.id, cardId, listingPrice: listing.price,
+                                    marketPrice, discountPct: deal.discountPct, dealTier: deal.dealTier, dealScore: deal.dealScore
+                                });
+                                cycleDeals++;
+                                scanState.totalDeals++;
+                                const emoji = { incredible: '🔥', great: '💎', good: '👍' }[deal.dealTier];
+                                broadcastActivity('deal_found', `${emoji} ${deal.dealTier.toUpperCase()} DEAL: ${card.card_name} — $${listing.price.toFixed(2)} (${(deal.discountPct * 100).toFixed(0)}% off!)`, {
+                                    dealId, dealTier: deal.dealTier, dealScore: deal.dealScore,
+                                    cardName: card.card_name, listingPrice: listing.price, marketPrice,
+                                    discountPct: deal.discountPct, savings: deal.savings, marketplace: listing.marketplace,
+                                    listingUrl: listing.listingUrl, confidence: card.confidence,
+                                });
+                                broadcast({
+                                    type: 'new_deal', deal: {
+                                        id: dealId, listing_id: listing.id, title: listing.title,
+                                        listing_url: listing.listingUrl, image_urls: JSON.stringify(listing.imageUrls || []),
+                                        marketplace: listing.marketplace, card_name: card.card_name, card_set: card.card_set,
+                                        rarity: card.rarity, listing_price: listing.price, market_price: marketPrice,
+                                        discount_pct: deal.discountPct, deal_tier: deal.dealTier, deal_score: deal.dealScore,
+                                        confidence: card.confidence,
+                                    }
+                                });
+                            } else {
+                                broadcastActivity('no_deal', `Fair price for ${card.card_name}`, { cardName: card.card_name });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                continue; // No image, no AI — skip
+            }
+            // === BRANCH B: Has image — use Vision AI ===
+            const imageUrl = listing.imageUrls[0];
+            imagesAnalyzed++;
+
+            console.log(`  [Vision] Analysing image: "${listing.title.substring(0, 40)}" (${imageUrl.substring(0, 40)}...)`);
             // Broadcast: we're looking at this listing image
             broadcastActivity('analyzing_image', `Analyzing: "${listing.title.substring(0, 60)}..."`, {
                 marketplace: listing.marketplace, listingTitle: listing.title,
@@ -576,15 +899,23 @@ async function runScanCycle() {
 
             // Quick check — is this even a pokemon card?
             const quick = await quickCheckImage(imageUrl);
-            if (!quick || !quick.is_pokemon_card) {
+            if (!quick) {
+                console.log(`  [Vision] Skip: quick check failed/errored for "${listing.title.substring(0, 40)}"`);
+                continue;
+            }
+            if (!quick.is_pokemon_card) {
+                console.log(`  [Vision] Skip: Not a pokemon card ("${listing.title.substring(0, 40)}")`);
                 broadcastActivity('skip_listing', `Not a card image, skipping`, { listingTitle: listing.title });
                 continue;
             }
 
             if (quick.worth_detailed_analysis === false && (!quick.estimated_value || quick.estimated_value < 20)) {
+                console.log(`  [Vision] Skip: Low value card (${quick.estimated_value}) ("${listing.title.substring(0, 40)}")`);
                 broadcastActivity('skip_listing', `Low-value card, skipping`, { cardName: quick.card_name });
                 continue;
             }
+
+            console.log(`  [Vision] Passed quick check: ${quick.card_name || 'Unknown'} - doing full analysis...`);
 
             // Full analysis
             broadcastActivity('ai_analyzing', `AI identifying card from image...`, { imageUrl, listingTitle: listing.title });
@@ -695,7 +1026,8 @@ async function runScanCycle() {
     });
     broadcast({ type: 'status', scanState: { ...scanState } });
 
-    console.log(`✅ Cycle #${cycleNum}: ${cycleNewListings} new, ${cycleDeals} deals`);
+    console.log(`✅ Cycle #${cycleNum}: ${cycleNewListings} new, ${cycleDeals} deals (images analyzed across all scrapers)`);
+    console.log(`   Listings without images were analyzed by title or skipped`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -759,7 +1091,6 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down...');
-    if (fbBrowser) await fbBrowser.close();
     db.close();
     process.exit(0);
 });

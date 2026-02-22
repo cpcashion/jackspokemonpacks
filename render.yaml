@@ -10,3 +10,7 @@ services:
         value: 3000
       - key: SCAN_INTERVAL_MINUTES
         value: 3
+    disk:
+      name: pokesniper-db
+      mountPath: /app/data
+      sizeGB: 1

@@ -33,137 +33,77 @@
         </div>
     </nav>
 
-    <!-- ═══════════ SECTION 1: HERO ═══════════ -->
+    <!-- ═══════════ SECTION 1: UPLOAD & AUTO-LIST ═══════════ -->
     <section class="hero" id="hero">
         <div class="background-glow"></div>
         <div class="particles" id="particles"></div>
 
-        <div class="hero-content">
+        <div class="hero-content" style="max-width: 800px;">
             <header class="hero-header">
                 <h1 class="logo">
                     <span class="logo-icon">⚡</span>
-                    Jack's Pokemon Packs
+                    Jack's Auto-Lister
                 </h1>
-                <p class="hero-subtitle">AI-Powered Card Deal Finder</p>
+                <p class="hero-subtitle">Upload cards, let AI price them, and auto-list to eBay</p>
             </header>
 
-            <div class="card-showcase">
-                <div class="card-container" id="card-container">
-                    <div class="card" id="pokemon-card">
-                        <div class="card-inner">
-                            <div class="card-face card-front">
-                                <div class="card-shine"></div>
-                                <div class="card-glare"></div>
-                                <div class="holographic-overlay"></div>
-                                <img src="card.png" alt="Holographic Pokemon Card" class="card-image">
-                            </div>
-                        </div>
+            <div class="upload-portal">
+                <form id="autoListForm" class="auto-list-form">
+                    <div class="form-group">
+                        <label for="ebayUsername">eBay Username</label>
+                        <input type="text" id="ebayUsername" placeholder="e.g., pokemaster99" required>
                     </div>
-                </div>
+                    <div class="form-group">
+                        <label for="ebayPassword">eBay Password</label>
+                        <input type="password" id="ebayPassword" placeholder="••••••••" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="cardPhotos">Upload Card Photos</label>
+                        <input type="file" id="cardPhotos" accept="image/*" multiple required>
+                        <p class="help-text">You can upload multiple photos. The AI will find all cards in every photo.
+                        </p>
+                    </div>
+                    <button type="submit" class="hero-cta" id="btnSubmitAutoList"
+                        style="width: 100%; justify-content: center; margin-top: 20px;">
+                        <span class="cta-icon">🚀</span>
+                        Analyze & Auto-List on eBay
+                    </button>
+                </form>
             </div>
-
-            <a href="#scanner" class="hero-cta">
-                <span class="cta-icon">🔍</span>
-                View Live Scanner
-                <span class="cta-arrow">↓</span>
-            </a>
         </div>
     </section>
 
-    <!-- ═══════════ SECTION 2: LIVE SCANNER ═══════════ -->
+    <!-- ═══════════ SECTION 2: LIVE ACTIVITY ═══════════ -->
     <section class="scanner-section" id="scanner">
-        <!-- Stats Bar -->
-        <div class="stats-bar">
-            <div class="stat-card">
-                <div class="stat-value" id="statListings">0</div>
-                <div class="stat-label">Listings Scanned</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statAnalyzed">0</div>
-                <div class="stat-label">Cards Analyzed by AI</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statDeals">0</div>
-                <div class="stat-label">Deals Found</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statNextScan">—</div>
-                <div class="stat-label">Next Scan</div>
-            </div>
-        </div>
-
         <!-- Live Activity Panel -->
         <div class="activity-panel">
             <div class="activity-header">
-                <h2>🔍 Live Scanner Activity</h2>
-                <div class="live-badge">
+                <h2>🔍 Auto-Lister Progress</h2>
+                <div class="live-badge" id="liveBadge" style="display: none;">
                     <span class="live-dot"></span>
-                    LIVE
+                    ACTIVE
                 </div>
             </div>
 
             <!-- Current AI Analysis (featured) -->
             <div class="ai-current" id="aiCurrent" style="display:none;">
-                <div class="ai-current-image">
-                    <img id="aiCurrentImg" src="" alt="Card being analyzed">
-                    <div class="ai-scanning-overlay" id="aiScanOverlay">
-                        <div class="scanning-line"></div>
-                        <span>AI Analyzing...</span>
-                    </div>
-                </div>
-                <div class="ai-current-info">
-                    <div class="ai-current-title" id="aiCurrentTitle">Analyzing...</div>
-                    <div class="ai-result" id="aiResult" style="display:none;">
-                        <div class="ai-result-row">
-                            <span class="ai-label">Card:</span>
-                            <span class="ai-value" id="aiCardName">—</span>
-                        </div>
-                        <div class="ai-result-row">
-                            <span class="ai-label">Set:</span>
-                            <span class="ai-value" id="aiCardSet">—</span>
-                        </div>
-                        <div class="ai-result-row">
-                            <span class="ai-label">Rarity:</span>
-                            <span class="ai-value" id="aiCardRarity">—</span>
-                        </div>
-                        <div class="ai-result-row">
-                            <span class="ai-label">Condition:</span>
-                            <span class="ai-value" id="aiCardCondition">—</span>
-                        </div>
-                        <div class="ai-result-row">
-                            <span class="ai-label">Confidence:</span>
-                            <span class="ai-value" id="aiCardConfidence">—</span>
-                        </div>
-                        <div class="ai-result-divider"></div>
-                        <div class="ai-result-row price-row">
-                            <span class="ai-label">Listed:</span>
-                            <span class="ai-value listed-price" id="aiListedPrice">—</span>
-                        </div>
-                        <div class="ai-result-row price-row">
-                            <span class="ai-label">Market Value:</span>
-                            <span class="ai-value market-price" id="aiMarketPrice">—</span>
-                        </div>
-                        <div class="ai-result-row" id="aiVerdictRow" style="display:none;">
-                            <span class="ai-verdict" id="aiVerdict"></span>
-                        </div>
-                    </div>
-                </div>
+                <!-- Re-used structure but we can just use the activity log for now to keep it simple -->
             </div>
 
             <!-- Activity Log -->
             <div class="activity-log" id="activityLog">
                 <div class="log-entry log-placeholder">
                     <span class="log-icon">⏳</span>
-                    <span class="log-text">Waiting for scanner to start...</span>
+                    <span class="log-text">Waiting for photos to be uploaded...</span>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- ═══════════ SECTION 3: DISCOVERIES ═══════════ -->
+    <!-- ═══════════ SECTION 3: TOP 100 CARDS LISTED ═══════════ -->
     <section class="deals-section" id="deals">
         <div class="deals-header">
-            <h2>🎯 Agent Discoveries</h2>
+            <h2>🎯 Top Cards Listed on eBay</h2>
 
             <div class="feed-tabs">
                 <button class="feed-tab active" data-feed="deals" id="tabDeals">🔥 Deals Only</button>

@@ -17,12 +17,11 @@ import { mkdirSync } from 'fs';
 import Database from 'better-sqlite3';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
-import cron from 'node-cron';
 import puppeteer from 'puppeteer';
+import multer from 'multer';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const SCAN_INTERVAL = parseInt(process.env.SCAN_INTERVAL_MINUTES || '5', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════
@@ -297,6 +296,12 @@ async function analyzeListingTitle(title, price) {
 // ═══════════════════════════════════════════════════════════════
 
 const priceCache = new Map();
+
+// Configure Multer for in-memory storage of uploaded photos
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
+});
 
 function checkKnownCards(name, set) {
     const n = (name || '').toLowerCase(), s = (set || '').toLowerCase();
@@ -783,299 +788,48 @@ function broadcastActivity(type, message, details = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  SCAN CYCLE — The main pipeline
+//  BULK LOT ANALYSIS (from pokemon-card-scraper logic)
 // ═══════════════════════════════════════════════════════════════
 
-let scanState = {
-    isRunning: false, cycleCount: 0, lastCycleAt: null, nextCycleAt: null,
-    totalListings: 0, totalDeals: 0, cardsAnalyzed: 0
-};
+const BULK_LOT_PROMPT = `Analyze this image containing multiple Pokemon cards (a lot).
+You are an expert Pokemon TCG appraiser. Identify EVERY Pokemon card visible in the image.
+For each card, provide its name, set (if identifiable), and estimated condition.
+Pay attention to holographic patterns, 1st edition stamps, and obvious damage.
 
-async function runScanCycle() {
-    if (scanState.isRunning) return;
-    scanState.isRunning = true;
-    scanState.cycleCount++;
-    const cycleNum = scanState.cycleCount;
-
-    broadcastActivity('cycle_start', `Scan cycle #${cycleNum} starting...`);
-    broadcast({ type: 'status', scanState: { ...scanState } });
-
-    // Pick random subset of search terms per cycle
-    const shuffled = [...SEARCH_TERMS].sort(() => Math.random() - 0.5);
-    const cycleTerms = shuffled.slice(0, 3);
-
-    // Always include a 1st edition term in every cycle
-    const firstEdTerm = FIRST_EDITION_TERMS[Math.floor(Math.random() * FIRST_EDITION_TERMS.length)];
-    if (!cycleTerms.includes(firstEdTerm)) cycleTerms.push(firstEdTerm);
-
-    broadcastActivity('search_terms', `Searching for: ${cycleTerms.join(', ')}`);
-
-    let cycleNewListings = 0;
-    let cycleDeals = 0;
-
-    for (const scraper of SCRAPERS) {
-        if (!scraper.enabled) continue;
-
-        broadcastActivity('scraper_start', `Scanning ${scraper.name.toUpperCase()}...`, { marketplace: scraper.name });
-
-        let allListings = [];
-        for (const term of cycleTerms) {
-            try {
-                await sleep(scraper.rateLimit);
-                const results = await scraper.fn(term);
-                allListings.push(...results);
-                broadcastActivity('search_result', `${scraper.name}: "${term}" → ${results.length} listings`, { marketplace: scraper.name, count: results.length });
-            } catch (err) {
-                broadcastActivity('error', `${scraper.name} error: ${err.message}`, { marketplace: scraper.name });
-            }
-        }
-
-        // Dedupe
-        const seen = new Set();
-        allListings = allListings.filter(l => { if (seen.has(l.id)) return false; seen.add(l.id); return true; });
-
-        // Filter new and remove spam keywords
-        const spamWords = ['proxy', 'custom', 'orica', 'metal', 'reprint', 'pocket card', 'fantastic parade', 'fan art', 'replica', 'fake', 'novelty'];
-
-        const newListings = allListings.filter(l => {
-            if (isListingSeen(l.id)) return false;
-            const titleLower = (l.title || '').toLowerCase();
-            return !spamWords.some(w => titleLower.includes(w));
-        });
-
-        for (const l of newListings) insertListing(l);
-        cycleNewListings += newListings.length;
-        scanState.totalListings += newListings.length;
-
-        broadcastActivity('new_listings', `${scraper.name}: ${newListings.length} new listings (${allListings.length} total)`,
-            { marketplace: scraper.name, newCount: newListings.length, totalCount: allListings.length });
-
-        // Analyze new listings with Vision AI or Title-based AI
-        let imagesAnalyzed = 0;
-        let titleAnalyzed = 0;
-        let noImageCount = 0;
-        console.log(`  [Analysis] Starting analysis of ${newListings.length} new listings`);
-        for (const listing of newListings) {
-            console.log(`  [Debug] Listing: title="${(listing.title || '').substring(0, 60)}" price=${listing.price} images=${listing.imageUrls?.length || 0} marketplace=${listing.marketplace}`);
-            await sleep(800); // 120 RPM limit since Gemini Billing is enabled
-
-            // === BRANCH A: No image — use title-based AI analysis ===
-            if (!listing.imageUrls?.length) {
-                noImageCount++;
-                if (listing.title && listing.price > 0 && geminiModel) {
-                    titleAnalyzed++;
-                    broadcastActivity('analyzing_title', `AI analyzing: "${listing.title.substring(0, 70)}" ($${listing.price})`, {
-                        marketplace: listing.marketplace, listingTitle: listing.title,
-                        listingPrice: listing.price, listingUrl: listing.listingUrl,
-                    });
-                    const titleResult = await analyzeListingTitle(listing.title, listing.price);
-                    if (titleResult?.is_pokemon_card && titleResult.cards?.length > 0) {
-                        for (const card of titleResult.cards) {
-                            if (!card.card_name) continue;
-                            broadcastActivity('card_identified', `Identified: ${card.card_name} (${card.rarity || 'Unknown'})`, {
-                                cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity,
-                                confidence: card.confidence, aiEstimate: card.estimated_value_usd,
-                                listingPrice: listing.price, marketplace: listing.marketplace,
-                            });
-                            let marketPrice = (typeof card.estimated_value_usd === 'number' && card.estimated_value_usd > 0) ? card.estimated_value_usd : null;
-                            const lookedUp = await lookupPrice(card.card_name, card.card_set, card.card_number);
-                            if (lookedUp) marketPrice = lookedUp;
-                            if (!marketPrice) continue;
-                            broadcastActivity('price_comparison', `${card.card_name}: Listed $${listing.price.toFixed(2)} vs Market $${marketPrice.toFixed(2)}`, {
-                                cardName: card.card_name, listingPrice: listing.price, marketPrice,
-                                marketplace: listing.marketplace, listingUrl: listing.listingUrl,
-                            });
-                            const cardId = insertCard({
-                                listingId: listing.id, cardName: card.card_name, cardSet: card.card_set,
-                                cardNumber: card.card_number, rarity: card.rarity, conditionEst: card.condition_estimate,
-                                isHolo: card.is_holographic, is1stEd: card.is_first_edition, confidence: card.confidence, marketPrice
-                            });
-                            scanState.cardsAnalyzed++;
-                            const deal = scoreDeal({
-                                listingPrice: listing.price, marketPrice, rarity: card.rarity,
-                                isHolo: card.is_holographic, is1stEd: card.is_first_edition,
-                                postedAt: listing.postedAt, confidence: card.confidence
-                            });
-                            if (deal) {
-                                if (listing.price / marketPrice < 0.05 && marketPrice > 100) continue;
-                                const dealId = insertDeal({
-                                    listingId: listing.id, cardId, listingPrice: listing.price,
-                                    marketPrice, discountPct: deal.discountPct, dealTier: deal.dealTier, dealScore: deal.dealScore
-                                });
-                                cycleDeals++;
-                                scanState.totalDeals++;
-                                const emoji = { incredible: '🔥', great: '💎', good: '👍' }[deal.dealTier];
-                                broadcastActivity('deal_found', `${emoji} ${deal.dealTier.toUpperCase()} DEAL: ${card.card_name} — $${listing.price.toFixed(2)} (${(deal.discountPct * 100).toFixed(0)}% off!)`, {
-                                    dealId, dealTier: deal.dealTier, dealScore: deal.dealScore,
-                                    cardName: card.card_name, listingPrice: listing.price, marketPrice,
-                                    discountPct: deal.discountPct, savings: deal.savings, marketplace: listing.marketplace,
-                                    listingUrl: listing.listingUrl, confidence: card.confidence,
-                                });
-                                broadcast({
-                                    type: 'new_deal', deal: {
-                                        id: dealId, listing_id: listing.id, title: listing.title,
-                                        listing_url: listing.listingUrl, image_urls: JSON.stringify(listing.imageUrls || []),
-                                        marketplace: listing.marketplace, card_name: card.card_name, card_set: card.card_set,
-                                        rarity: card.rarity, listing_price: listing.price, market_price: marketPrice,
-                                        discount_pct: deal.discountPct, deal_tier: deal.dealTier, deal_score: deal.dealScore,
-                                        confidence: card.confidence,
-                                    }
-                                });
-                            } else {
-                                broadcastActivity('no_deal', `Fair price for ${card.card_name}`, { cardName: card.card_name });
-                            }
-                        }
-                    }
-                    continue;
-                }
-                continue; // No image, no AI — skip
-            }
-            // === BRANCH B: Has image — use Vision AI ===
-            const imageUrl = listing.imageUrls[0];
-            imagesAnalyzed++;
-
-            console.log(`  [Vision] Analysing image: "${listing.title.substring(0, 40)}" (${imageUrl.substring(0, 40)}...)`);
-            // Broadcast: we're looking at this listing image
-            broadcastActivity('analyzing_image', `Analyzing: "${listing.title.substring(0, 60)}..."`, {
-                marketplace: listing.marketplace, listingTitle: listing.title,
-                imageUrl, listingUrl: listing.listingUrl, listingPrice: listing.price,
-            });
-
-            // Quick check — is this even a pokemon card?
-            const quick = await quickCheckImage(imageUrl);
-            if (!quick) {
-                console.log(`  [Vision] Skip: quick check failed/errored for "${listing.title.substring(0, 40)}"`);
-                continue;
-            }
-            if (!quick.is_pokemon_card) {
-                console.log(`  [Vision] Skip: Not a pokemon card ("${listing.title.substring(0, 40)}")`);
-                broadcastActivity('skip_listing', `Not a card image, skipping`, { listingTitle: listing.title });
-                continue;
-            }
-
-            /*
-            if (quick.worth_detailed_analysis === false && (!quick.estimated_value || quick.estimated_value < 5)) {
-                console.log(`  [Vision] Skip: Low value card (< $5) (${quick.estimated_value}) ("${listing.title.substring(0, 40)}")`);
-                broadcastActivity('skip_listing', `Low-value card (< $5), skipping`, { cardName: quick.card_name });
-                continue;
-            }
-            */
-
-            console.log(`  [Vision] Passed quick check: ${quick.card_name || 'Unknown'} - doing full analysis...`);
-            scanState.cardsAnalyzed++;
-            broadcast({ type: 'status', scanState: { ...scanState } });
-
-            // Full analysis
-            broadcastActivity('ai_analyzing', `AI identifying card from image...`, { imageUrl, listingTitle: listing.title });
-            await sleep(500);
-            const result = await analyzeCardImage(imageUrl);
-
-            if (!result?.cards?.length) {
-                broadcastActivity('ai_no_result', `Could not identify card`, { listingTitle: listing.title });
-                continue;
-            }
-
-            for (const card of result.cards) {
-                if (!card.card_name) continue;
-
-                // Broadcast AI identification result
-                broadcastActivity('card_identified', `Identified: ${card.card_name}`, {
-                    cardName: card.card_name, cardSet: card.card_set, cardNumber: card.card_number,
-                    rarity: card.rarity, condition: card.condition_estimate, isHolo: card.is_holographic,
-                    is1stEd: card.is_first_edition, confidence: card.confidence,
-                    aiEstimate: card.estimated_value_usd, imageUrl, listingPrice: listing.price,
-                });
-
-                // Look up market price
-                let marketPrice = await lookupPrice(card.card_name, card.card_set, card.card_number);
-                if (!marketPrice && card.estimated_value_usd) {
-                    marketPrice = parseFloat(card.estimated_value_usd);
-                    if (isNaN(marketPrice) || marketPrice <= 0) marketPrice = null;
-                }
-
-                if (!marketPrice) {
-                    broadcastActivity('no_price', `No price data for ${card.card_name}`, { cardName: card.card_name });
-                    continue;
-                }
-
-                // Broadcast price comparison
-                broadcastActivity('price_comparison', `${card.card_name}: Listed $${listing.price.toFixed(2)} vs Market $${marketPrice.toFixed(2)}`, {
-                    cardName: card.card_name, listingPrice: listing.price, marketPrice,
-                    imageUrl, marketplace: listing.marketplace, listingUrl: listing.listingUrl,
-                });
-
-                // Insert card record
-                const cardId = insertCard({
-                    listingId: listing.id, cardName: card.card_name, cardSet: card.card_set,
-                    cardNumber: card.card_number, rarity: card.rarity, conditionEst: card.condition_estimate,
-                    isHolo: card.is_holographic, is1stEd: card.is_first_edition, confidence: card.confidence, marketPrice
-                });
-
-                // Score the deal
-                const deal = scoreDeal({
-                    listingPrice: listing.price, marketPrice, rarity: card.rarity,
-                    isHolo: card.is_holographic, is1stEd: card.is_first_edition,
-                    postedAt: listing.postedAt, confidence: card.confidence
-                });
-
-                if (deal) {
-                    // Check for scams (95%+ off cards over $100)
-                    if (listing.price / marketPrice < 0.05 && marketPrice > 100) {
-                        broadcastActivity('scam_warning', `⚠️ Suspiciously cheap: ${card.card_name}`, { cardName: card.card_name, listingPrice: listing.price, marketPrice });
-                        continue;
-                    }
-
-                    const dealId = insertDeal({
-                        listingId: listing.id, cardId, listingPrice: listing.price,
-                        marketPrice, discountPct: deal.discountPct, dealTier: deal.dealTier, dealScore: deal.dealScore
-                    });
-
-                    cycleDeals++;
-                    scanState.totalDeals++;
-
-                    const emoji = { incredible: '🔥', great: '💎', good: '👍' }[deal.dealTier];
-                    broadcastActivity('deal_found', `${emoji} ${deal.dealTier.toUpperCase()} DEAL: ${card.card_name} — $${listing.price.toFixed(2)} (${(deal.discountPct * 100).toFixed(0)}% off!)`, {
-                        dealId, dealTier: deal.dealTier, dealScore: deal.dealScore,
-                        cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity,
-                        isHolo: card.is_holographic, is1stEd: card.is_first_edition,
-                        listingPrice: listing.price, marketPrice, discountPct: deal.discountPct,
-                        savings: deal.savings, imageUrl, marketplace: listing.marketplace,
-                        listingUrl: listing.listingUrl, confidence: card.confidence,
-                    });
-
-                    // Also broadcast as a new deal for the deal grid
-                    broadcast({
-                        type: 'new_deal', deal: {
-                            id: dealId, listing_id: listing.id, title: listing.title,
-                            listing_url: listing.listingUrl, image_urls: JSON.stringify(listing.imageUrls),
-                            marketplace: listing.marketplace, card_name: card.card_name, card_set: card.card_set,
-                            rarity: card.rarity, is_holo: card.is_holographic ? 1 : 0, is_1st_ed: card.is_first_edition ? 1 : 0,
-                            listing_price: listing.price, market_price: marketPrice,
-                            discount_pct: deal.discountPct, deal_tier: deal.dealTier, deal_score: deal.dealScore,
-                            confidence: card.confidence,
-                        }
-                    });
-                } else {
-                    broadcastActivity('no_deal', `Fair price for ${card.card_name} (not a deal)`, { cardName: card.card_name });
-                }
-            }
-        }
-
-        broadcastActivity('scraper_done', `${scraper.name.toUpperCase()} scan complete`, { marketplace: scraper.name });
+Return ONLY valid JSON (no markdown fences):
+{
+  "identified_cards": [
+    {
+       "card_name": "Pokemon name",
+       "card_set": "Set name or Unknown",
+       "card_number": "e.g. 4/102",
+       "rarity": "Common|Uncommon|Rare|Rare Holo|Unknown",
+       "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
+       "is_holographic": true/false,
+       "is_first_edition": true/false,
+       "confidence": 0.0 to 1.0,
+       "notes": "Any identifying features or damage seen"
     }
+  ],
+  "total_cards_found": number
+}`;
 
-    scanState.isRunning = false;
-    scanState.lastCycleAt = new Date().toISOString();
-    scanState.nextCycleAt = new Date(Date.now() + SCAN_INTERVAL * 60000).toISOString();
-
-    broadcastActivity('cycle_complete', `Cycle #${cycleNum} complete — ${cycleNewListings} new listings, ${cycleDeals} deals found`, {
-        newListings: cycleNewListings, deals: cycleDeals
-    });
-    broadcast({ type: 'status', scanState: { ...scanState } });
-
-    console.log(`✅ Cycle #${cycleNum}: ${cycleNewListings} new, ${cycleDeals} deals (images analyzed across all scrapers)`);
-    console.log(`   Listings without images were analyzed by title or skipped`);
+async function analyzeImageBuffer(buffer, mimeType) {
+    if (!geminiModel) return null;
+    try {
+        const base64Data = buffer.toString('base64');
+        const result = await geminiModel.generateContent([
+            BULK_LOT_PROMPT,
+            { inlineData: { data: base64Data, mimeType } }
+        ]);
+        const text = result.response.text();
+        return parseAiJson(text);
+    } catch (err) {
+        console.error('  [Vision Analysis] Error analyzing uploaded buffer:', err.message);
+        return null; // Return null instead of throwing to prevent crashing on single bad images
+    }
 }
+
 
 // ═══════════════════════════════════════════════════════════════
 //  EXPRESS SERVER
@@ -1103,14 +857,102 @@ app.get('/api/cards', (req, res) => {
 // API: stats
 app.get('/api/stats', (req, res) => {
     const stats = getStats();
-    res.json({ ...stats, scanState });
+    res.json({ ...stats });
 });
+
+// New Auto-Lister API implementation
+app.post('/api/analyze-and-list', upload.array('photos'), async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const files = req.files;
+
+        if (!files || files.length === 0) {
+            return res.status(400).json({ success: false, message: 'No photos provided.' });
+        }
+
+        if (!username || !password) {
+            return res.status(400).json({ success: false, message: 'eBay credentials required.' });
+        }
+
+        broadcastActivity('cycle_start', `Received ${files.length} photos for processing...`);
+
+        // This process handles the remaining pipeline entirely asynchronously, sending events via SSE
+        processUploadAndList(username, password, files).catch(err => {
+            console.error('Background processing error:', err);
+            broadcastActivity('error', `Pipeline error: ${err.message}`);
+        });
+
+        // Immediately respond to client with success
+        res.json({ success: true, message: 'Pipeline started successfully.' });
+    } catch (err) {
+        console.error('Upload Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// The core logic function handling the 5 steps mentioned
+async function processUploadAndList(username, password, files) {
+    let allCards = [];
+
+    // Step 2 & 3: Vision AI Analysis
+    for (const [index, file] of files.entries()) {
+        try {
+            broadcastActivity('analyzing_image', `Analyzing photo ${index + 1} of ${files.length}...`);
+            const analysis = await analyzeImageBuffer(file.buffer, file.mimetype);
+            if (analysis && analysis.identified_cards && analysis.identified_cards.length > 0) {
+                broadcastActivity('card_identified', `Found ${analysis.identified_cards.length} cards in photo ${index + 1}.`);
+                for (const card of analysis.identified_cards) {
+                    // Get market valuation via price check
+                    broadcastActivity('price_comparison', `Fetching valuation for ${card.card_name}...`);
+                    let marketPrice = await lookupPrice(card.card_name, card.card_set, card.card_number);
+                    if (!marketPrice) {
+                        // Default fallback logic
+                        marketPrice = card.estimated_value_usd ? parseFloat(card.estimated_value_usd) : 5.0;
+                    }
+                    allCards.push({
+                        ...card,
+                        marketPrice,
+                        originalImageBuffer: file.buffer,
+                        originalMimeType: file.mimetype
+                    });
+                    broadcastActivity('card_identified', `Valued ${card.card_name} at $${marketPrice.toFixed(2)}`, {
+                        cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity, aiEstimate: marketPrice
+                    });
+                }
+            } else {
+                broadcastActivity('ai_no_result', `No cards found in photo ${index + 1}.`);
+            }
+        } catch (err) {
+            console.error(`Photo ${index + 1} analysis error:`, err.message);
+            broadcastActivity('error', `Failed to analyze photo ${index + 1}: ${err.message}`);
+        }
+    }
+
+    if (allCards.length === 0) {
+        broadcastActivity('error', 'No cards identified in any given photos. Pipeline stopped.');
+        return;
+    }
+
+    // Step 4: Sort by valuation
+    allCards.sort((a, b) => b.marketPrice - a.marketPrice);
+
+    // Pick top 100 for listing (as per user instruction)
+    const topCards = allCards.slice(0, 100);
+    broadcastActivity('deal_found', `Proceeding to list the top ${topCards.length} cards.`);
+
+    // Step 5: Puppeteer upload
+    // We import and execute this from the ebay lister script
+    const { listCardsOnEbay } = await import('./ebayLister.js');
+    await listCardsOnEbay(username, password, topCards, broadcastActivity, broadcast);
+
+    broadcastActivity('cycle_complete', 'All operations finished successfully!');
+}
 
 // SSE: real-time event stream
 app.get('/api/events', (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     sseClients.add(res);
-    res.write(`data: ${JSON.stringify({ type: 'connected', scanState })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
     req.on('close', () => sseClients.delete(res));
 });
 
@@ -1124,22 +966,13 @@ app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 console.log(`
 ╔══════════════════════════════════════════════════╗
 ║  ⚡ Jack's Pokemon Packs — PokéSniper Agent      ║
-║  AI-Powered Card Deal Finder                      ║
+║  AI - Powered Card Deal Finder                   ║
 ╚══════════════════════════════════════════════════╝
-`);
+                    `);
 
 app.listen(PORT, () => {
     console.log(`🌐 Website running at http://localhost:${PORT}`);
-    console.log(`🔍 Scanning every ${SCAN_INTERVAL} minutes`);
     console.log('');
-
-    // Run first scan after a short delay
-    setTimeout(runScanCycle, 3000);
-
-    // Schedule recurring scans
-    cron.schedule(`*/${SCAN_INTERVAL} * * * *`, runScanCycle);
-
-    scanState.nextCycleAt = new Date(Date.now() + 3000).toISOString();
 });
 
 // Graceful shutdown

@@ -16,76 +16,17 @@ let eventSource = null;
 // ═══════════ INIT ═══════════
 
 document.addEventListener('DOMContentLoaded', () => {
-    initCardEffect();
     initParticles();
-    initIdleAnimation();
     initNavigation();
+    initAutoListForm();
     connectSSE();
-    fetchDeals();
-    fetchCards();
     fetchStats();
     initFilters();
 
     setInterval(fetchStats, 15000);
 });
 
-// ═══════════ 3D CARD EFFECT (preserved) ═══════════
-
-function initCardEffect() {
-    const card = document.getElementById('pokemon-card');
-    const container = document.getElementById('card-container');
-    if (!card || !container) return;
-
-    const config = { maxRotation: 25, scale: 1.05, transitionSpeed: 0.1 };
-    let isHovering = false;
-    let raf = null;
-
-    function updateCard(rotateX, rotateY, mouseX, mouseY) {
-        card.style.transform = `rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale3d(${config.scale},${config.scale},${config.scale})`;
-        card.style.setProperty('--mouse-x', `${((mouseX + 1) / 2) * 100}%`);
-        card.style.setProperty('--mouse-y', `${((mouseY + 1) / 2) * 100}%`);
-        card.style.setProperty('--holo-angle', `${Math.atan2(mouseY, mouseX) * (180 / Math.PI) + 135}deg`);
-    }
-
-    container.addEventListener('mouseenter', () => {
-        isHovering = true;
-        card.style.transition = `transform ${config.transitionSpeed}s ease-out`;
-    });
-
-    container.addEventListener('mouseleave', () => {
-        isHovering = false;
-        if (raf) cancelAnimationFrame(raf);
-        card.style.transition = 'transform 0.5s ease-out';
-        card.style.transform = 'rotateX(0deg) rotateY(0deg) scale3d(1,1,1)';
-        card.style.setProperty('--mouse-x', '50%');
-        card.style.setProperty('--mouse-y', '50%');
-    });
-
-    container.addEventListener('mousemove', (e) => {
-        if (!isHovering) return;
-        if (raf) cancelAnimationFrame(raf);
-        raf = requestAnimationFrame(() => {
-            const rect = container.getBoundingClientRect();
-            const mx = (e.clientX - rect.left - rect.width / 2) / (rect.width / 2);
-            const my = (e.clientY - rect.top - rect.height / 2) / (rect.height / 2);
-            updateCard(-my * config.maxRotation, mx * config.maxRotation, mx, my);
-        });
-    });
-
-    // Touch support
-    container.addEventListener('touchstart', () => card.classList.add('active'), { passive: true });
-    container.addEventListener('touchmove', (e) => {
-        const t = e.touches[0], rect = container.getBoundingClientRect();
-        const mx = ((t.clientX - rect.left) / rect.width) * 2 - 1;
-        const my = ((t.clientY - rect.top) / rect.height) * 2 - 1;
-        updateCard(-my * config.maxRotation, mx * config.maxRotation, mx, my);
-    }, { passive: true });
-    container.addEventListener('touchend', () => {
-        card.classList.remove('active');
-        card.style.transition = 'transform 0.5s ease-out';
-        card.style.transform = 'rotateX(0deg) rotateY(0deg) scale3d(1,1,1)';
-    });
-}
+// ═══════════ PARTICLES ═══════════
 
 function initParticles() {
     const container = document.getElementById('particles');
@@ -99,22 +40,6 @@ function initParticles() {
         p.style.cssText = `width:${size}px;height:${size}px;left:${Math.random() * 100}%;background:${color};animation-delay:${Math.random() * 8}s;animation-duration:${Math.random() * 4 + 6}s;box-shadow:0 0 ${size * 2}px ${color};`;
         container.appendChild(p);
     }
-}
-
-function initIdleAnimation() {
-    const card = document.getElementById('pokemon-card');
-    const container = document.getElementById('card-container');
-    if (!card || !container) return;
-    let angle = 0, idle = true;
-    container.addEventListener('mouseenter', () => idle = false);
-    container.addEventListener('mouseleave', () => setTimeout(() => idle = true, 600));
-    (function animate() {
-        if (idle) {
-            angle += 0.02;
-            card.style.transform = `rotateX(${Math.sin(angle) * 3}deg) rotateY(${Math.cos(angle * 0.7) * 3}deg) scale3d(1,1,1)`;
-        }
-        requestAnimationFrame(animate);
-    })();
 }
 
 // ═══════════ NAVIGATION ═══════════
@@ -140,6 +65,59 @@ function initNavigation() {
     });
 }
 
+// ═══════════ FORM SUBMISSION ═══════════
+
+function initAutoListForm() {
+    const form = document.getElementById('autoListForm');
+    if (!form) return;
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const username = document.getElementById('ebayUsername').value;
+        const password = document.getElementById('ebayPassword').value;
+        const files = document.getElementById('cardPhotos').files;
+
+        if (!files.length) return alert('Please select at least one photo.');
+
+        const btn = document.getElementById('btnSubmitAutoList');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="cta-icon">⏳</span> Uploading...';
+
+        // Clear activity log and show live badge
+        document.getElementById('activityLog').innerHTML = '';
+        document.getElementById('liveBadge').style.display = 'flex';
+        document.getElementById('scanner').scrollIntoView({ behavior: 'smooth' });
+
+        const formData = new FormData();
+        formData.append('username', username);
+        formData.append('password', password);
+        for (let i = 0; i < files.length; i++) {
+            formData.append('photos', files[i]);
+        }
+
+        try {
+            const resp = await fetch('/api/analyze-and-list', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await resp.json();
+
+            if (data.success) {
+                btn.innerHTML = '<span class="cta-icon">✅</span> Pipeline Started';
+            } else {
+                alert(`Error: ${data.message}`);
+                btn.disabled = false;
+                btn.innerHTML = '<span class="cta-icon">🚀</span> Analyze & Auto-List on eBay';
+            }
+        } catch (err) {
+            alert(`Upload failed: ${err.message}`);
+            btn.disabled = false;
+            btn.innerHTML = '<span class="cta-icon">🚀</span> Analyze & Auto-List on eBay';
+        }
+    });
+}
+
 // ═══════════ SSE CONNECTION ═══════════
 
 function connectSSE() {
@@ -151,19 +129,13 @@ function connectSSE() {
             const data = JSON.parse(e.data);
             switch (data.type) {
                 case 'connected':
-                    setNavStatus('Connected — Monitoring', true);
-                    if (data.scanState) updateScanState(data.scanState);
+                    setNavStatus('Connected', true);
                     break;
                 case 'activity':
                     handleActivity(data);
                     break;
-                case 'new_deal':
-                    addDeal(data.deal);
-                    showToast(data.deal);
-                    fetchStats();
-                    break;
-                case 'status':
-                    if (data.scanState) updateScanState(data.scanState);
+                case 'listing_created':
+                    addDeal(data.card); // Repurpose addDeal for created listings
                     break;
             }
         } catch (err) { console.error('SSE parse error:', err); }

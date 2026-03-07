@@ -1,12 +1,12 @@
 /**
- * Jack's Pokemon Packs — Integrated Server
+ * Jack's Pokemon Packs — Portfolio Tracker Server
  * 
- * Single Express server that:
- * 1. Serves the website (static HTML/CSS/JS)
- * 2. Runs marketplace scrapers (eBay, Mercari, OfferUp, Facebook)
- * 3. Analyzes listing images with Gemini Vision AI
- * 4. Looks up market prices
- * 5. Scores deals and broadcasts results via SSE
+ * Express server that:
+ * 1. Serves the portfolio dashboard (static HTML/CSS/JS)
+ * 2. Stores cards permanently in a SQLite portfolio database
+ * 3. Analyzes uploaded card photos with Gemini Vision AI
+ * 4. Scrapes marketplace prices (eBay, Mercari, etc.)
+ * 5. Tracks price history over time with background refresh
  */
 
 import 'dotenv/config';
@@ -52,28 +52,6 @@ async function getBrowser() {
 //  CONFIG
 // ═══════════════════════════════════════════════════════════════
 
-const SEARCH_TERMS = [
-    'pokemon card',
-    'pokemon cards lot',
-    'pokemon tcg',
-    'pokemon card rare',
-    'charizard card',
-    'pokemon holographic card',
-    'pokemon card vintage',
-    'pokemon card psa',
-    'pokemon card shadowless',
-    'pokemon card collection',
-    'pokemon booster box',
-];
-
-// 1st Edition terms — always included in every cycle
-const FIRST_EDITION_TERMS = [
-    'pokemon 1st edition',
-    'pokemon first edition base set',
-    'pokemon first edition holo',
-    '1st edition shadowless pokemon',
-];
-
 const HIGH_VALUE_CARDS = [
     { name: 'Charizard', set: 'Base Set', minValue: 200 },
     { name: 'Charizard', set: 'Base Set', variant: '1st Edition', minValue: 5000 },
@@ -99,6 +77,7 @@ mkdirSync(join(__dirname, 'data'), { recursive: true });
 const db = new Database(join(__dirname, 'data', 'pokesniper.db'));
 db.pragma('journal_mode = WAL');
 
+// Legacy tables (kept for backward compat)
 db.exec(`
   CREATE TABLE IF NOT EXISTS listings (
     id TEXT PRIMARY KEY, marketplace TEXT, title TEXT, price REAL,
@@ -124,37 +103,89 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_listings_seen ON listings(first_seen_at);
 `);
 
-function isListingSeen(id) { return !!db.prepare('SELECT 1 FROM listings WHERE id=?').get(id); }
-function insertListing(l) {
-    return db.prepare(`INSERT OR IGNORE INTO listings(id,marketplace,title,price,image_urls,listing_url,posted_at,seller,location,watchers)
-    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(l.id, l.marketplace, l.title, l.price, JSON.stringify(l.imageUrls || []), l.listingUrl, l.postedAt, l.seller || '', l.location || '', l.watchers || 0).changes > 0;
+// ── NEW: Portfolio tables ──
+db.exec(`
+  CREATE TABLE IF NOT EXISTS portfolio_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_name TEXT NOT NULL,
+    card_set TEXT DEFAULT '',
+    card_number TEXT DEFAULT '',
+    rarity TEXT DEFAULT 'Unknown',
+    condition TEXT DEFAULT 'Unknown',
+    is_holo INTEGER DEFAULT 0,
+    is_first_edition INTEGER DEFAULT 0,
+    confidence REAL DEFAULT 0,
+    image_data TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    added_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id INTEGER NOT NULL,
+    price REAL NOT NULL,
+    source TEXT DEFAULT 'market',
+    recorded_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (card_id) REFERENCES portfolio_cards(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
+`);
+
+// ── Portfolio DB helpers ──
+function insertPortfolioCard(card) {
+    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
+        card.condition || 'Unknown', card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
+        card.confidence || 0, card.image_data || '', card.notes || ''
+    );
 }
-function insertCard(c) {
-    return db.prepare(`INSERT INTO identified_cards(listing_id,card_name,card_set,card_number,rarity,condition_est,is_holo,is_1st_ed,confidence,market_price)
-    VALUES(?,?,?,?,?,?,?,?,?,?)`).run(c.listingId, c.cardName, c.cardSet || '', c.cardNumber || '', c.rarity || 'Unknown', c.conditionEst || 'Unknown', c.isHolo ? 1 : 0, c.is1stEd ? 1 : 0, c.confidence || 0, c.marketPrice).lastInsertRowid;
+
+function insertPricePoint(cardId, price, source) {
+    return db.prepare(`INSERT INTO price_history (card_id, price, source) VALUES (?, ?, ?)`)
+        .run(cardId, price, source || 'market');
 }
-function insertDeal(d) {
-    return db.prepare(`INSERT INTO deals(listing_id,card_id,listing_price,market_price,discount_pct,deal_tier,deal_score)
-    VALUES(?,?,?,?,?,?,?)`).run(d.listingId, d.cardId, d.listingPrice, d.marketPrice, d.discountPct, d.dealTier, d.dealScore).lastInsertRowid;
+
+function getAllPortfolioCards() {
+    return db.prepare(`
+        SELECT pc.*,
+            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) as current_price,
+            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1 OFFSET 1) as previous_price
+        FROM portfolio_cards pc
+        ORDER BY (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) DESC
+    `).all();
 }
-function getRecentDeals(limit = 5000) {
-    return db.prepare(`SELECT d.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.watchers,
-    c.card_name,c.card_set,c.card_number,c.rarity,c.condition_est,c.is_holo,c.is_1st_ed,c.confidence
-    FROM deals d JOIN listings l ON d.listing_id=l.id LEFT JOIN identified_cards c ON d.card_id=c.id
-    ORDER BY d.created_at DESC LIMIT ?`).all(limit);
+
+function getCardPriceHistory(cardId) {
+    return db.prepare(`SELECT price, source, recorded_at FROM price_history WHERE card_id = ? ORDER BY recorded_at ASC`).all(cardId);
 }
-function getRecentCards(limit = 5000) {
-    return db.prepare(`SELECT c.*,l.title,l.listing_url,l.image_urls,l.marketplace,l.seller,l.posted_at,l.price,l.watchers
-    FROM identified_cards c JOIN listings l ON c.listing_id=l.id
-    ORDER BY c.created_at DESC LIMIT ?`).all(limit);
+
+function deletePortfolioCard(cardId) {
+    db.prepare(`DELETE FROM price_history WHERE card_id = ?`).run(cardId);
+    db.prepare(`DELETE FROM portfolio_cards WHERE id = ?`).run(cardId);
 }
-function getStats() {
-    const totalListings = db.prepare('SELECT COUNT(*) as c FROM listings').get().c;
-    const totalDeals = db.prepare('SELECT COUNT(*) as c FROM deals').get().c;
-    const todayDeals = db.prepare("SELECT COUNT(*) as c FROM deals WHERE created_at>datetime('now','-24 hours')").get().c;
-    const best = db.prepare('SELECT MAX(discount_pct) as m FROM deals').get().m;
-    return { totalListings, totalDeals, todayDeals, bestDiscount: best };
+
+function getPortfolioStats() {
+    const totalCards = db.prepare('SELECT COUNT(*) as c FROM portfolio_cards').get().c;
+    const totalValue = db.prepare(`
+        SELECT COALESCE(SUM(latest.price), 0) as total FROM (
+            SELECT ph.price FROM portfolio_cards pc
+            JOIN price_history ph ON ph.card_id = pc.id
+            WHERE ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1)
+        ) latest
+    `).get().total;
+    const prevValue = db.prepare(`
+        SELECT COALESCE(SUM(prev.price), 0) as total FROM (
+            SELECT ph.price FROM portfolio_cards pc
+            JOIN price_history ph ON ph.card_id = pc.id
+            WHERE ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1 OFFSET 1)
+        ) prev
+    `).get().total;
+    return { totalCards, totalValue, prevValue };
 }
+
+// Legacy helpers
 function getCachedPrice(name, set) {
     const r = db.prepare(`SELECT market_price FROM identified_cards WHERE card_name=? AND card_set=?
     AND market_price IS NOT NULL AND created_at>datetime('now','-24 hours') ORDER BY created_at DESC LIMIT 1`).get(name, set || '');
@@ -174,10 +205,8 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
 
-const CARD_ID_PROMPT = `You are an expert Pokemon TCG card grader and identifier. Analyze this image and identify any Pokemon cards.
-CRITICAL INSTRUCTION: You must intensely scrutinize the card for ANY physical damage. Look extremely closely at the edges for whitening, and scan the entire surface for creases, bends, or scratches. 
-If you see a crease (a white stress line or fold), the condition is "Damaged". If there is heavy edge wear, it is "Heavily Played".
-You must drastically reduce your \`estimated_value_usd\` if the card is damaged (a damaged card is often worth only 10-20% of its Mint value).
+const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
+Look closely at the card name, set symbol, card number, rarity, holographic patterns, 1st edition stamps, and condition.
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -189,47 +218,12 @@ Return ONLY valid JSON (no markdown fences):
     "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
     "is_holographic": true/false,
     "is_first_edition": true/false,
-    "estimated_value_usd": number (MUST BE HEAVILY PENALIZED IF DAMAGED),
+    "estimated_value_usd": number,
     "confidence": 0.0 to 1.0,
-    "notes": "List any specific damage observed (e.g., 'Large crease on right edge', 'Heavy edge whitening')"
+    "notes": "Any identifying features or damage"
   }],
   "is_pokemon_card": true/false
 }`;
-
-const QUICK_CHECK_PROMPT = `Is this a Pokemon trading card image? Reply ONLY with valid JSON (no markdown):
-{"is_pokemon_card": true/false, "card_name": "name or null", "estimated_value": 0, "worth_detailed_analysis": true/false}`;
-
-const TITLE_ANALYSIS_PROMPT = `You are an expert Pokemon TCG dealer. Analyze this marketplace listing title and price to identify specific Pokemon cards being sold.
-
-Listing Title: "{TITLE}"
-Asking Price: ${'{PRICE}'}
-
-If this listing is selling specific Pokemon cards (not just generic "card lot" or "random cards"), identify each card mentioned.
-For card lots (e.g., "100 random cards"), estimate the true market value.
-Consider: condition hints ("NM", "PSA10", "LP"), edition ("1st edition", "shadowless"), and rarity clues.
-
-Return ONLY valid JSON (no markdown fences):
-{
-  "cards": [{"card_name": "Pokemon name", "card_set": "Set name or Unknown", "card_number": "", "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Unknown", "condition_estimate": "Mint|Near Mint|Lightly Played|Unknown", "is_holographic": true/false, "is_first_edition": true/false, "estimated_value_usd": number, "confidence": 0.0 to 1.0, "notes": ""}],
-  "is_pokemon_card": true/false,
-  "is_bulk_lot": true/false,
-  "estimated_total_value": number
-}`;
-
-async function fetchImageAsBase64(url) {
-    try {
-        if (!url || url.startsWith('data:')) return null;
-        const resp = await axios.get(url, {
-            responseType: 'arraybuffer', timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7 AppleWebKit/537.36)' }
-        });
-        const mime = (resp.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
-        return { base64: Buffer.from(resp.data).toString('base64'), mimeType: mime };
-    } catch (e) {
-        console.error(`  [fetchImage] Error fetching ${url.substring(0, 50)}...: ${e.message}`);
-        return null;
-    }
-}
 
 function parseAiJson(text) {
     try {
@@ -243,50 +237,18 @@ function parseAiJson(text) {
     }
 }
 
-async function quickCheckImage(imageUrl) {
-    if (!geminiModel) return { is_pokemon_card: true, worth_detailed_analysis: true }; // assume yes if no AI
-    try {
-        const img = await fetchImageAsBase64(imageUrl);
-        if (!img) {
-            console.error(`  [quickCheck] Failed to fetch image: ${imageUrl.substring(0, 50)}...`);
-            return null;
-        }
-        const result = await geminiModel.generateContent([QUICK_CHECK_PROMPT,
-            { inlineData: { data: img.base64, mimeType: img.mimeType } }]);
-        return parseAiJson(result.response.text());
-    } catch (e) {
-        console.error(`  [quickCheck] Gemini API error: ${e.message}`);
-        return null;
-    }
-}
-
-async function analyzeCardImage(imageUrl) {
+async function analyzeImageBuffer(buffer, mimeType) {
     if (!geminiModel) return null;
     try {
-        const img = await fetchImageAsBase64(imageUrl);
-        if (!img) return null;
-        const result = await geminiModel.generateContent([CARD_ID_PROMPT,
-            { inlineData: { data: img.base64, mimeType: img.mimeType } }]);
-        return parseAiJson(result.response.text());
+        const base64Data = buffer.toString('base64');
+        const result = await geminiModel.generateContent([
+            CARD_ID_PROMPT,
+            { inlineData: { data: base64Data, mimeType } }
+        ]);
+        const text = result.response.text();
+        return parseAiJson(text);
     } catch (err) {
-        console.error('  [Vision] Error:', err.message);
-        return null;
-    }
-}
-
-// Text-based card identification using AI (no image needed)
-async function analyzeListingTitle(title, price) {
-    if (!geminiModel) return null;
-    try {
-        const prompt = TITLE_ANALYSIS_PROMPT.replace('{TITLE}', title).replace('{PRICE}', price?.toFixed(2) || '0');
-        const result = await geminiModel.generateContent([prompt]);
-        const parsed = parseAiJson(result.response.text());
-        if (parsed) {
-            console.log(`  [AI-Title] Analyzed "${title.substring(0, 50)}": ${parsed.cards?.length || 0} cards, pokemon=${parsed.is_pokemon_card}`);
-        }
-        return parsed;
-    } catch (err) {
-        console.error(`  [AI-Title] Error:`, err.message);
+        console.error('  [Vision Analysis] Error:', err.message);
         return null;
     }
 }
@@ -297,11 +259,13 @@ async function analyzeListingTitle(title, price) {
 
 const priceCache = new Map();
 
-// Configure Multer for in-memory storage of uploaded photos
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit per file
+    limits: { fileSize: 10 * 1024 * 1024 }
 });
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function parsePrice(p) { if (typeof p === 'number') return p; return parseFloat((p || '').replace(/[^0-9.]/g, '')) || 0; }
 
 function checkKnownCards(name, set) {
     const n = (name || '').toLowerCase(), s = (set || '').toLowerCase();
@@ -311,11 +275,32 @@ function checkKnownCards(name, set) {
     return null;
 }
 
-async function lookupPrice(cardName, cardSet, cardNumber) {
+// Rotating user agents
+const USER_AGENTS = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+];
+function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+
+function makeHeaders(extra = {}) {
+    return {
+        'User-Agent': randomUA(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        ...extra
+    };
+}
+
+async function lookupMarketPrice(cardName, cardSet, cardNumber) {
     if (!cardName) return null;
     const key = `${cardName}|${cardSet || ''}`.toLowerCase();
 
-    // We want the search URL available everywhere now
     const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
     const sourceUrl = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
 
@@ -332,6 +317,26 @@ async function lookupPrice(cardName, cardSet, cardNumber) {
     if (known) {
         priceCache.set(key, { price: known, ts: Date.now() });
         return { price: known, sourceUrl };
+    }
+
+    // Try eBay scrape for a live price
+    try {
+        const listings = await scrapeEbayRSS(`${cardName} ${cardSet || ''} pokemon card`);
+        if (listings.length > 0) {
+            // Filter out lots and graded, get median price
+            const filtered = listings.filter(l => {
+                const t = l.title.toLowerCase();
+                return !['lot', 'psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'orica', 'replica'].some(kw => t.includes(kw));
+            });
+            if (filtered.length > 0) {
+                filtered.sort((a, b) => a.price - b.price);
+                const medianPrice = filtered[Math.floor(filtered.length / 2)].price;
+                priceCache.set(key, { price: medianPrice, ts: Date.now() });
+                return { price: medianPrice, sourceUrl };
+            }
+        }
+    } catch (err) {
+        console.error(`  [Pricing] eBay scrape failed for ${cardName}:`, err.message);
     }
 
     // Try TCGPlayer scrape
@@ -359,431 +364,47 @@ async function lookupPrice(cardName, cardSet, cardNumber) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  DEAL SCORER
+//  SCRAPERS (eBay RSS only for price lookups — fast and reliable)
 // ═══════════════════════════════════════════════════════════════
 
-function scoreDeal({ listingPrice, marketPrice, rarity, isHolo, is1stEd, postedAt, confidence }) {
-    if (!marketPrice || marketPrice <= 0 || !listingPrice || listingPrice <= 0) return null;
-    const disc = (marketPrice - listingPrice) / marketPrice;
-    if (disc < 0.20) return null; // minimum 20% off
-    let score = disc * 100;
-
-    const mult = {
-        'Secret Rare': 1.5, 'Illustration Rare': 1.4, 'Hyper Rare': 1.4, 'Rare Ultra': 1.3,
-        'Rare Holo': 1.2, 'Rare': 1.1, 'Uncommon': 1.0, 'Common': 0.8
-    };
-    score *= mult[rarity] || 1.0;
-    if (is1stEd) score *= 1.5;
-    if (isHolo) score *= 1.1;
-    if (postedAt) {
-        const hrs = (Date.now() - new Date(postedAt).getTime()) / 3600000;
-        if (hrs < 1) score *= 1.5;
-        else if (hrs < 6) score *= 1.3;
-        else if (hrs < 24) score *= 1.1;
-    }
-    if (confidence && confidence < 1) score *= (0.5 + confidence * 0.5);
-
-    let tier;
-    if (disc >= 0.70) tier = 'incredible';
-    else if (disc >= 0.40) tier = 'great';
-    else tier = 'good';
-
-    return {
-        discountPct: disc, dealTier: tier, dealScore: Math.round(score * 100) / 100,
-        savings: +(marketPrice - listingPrice).toFixed(2)
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  SCRAPERS
-// ═══════════════════════════════════════════════════════════════
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function parsePrice(p) { if (typeof p === 'number') return p; return parseFloat((p || '').replace(/[^0-9.]/g, '')) || 0; }
-
-// Rotating user agents to avoid detection
-const USER_AGENTS = [
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0',
-];
-function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
-
-function makeHeaders(extra = {}) {
-    return {
-        'User-Agent': randomUA(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Cache-Control': 'no-cache',
-        'Sec-Ch-Ua': '"Not A(Brand";v="8", "Chromium";v="131", "Google Chrome";v="131"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"macOS"',
-        'Upgrade-Insecure-Requests': '1',
-        ...extra
-    };
-}
-
-// -- eBay (Puppeteer-based — free, unlimited, bypasses bot detection) --
-async function scrapeEbay(searchTerm) {
-    const listings = [];
-    let page = null;
-    try {
-        const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&rt=nc&_ipg=60`;
-        console.log(`  [eBay] Fetching via Puppeteer: ${url}`);
-
-        const br = await getBrowser();
-        page = await br.newPage();
-        await page.setUserAgent(randomUA());
-        await page.setViewport({ width: 1920, height: 1080 });
-
-        // Block images/fonts/css to speed up loading
-        await page.setRequestInterception(true);
-        page.on('request', req => {
-            const type = req.resourceType();
-            if (['image', 'font', 'stylesheet', 'media'].includes(type)) req.abort();
-            else req.continue();
-        });
-
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-        // Wait for search results to render
-        await page.waitForSelector('[data-viewport], li.s-item', { timeout: 8000 }).catch(() => { });
-
-        // Extract listings from the fully rendered page
-        const items = await page.evaluate(() => {
-            const results = [];
-            const els = document.querySelectorAll('[data-viewport], li.s-item');
-            els.forEach((el, i) => {
-                if (i >= 40) return;
-
-                // Title
-                let title = '';
-                const titleEl = el.querySelector('.s-item__title span') || el.querySelector('.s-item__title') || el.querySelector('[role="heading"]');
-                if (titleEl) {
-                    const clipped = titleEl.querySelector('.clipped');
-                    if (clipped) clipped.remove();
-                    title = titleEl.textContent.trim();
-                }
-                title = title.replace(/Opens in a new window or tab/gi, '').replace(/New Listing/gi, '').trim();
-
-                // Price
-                const priceEl = el.querySelector('.s-item__price') || el.querySelector('[class*="price"]');
-                const priceText = priceEl ? priceEl.textContent.trim() : '';
-
-                // Link
-                const linkEl = el.querySelector('.s-item__link') || el.querySelector('a[href*="/itm/"]');
-                const link = linkEl ? linkEl.href : '';
-
-                // Image
-                let imgSrc = '';
-                const imgEl = el.querySelector('.s-item__image-img') || el.querySelector('img[src*="ebayimg"]') || el.querySelector('img');
-                if (imgEl) imgSrc = imgEl.src || imgEl.dataset.src || '';
-                if (imgSrc && imgSrc.includes('s-l')) imgSrc = imgSrc.replace(/s-l\d+/, 's-l500');
-
-                // Watchers
-                let watchers = 0;
-                const hotnessEl = el.querySelector('.s-item__hotness, .s-item__subtitle');
-                if (hotnessEl) {
-                    const hotnessText = hotnessEl.textContent.trim().toLowerCase();
-                    const m = hotnessText.match(/(\d+)\+? watchers?/i) || hotnessText.match(/(\d+)\+? watching/i);
-                    if (m) watchers = parseInt(m[1], 10);
-                }
-
-                const itemIdMatch = link.match(/\/itm\/(\d+)/);
-                const itemId = itemIdMatch ? itemIdMatch[1] : null;
-
-                if (title && title !== 'Shop on eBay' && itemId && !title.includes('Shop on eBay')) {
-                    results.push({ title, priceText, link, imgSrc, itemId, watchers });
-                }
-            });
-            return results;
-        });
-
-        for (const item of items) {
-            const price = parsePrice(item.priceText);
-            if (price > 0 && price < 5000) {
-                listings.push({
-                    id: `ebay_${item.itemId}`, marketplace: 'ebay', title: item.title, price,
-                    imageUrls: item.imgSrc ? [item.imgSrc] : [], listingUrl: item.link.split('?')[0],
-                    postedAt: new Date().toISOString(), seller: '', location: '', watchers: item.watchers
-                });
-            }
-        }
-
-        console.log(`  [eBay] Parsed ${listings.length} valid listings from "${searchTerm}"`);
-    } catch (err) {
-        console.error(`  [eBay] Puppeteer error scraping "${searchTerm}":`, err.message);
-    } finally {
-        if (page) await page.close().catch(() => { });
-    }
-    return listings;
-}
-
-// -- Mercari (attempt with better headers) --
-async function scrapeMercari(searchTerm) {
-    const listings = [];
-    try {
-        const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.mercari.com/search/?keyword=${encoded}&category_id=2536&sort=created_time&order=desc&status=on_sale`;
-        console.log(`  [Mercari] Fetching: ${url.substring(0, 80)}...`);
-
-        const resp = await axios.get(url, {
-            headers: makeHeaders({
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-            }),
-            timeout: 15000,
-            maxRedirects: 5,
-        });
-
-        console.log(`  [Mercari] Response: ${resp.status}, size: ${resp.data.length} bytes`);
-
-        const { load } = await import('cheerio');
-        const $ = load(resp.data);
-
-        // Use reliable DOM selectors instead of __NEXT_DATA__
-        const itemLinks = $('a[data-testid="ItemContainer"]');
-        console.log(`  [Mercari] DOM: found ${itemLinks.length} item links`);
-        itemLinks.each((i, el) => {
-            if (i >= 30) return false;
-            const $el = $(el);
-            const href = $el.attr('href') || $el.attr('data-href') || '';
-            const id = href.match(/\/item\/([a-z0-9]+)/i)?.[1];
-
-            const title = $el.find('[data-testid="ItemName"]').text().trim() || $el.text().trim().substring(0, 100);
-            const price = $el.find('[data-testid="ItemPrice"]').text().trim();
-
-            let img = $el.find('img[data-testid="ItemThumbnail"]').attr('src');
-            if (!img) img = $el.find('img').attr('src') || '';
-
-            if (id && title) {
-                listings.push({
-                    id: `mercari_${id}`, marketplace: 'mercari', title, price: parsePrice(price),
-                    imageUrls: img ? [img] : [], listingUrl: `https://www.mercari.com${href}`, postedAt: new Date().toISOString()
-                });
-            }
-        });
-
-        console.log(`  [Mercari] Parsed ${listings.length} listings from "${searchTerm}"`);
-
-        // Fallback: try any item links
-        if (!listings.length) {
-            const itemLinks = $('a[href*="/item/"]');
-            console.log(`  [Mercari] DOM fallback: found ${itemLinks.length} item links`);
-            itemLinks.each((i, el) => {
-                if (i >= 30) return false;
-                const $el = $(el);
-                const href = $el.attr('href') || '';
-                const id = href.match(/\/item\/([a-z0-9]+)/i)?.[1];
-                const title = $el.find('[class*="ItemName"], [class*="title"]').text().trim() || $el.attr('aria-label') || $el.text().trim().substring(0, 100);
-                const price = $el.find('[class*="Price"], [class*="price"]').text().trim();
-                const img = $el.find('img').attr('src') || '';
-                if (id && title) {
-                    listings.push({
-                        id: `mercari_${id}`, marketplace: 'mercari', title, price: parsePrice(price),
-                        imageUrls: img ? [img] : [], listingUrl: `https://www.mercari.com${href}`, postedAt: new Date().toISOString()
-                    });
-                }
-            });
-        }
-
-        console.log(`  [Mercari] Parsed ${listings.length} listings from "${searchTerm}"`);
-    } catch (err) {
-        console.error(`  [Mercari] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
-    }
-    return listings;
-}
-
-// -- OfferUp (attempt with better headers) --
-async function scrapeOfferUp(searchTerm) {
-    const listings = [];
-    try {
-        console.log(`  [OfferUp] Trying web scraper for "${searchTerm}"...`);
-        const url = `https://offerup.com/search/?q=${encodeURIComponent(searchTerm)}&sort=-posted`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 30000 });
-        console.log(`  [OfferUp] Web Response: ${resp.status}, size: ${resp.data.length} bytes`);
-        const { load } = await import('cheerio');
-        const $ = load(resp.data);
-
-        // Try standard DOM extraction since __NEXT_DATA__ sometimes lacks items
-        let count = 0;
-        $('a[href*="/item/detail/"]').each((i, el) => {
-            if (count >= 30) return false;
-
-            const title = $(el).find('p[title]').attr('title') || $(el).text();
-
-            // Find price text containing $
-            const priceText = $(el).find('p').filter((idx, pEl) => $(pEl).text().includes('$')).first().text();
-
-            let imgUrl = $(el).find('img').attr('src');
-
-            const href = $(el).attr('href') || '';
-            const itemId = href.match(/\/item\/detail\/([a-z0-9]+)/i)?.[1] || count.toString();
-
-            if (title && priceText && title.toLowerCase().includes(searchTerm.split(' ')[0])) {
-                listings.push({
-                    id: `offerup_${itemId}`,
-                    marketplace: 'offerup',
-                    title: title.trim().substring(0, 100),
-                    price: parsePrice(priceText),
-                    imageUrls: imgUrl ? [imgUrl] : [],
-                    listingUrl: href.startsWith('http') ? href : `https://offerup.com${href}`,
-                    postedAt: new Date().toISOString()
-                });
-                count++;
-            }
-        });
-
-        console.log(`  [OfferUp] Found ${count} items from DOM.`);
-    } catch (err) { console.error(`  [OfferUp] Web Error: ${err.message}`); }
-
-    console.log(`  [OfferUp] Parsed ${listings.length} listings from "${searchTerm}"`);
-    return listings;
-
-}
-
-// -- Facebook Marketplace (HTTP-based, no Puppeteer) --
-async function scrapeFacebook(searchTerm) {
-    const listings = [];
-    try {
-        // Use the mobile/basic version of Facebook Marketplace which is lighter
-        // Removed daysSinceListed=1 as it was too restrictive
-        const url = `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(searchTerm)}&sortBy=creation_time_descend`;
-        console.log(`  [Facebook] Fetching: ${url.substring(0, 80)}...`);
-
-        const resp = await axios.get(url, {
-            headers: makeHeaders({
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-            }),
-            timeout: 20000,
-            maxRedirects: 5,
-        });
-
-        console.log(`  [Facebook] Response: ${resp.status}, size: ${resp.data.length} bytes`);
-
-        // Facebook embeds data in script tags — try to extract marketplace items
-        const dataMatches = resp.data.match(/marketplace_search.*?"edges":\s*\[(.*?)\]/gs);
-        if (dataMatches) {
-            console.log(`  [Facebook] Found marketplace data in scripts`);
-            // Try to parse JSON from the script data
-            for (const match of dataMatches) {
-                try {
-                    const itemMatches = match.matchAll(/"marketplace_listing_title":"([^"]+)".*?"listing_price":\{[^}]*"amount":"(\d+\.?\d*)"/g);
-                    for (const m of itemMatches) {
-                        const id = `facebook_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-                        listings.push({
-                            id, marketplace: 'facebook', title: m[1], price: parseFloat(m[2]),
-                            imageUrls: [], listingUrl: url, postedAt: new Date().toISOString()
-                        });
-                    }
-                } catch { }
-            }
-        }
-
-        // Also try the standard HTML parsing
-        if (!listings.length) {
-            const { load } = await import('cheerio');
-            const $ = load(resp.data);
-            $('a[href*="/marketplace/item/"]').each((i, el) => {
-                if (i >= 30) return false;
-                const href = $(el).attr('href') || '';
-                const itemId = href.match(/\/item\/(\d+)/)?.[1];
-                if (!itemId) return;
-                const text = $(el).text();
-                const priceMatch = text.match(/\$[\d,]+\.?\d*/);
-                const title = text.replace(/\$[\d,]+\.?\d*/, '').trim().substring(0, 200);
-                const img = $(el).find('img').attr('src') || '';
-                if (title) {
-                    listings.push({
-                        id: `facebook_${itemId}`, marketplace: 'facebook', title,
-                        price: priceMatch ? parsePrice(priceMatch[0]) : 0,
-                        imageUrls: img ? [img] : [], listingUrl: `https://www.facebook.com/marketplace/item/${itemId}`,
-                        postedAt: new Date().toISOString()
-                    });
-                }
-            });
-        }
-
-        console.log(`  [Facebook] Parsed ${listings.length} listings from "${searchTerm}"`);
-    } catch (err) {
-        console.error(`  [Facebook] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
-    }
-    return listings;
-}
-
-// -- eBay RSS Feed (very reliable, no anti-bot) --
 async function scrapeEbayRSS(searchTerm) {
     const listings = [];
     try {
         const encoded = encodeURIComponent(searchTerm);
-        // eBay RSS feed — always works, no anti-bot protection
         const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&_rss=1`;
-        console.log(`  [eBay-RSS] Fetching RSS for "${searchTerm}"`);
-
         const resp = await axios.get(url, {
             headers: { 'User-Agent': randomUA(), 'Accept': 'application/rss+xml,application/xml,text/xml' },
             timeout: 20000,
         });
-
-        console.log(`  [eBay-RSS] Response: ${resp.status}, size: ${resp.data.length} bytes`);
-
         const { load } = await import('cheerio');
         const $ = load(resp.data, { xmlMode: true });
-
         $('item').each((i, el) => {
             if (i >= 40) return false;
             const $el = $(el);
             const title = $el.find('title').text().trim();
             const link = $el.find('link').text().trim();
             const itemId = link.match(/\/itm\/(\d+)/)?.[1];
-
-            // Extract price — usually in the title or description
             const desc = $el.find('description').text();
-            const priceMatch = desc.match(/Price:\s*US\s*\$([\d,.]+)/i) ||
-                desc.match(/\$([\d,.]+)/);
+            const priceMatch = desc.match(/Price:\s*US\s*\$([\d,.]+)/i) || desc.match(/\$([\d,.]+)/);
             const price = priceMatch ? parsePrice(priceMatch[1]) : 0;
-
-            // Extract image from description HTML
             const imgMatch = desc.match(/src="([^"]*ebayimg[^"]*)"/i);
             const imgSrc = imgMatch ? imgMatch[1].replace(/s-l\d+/, 's-l500') : '';
-
             if (title && itemId && price > 0) {
                 listings.push({
                     id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
                     imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
-                    postedAt: new Date().toISOString(), seller: '', location: ''
+                    postedAt: new Date().toISOString()
                 });
             }
         });
-
-        console.log(`  [eBay-RSS] Parsed ${listings.length} listings`);
     } catch (err) {
-        console.error(`  [eBay-RSS] Error: ${err.message}${err.response ? ` (HTTP ${err.response.status})` : ''}`);
+        console.error(`  [eBay-RSS] Error: ${err.message}`);
     }
     return listings;
 }
 
-const SCRAPERS = [
-    { name: 'ebay', fn: scrapeEbay, rateLimit: RATE_LIMITS.ebay, enabled: true },
-    { name: 'ebay-rss', fn: scrapeEbayRSS, rateLimit: RATE_LIMITS.ebay, enabled: true },
-    { name: 'mercari', fn: scrapeMercari, rateLimit: RATE_LIMITS.mercari, enabled: true },
-    { name: 'offerup', fn: scrapeOfferUp, rateLimit: RATE_LIMITS.offerup, enabled: true },
-    { name: 'facebook', fn: scrapeFacebook, rateLimit: RATE_LIMITS.facebook, enabled: true },
-];
-
 // ═══════════════════════════════════════════════════════════════
-//  SSE (Server-Sent Events) for real-time activity
+//  SSE (Server-Sent Events) for real-time updates
 // ═══════════════════════════════════════════════════════════════
 
 const sseClients = new Set();
@@ -795,251 +416,209 @@ function broadcast(event) {
     }
 }
 
-// Broadcast a log entry to the live activity panel
-function broadcastActivity(type, message, details = {}) {
-    broadcast({ type: 'activity', activityType: type, message, details, timestamp: new Date().toISOString() });
+function broadcastActivity(type, message) {
+    broadcast({ type: 'activity', activityType: type, message, timestamp: new Date().toISOString() });
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  BULK LOT ANALYSIS (from pokemon-card-scraper logic)
+//  BACKGROUND PRICE REFRESH
 // ═══════════════════════════════════════════════════════════════
 
-const BULK_LOT_PROMPT = `Analyze this image containing multiple Pokemon cards (a lot).
-You are an expert Pokemon TCG appraiser. Identify EVERY Pokemon card visible in the image.
-For each card, provide its name, set (if identifiable), and estimated condition.
-Pay attention to holographic patterns, 1st edition stamps, and obvious damage.
+let priceRefreshRunning = false;
 
-Return ONLY valid JSON (no markdown fences):
-{
-  "identified_cards": [
-    {
-       "card_name": "Pokemon name",
-       "card_set": "Set name or Unknown",
-       "card_number": "e.g. 4/102",
-       "rarity": "Common|Uncommon|Rare|Rare Holo|Unknown",
-       "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
-       "is_holographic": true/false,
-       "is_first_edition": true/false,
-       "estimated_value_usd": number,
-       "confidence": 0.0 to 1.0,
-       "notes": "Any identifying features or damage seen"
+async function refreshAllPrices() {
+    if (priceRefreshRunning) {
+        console.log('  [PriceRefresh] Already running, skipping.');
+        return { skipped: true };
     }
-  ],
-  "total_cards_found": number
-}`;
+    priceRefreshRunning = true;
+    console.log('  [PriceRefresh] Starting price refresh for all portfolio cards...');
+    broadcastActivity('refresh_start', 'Refreshing market prices...');
 
-async function analyzeImageBuffer(buffer, mimeType) {
-    if (!geminiModel) return null;
-    try {
-        const base64Data = buffer.toString('base64');
-        const result = await geminiModel.generateContent([
-            BULK_LOT_PROMPT,
-            { inlineData: { data: base64Data, mimeType } }
-        ]);
-        const text = result.response.text();
-        return parseAiJson(text);
-    } catch (err) {
-        console.error('  [Vision Analysis] Error analyzing uploaded buffer:', err.message);
-        return null; // Return null instead of throwing to prevent crashing on single bad images
+    const cards = db.prepare('SELECT * FROM portfolio_cards').all();
+    let updated = 0;
+
+    for (const card of cards) {
+        try {
+            const result = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
+            if (result && result.price > 0) {
+                insertPricePoint(card.id, result.price, 'market');
+                updated++;
+            } else if (card.id) {
+                // If no live price found, check if we have any price at all — if not, use AI estimate
+                const hasPrice = db.prepare('SELECT 1 FROM price_history WHERE card_id = ? LIMIT 1').get(card.id);
+                if (!hasPrice) {
+                    // No price exists at all, can't do much
+                    console.log(`  [PriceRefresh] No price found for ${card.card_name}`);
+                }
+            }
+            await sleep(1500); // Rate limit between cards
+        } catch (err) {
+            console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
+        }
     }
+
+    priceRefreshRunning = false;
+    console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
+    broadcastActivity('refresh_complete', `Updated prices for ${updated} cards`);
+    broadcast({ type: 'portfolio_updated' });
+    return { updated, total: cards.length };
 }
 
-async function findHighestMarketListing(searchQuery) {
-    if (!searchQuery) return null;
+// Auto-refresh every 6 hours
+const REFRESH_INTERVAL = 6 * 60 * 60 * 1000;
+setInterval(() => {
+    refreshAllPrices().catch(err => console.error('[AutoRefresh] Error:', err.message));
+}, REFRESH_INTERVAL);
 
-    // Execute all available active scrapers simultaneously
-    const activeScrapers = SCRAPERS.filter(s => s.enabled);
-    const scrapePromises = activeScrapers.map(scraper =>
-        scraper.fn(searchQuery).catch(err => {
-            console.error(`Scraper ${scraper.name} failed for "${searchQuery}":`, err.message);
-            return [];
-        })
-    );
-
-    // Wait for all to finish and flatten the arrays
-    const results = await Promise.all(scrapePromises);
-    let allListings = results.flat();
-
-    if (allListings.length === 0) return null;
-
-    // Filter out graded cards, proxies, lots, and custom junk to find raw card value
-    const negativeKeywords = ['psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'lot', 'collection', 'orica', 'metal', 'replica'];
-
-    allListings = allListings.filter(listing => {
-        const titleLower = listing.title.toLowerCase();
-        return !negativeKeywords.some(kw => titleLower.includes(kw));
-    });
-
-    if (allListings.length === 0) return null;
-
-    // Sort descending by price to find the absolute highest value
-    allListings.sort((a, b) => b.price - a.price);
-
-    // Return the #1 highest priced authentic listing
-    return allListings[0];
-}
-
+// Initial refresh 30 seconds after startup (give server time to boot)
+setTimeout(() => {
+    refreshAllPrices().catch(err => console.error('[InitialRefresh] Error:', err.message));
+}, 30000);
 
 // ═══════════════════════════════════════════════════════════════
 //  EXPRESS SERVER
 // ═══════════════════════════════════════════════════════════════
 
 const app = express();
+app.use(express.json());
 
-// Serve static files (index.html, styles.css, script.js, card.png, etc.)
+// Serve static files
 app.use(express.static(__dirname));
 
-// API: stats
-app.get('/api/stats', (req, res) => {
-    const stats = getStats();
-    res.json({ ...stats });
+// ── Portfolio API ──
+
+// Get all portfolio cards with latest + previous prices
+app.get('/api/portfolio', (req, res) => {
+    try {
+        const cards = getAllPortfolioCards();
+        const stats = getPortfolioStats();
+        res.json({ cards, stats });
+    } catch (err) {
+        console.error('Portfolio fetch error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// NEW 3-STAGE PIPELINE: PHASE 1 & 2 (Upload & Analyze)
-// ═══════════════════════════════════════════════════════════════
+// Get price history for a single card
+app.get('/api/portfolio/:id/history', (req, res) => {
+    try {
+        const history = getCardPriceHistory(parseInt(req.params.id));
+        res.json({ history });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-app.post('/api/analyze-lot', upload.array('photos'), async (req, res) => {
+// Delete a card from portfolio
+app.delete('/api/portfolio/:id', (req, res) => {
+    try {
+        deletePortfolioCard(parseInt(req.params.id));
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Manually trigger price refresh
+app.post('/api/portfolio/refresh-prices', async (req, res) => {
+    try {
+        res.json({ success: true, message: 'Price refresh started.' });
+        refreshAllPrices().catch(err => console.error('Manual refresh error:', err));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Upload photos → AI identifies → saves to portfolio
+app.post('/api/portfolio/upload', upload.array('photos'), async (req, res) => {
     try {
         const files = req.files;
         if (!files || files.length === 0) {
             return res.status(400).json({ success: false, message: 'No photos provided.' });
         }
 
-        broadcastActivity('cycle_start', `Received ${files.length} photos for analysis...`);
+        broadcastActivity('upload_start', `Analyzing ${files.length} photos...`);
 
-        // We run the analysis asynchronously so the browser connection doesn't timeout
-        processLotAnalysis(files).catch(err => {
-            console.error('Background analysis error:', err);
-            broadcastActivity('error', `Analysis error: ${err.message}`);
+        // Process asynchronously
+        processPortfolioUpload(files).catch(err => {
+            console.error('Portfolio upload error:', err);
+            broadcastActivity('error', `Upload error: ${err.message}`);
         });
 
-        res.json({ success: true, message: 'Analysis started.' });
+        res.json({ success: true, message: 'Processing started.' });
     } catch (err) {
-        console.error('Upload Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// Analyzes the images and evaluates market prices, emitting SSE events
-async function processLotAnalysis(files) {
-    let allCards = [];
+async function processPortfolioUpload(files) {
+    let totalAdded = 0;
 
-    // Vision AI Analysis
     for (const [index, file] of files.entries()) {
         try {
-            broadcastActivity('analyzing_image', `Analyzing photo ${index + 1} of ${files.length}...`);
+            broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
+
             const analysis = await analyzeImageBuffer(file.buffer, file.mimetype);
-            if (analysis && analysis.identified_cards && analysis.identified_cards.length > 0) {
-                broadcastActivity('card_identified', `Found ${analysis.identified_cards.length} cards in photo ${index + 1}.`);
-                for (const card of analysis.identified_cards) {
+            if (!analysis || !analysis.cards || analysis.cards.length === 0) {
+                broadcastActivity('info', `No cards found in photo ${index + 1}.`);
+                continue;
+            }
 
-                    broadcastActivity('price_comparison', `Fetching TCGPlayer search results for ${card.card_name}...`);
+            broadcastActivity('found', `Found ${analysis.cards.length} cards in photo ${index + 1}`);
 
-                    let marketPrice = 5.0;
-                    let sourceUrl = null;
-                    let explanation = "AI Estimated Value from initial scan";
-                    let matchedImageUrl = null;
+            // Create a small thumbnail from the uploaded image
+            const thumbBase64 = file.buffer.toString('base64');
+            const thumbDataUrl = `data:${file.mimetype};base64,${thumbBase64}`;
 
-                    // 1. Get the aggressive search query
-                    const q = [card.card_name, card.card_set, card.card_number].filter(Boolean).join(' ');
+            for (const card of analysis.cards) {
+                // Insert card into portfolio
+                const result = insertPortfolioCard({
+                    card_name: card.card_name,
+                    card_set: card.card_set || '',
+                    card_number: card.card_number || '',
+                    rarity: card.rarity || 'Unknown',
+                    condition: card.condition_estimate || 'Unknown',
+                    is_holo: card.is_holographic || false,
+                    is_first_edition: card.is_first_edition || false,
+                    confidence: card.confidence || 0,
+                    image_data: analysis.cards.length === 1 ? thumbDataUrl : '',
+                    notes: card.notes || ''
+                });
 
-                    // 2. Multi-marketplace scrape & locate highest value
-                    broadcastActivity('price_comparison', `Extracting live market visual data...`);
-                    const highestListing = await findHighestMarketListing(q);
+                const cardId = result.lastInsertRowid;
 
-                    if (highestListing) {
-                        marketPrice = highestListing.price;
-                        sourceUrl = highestListing.listingUrl;
-                        explanation = `Highest live listing found on ${highestListing.marketplace.toUpperCase()} - ${highestListing.title.substring(0, 40)}...`;
-                        if (highestListing.imageUrls && highestListing.imageUrls.length > 0) {
-                            matchedImageUrl = highestListing.imageUrls[0];
-                        }
-                    } else if (card.estimated_value_usd) {
-                        marketPrice = parseFloat(card.estimated_value_usd);
+                // Get initial market price
+                let price = card.estimated_value_usd || 0;
+                try {
+                    const marketResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
+                    if (marketResult && marketResult.price > 0) {
+                        price = marketResult.price;
                     }
-
-                    // Note: We avoid saving full buffers for the client to download here.
-                    // We'll base64 encode later if needed, but for now just send metrics.
-                    allCards.push({
-                        id: Math.random().toString(36).substring(2, 9),
-                        ...card,
-                        marketPrice,
-                        sourceUrl,
-                        explanation,
-                        matchedImageUrl
-                    });
-
-                    broadcastActivity('card_identified', `Valued ${card.card_name} at $${marketPrice.toFixed(2)}`, {
-                        cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity, aiEstimate: marketPrice
-                    });
+                } catch (err) {
+                    console.error(`  Price lookup failed for ${card.card_name}:`, err.message);
                 }
-            } else {
-                broadcastActivity('info', `No recognizable cards found in photo ${index + 1}.`);
+
+                // Record initial price
+                if (price > 0) {
+                    insertPricePoint(cardId, price, 'initial');
+                }
+
+                totalAdded++;
+                broadcastActivity('card_added', `Added ${card.card_name} — $${price.toFixed(2)}`);
+                await sleep(500); // Small delay between price lookups
             }
         } catch (err) {
-            console.error(`Photo ${index + 1} analysis error:`, err.message);
-            broadcastActivity('error', `Failed to analyze photo ${index + 1}: ${err.message}`);
+            console.error(`Photo ${index + 1} error:`, err.message);
+            broadcastActivity('error', `Error on photo ${index + 1}: ${err.message}`);
         }
     }
 
-    if (allCards.length === 0) {
-        broadcastActivity('error', 'No cards identified in any photos. Pipeline stopped.');
-        broadcast({ type: 'analysis_complete', success: false, cards: [] });
-        return;
-    }
-
-    // Sort by valuation (Highest first)
-    allCards.sort((a, b) => b.marketPrice - a.marketPrice);
-    const topCards = allCards.slice(0, 100);
-
-    broadcastActivity('deal_found', `Analysis complete. Found ${topCards.length} high-value cards ready for listing.`);
-
-    // Broadcast the final results payload back to the client via SSE
-    broadcast({
-        type: 'analysis_complete',
-        success: true,
-        cards: topCards
-    });
+    broadcastActivity('upload_complete', `Added ${totalAdded} cards to your portfolio!`);
+    broadcast({ type: 'portfolio_updated' });
 }
 
-// ═══════════════════════════════════════════════════════════════
-// NEW 3-STAGE PIPELINE: PHASE 3 (Authenticate & List)
-// ═══════════════════════════════════════════════════════════════
-
-app.post('/api/list-on-ebay', express.json(), async (req, res) => {
-    try {
-        const { username, password, cardsToList } = req.body;
-
-        if (!username || !password) {
-            return res.status(400).json({ success: false, message: 'eBay credentials required.' });
-        }
-        if (!cardsToList || cardsToList.length === 0) {
-            return res.status(400).json({ success: false, message: 'No cards provided for listing.' });
-        }
-
-        broadcastActivity('cycle_start', `Starting eBay listing wrapper for ${cardsToList.length} cards...`);
-
-        // Execute puppeteer agent asynchronously
-        triggerEbayAgent(username, password, cardsToList).catch(err => {
-            console.error('eBay Agent error:', err);
-            broadcastActivity('error', `Agent execution failed: ${err.message}`);
-        });
-
-        res.json({ success: true, message: 'eBay listing Agent sequence initiated.' });
-    } catch (err) {
-        console.error('eBay Listing Error:', err);
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
-async function triggerEbayAgent(username, password, topCards) {
-    const { listCardsOnEbay } = await import('./ebayLister.js');
-    await listCardsOnEbay(username, password, topCards, broadcastActivity, broadcast);
-    broadcastActivity('cycle_complete', 'eBay automation successfully populated draft listings!');
-}
-
-// SSE: real-time event stream
+// SSE endpoint
 app.get('/api/events', (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     sseClients.add(res);
@@ -1047,7 +626,7 @@ app.get('/api/events', (req, res) => {
     req.on('close', () => sseClients.delete(res));
 });
 
-// Fallback to index.html for SPA
+// Fallback to index.html
 app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1056,14 +635,13 @@ app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 
 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  ⚡ Jack's Pokemon Packs — PokéSniper Agent      ║
-║  AI - Powered Card Deal Finder                   ║
+║  📊 Jack's Pokemon Portfolio Tracker             ║
+║  Live market values for your collection          ║
 ╚══════════════════════════════════════════════════╝
-                    `);
+`);
 
 app.listen(PORT, () => {
-    console.log(`🌐 Website running at http://localhost:${PORT}`);
-    console.log('');
+    console.log(`🌐 Dashboard running at http://localhost:${PORT}`);
 });
 
 // Graceful shutdown

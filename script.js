@@ -1,270 +1,151 @@
 /**
- * Jack's Pokemon Packs — Auto-Lister Frontend Logic
- * Manages the UI state machine, SSE connection, and dynamic renders.
+ * Jack's Pokemon Portfolio — Frontend
+ * Portfolio rendering, sparklines, upload modal, card detail drawer.
  */
 
-// ═══════════ STATE ═══════════
+// ═══════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════
+
 const STATE = {
-    eventSource: null,
+    cards: [],
+    stats: { totalCards: 0, totalValue: 0, prevValue: 0 },
+    sortField: 'price',
+    sortDir: 'desc',
     files: [],
-    topCards: [],
-    listedStats: {
-        count: 0,
-        totalValue: 0
-    }
+    eventSource: null,
 };
 
-// ═══════════ DOM ELEMENTS ═══════════
+// ═══════════════════════════════════════════════════
+//  DOM
+// ═══════════════════════════════════════════════════
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+
 const DOM = {
-    // Views
-    viewPortal: document.getElementById('view-portal'),
-    viewProcessing: document.getElementById('view-processing'),
-    viewReview: document.getElementById('view-review'),
+    // Stats
+    statTotalValue: $('#statTotalValue'),
+    statTotalChange: $('#statTotalChange'),
+    statTotalCards: $('#statTotalCards'),
+    statGainer: $('#statGainer'),
+    statGainerChange: $('#statGainerChange'),
+    statLoser: $('#statLoser'),
+    statLoserChange: $('#statLoserChange'),
 
-    // Portal Form
-    form: document.getElementById('autoListForm'),
-    dropZone: document.getElementById('dropZone'),
-    fileInput: document.getElementById('cardPhotos'),
-    filePreviews: document.getElementById('filePreviews'),
-    btnSubmit: document.getElementById('btnStartPipeline'),
+    // Table
+    emptyState: $('#emptyState'),
+    tableWrapper: $('#tableWrapper'),
+    portfolioBody: $('#portfolioBody'),
 
-    // Processing Pipeline
-    steps: {
-        upload: document.getElementById('step-upload'),
-        vision: document.getElementById('step-vision'),
-        valuation: document.getElementById('step-valuation'),
-        listing: document.getElementById('step-listing')
-    },
-    activityLog: document.getElementById('activityLog'),
+    // Upload Modal
+    uploadModal: $('#uploadModal'),
+    dropZone: $('#dropZone'),
+    fileInput: $('#fileInput'),
+    filePreviews: $('#filePreviews'),
+    uploadContent: $('#uploadContent'),
+    btnUploadSubmit: $('#btnUploadSubmit'),
+    uploadStatus: $('#uploadStatus'),
 
-    // AI Focus
-    aiFocus: document.getElementById('aiFocus'),
-    focusImage: document.getElementById('focusImage'),
-    focusTitle: document.getElementById('focusTitle'),
-    focusEstimate: document.getElementById('focusEstimate'),
-    focusTier: document.getElementById('focusTier'),
+    // Drawer
+    drawerOverlay: $('#drawerOverlay'),
+    cardDrawer: $('#cardDrawer'),
+    drawerCardName: $('#drawerCardName'),
+    drawerMeta: $('#drawerMeta'),
+    priceChart: $('#priceChart'),
+    drawerPriceList: $('#drawerPriceList'),
 
-    // Dashboard & Phase 3
-    listedGrid: document.getElementById('listedGrid'),
-    listedCount: document.getElementById('listedCount'),
-    authForm: document.getElementById('ebayAuthForm'),
-    btnAuth: document.getElementById('btnAuthEbay'),
-
-    // Shared
-    statusText: document.getElementById('systemStatus'),
-    statusDot: document.querySelector('.status-indicator')
+    // Toast
+    statusToast: $('#statusToast'),
 };
 
-// ═══════════ INIT ═══════════
+// ═══════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════
+
 document.addEventListener('DOMContentLoaded', () => {
-    initDragAndDrop();
-    initForms();
+    initEventListeners();
     connectSSE();
+    fetchPortfolio();
 });
 
-function setStatus(text, isActive = false) {
-    DOM.statusText.textContent = text;
-    DOM.statusDot.classList.toggle('active', isActive);
-}
+function initEventListeners() {
+    // Open upload modal
+    $('#btnOpenUpload').addEventListener('click', openUploadModal);
+    $('#btnEmptyUpload')?.addEventListener('click', openUploadModal);
 
-function switchView(viewId) {
-    DOM.viewPortal.classList.remove('active');
-    DOM.viewProcessing.classList.remove('active');
-    DOM.viewReview.classList.remove('active');
-
-    if (viewId === 'processing') {
-        DOM.viewProcessing.classList.add('active');
-    } else if (viewId === 'review') {
-        DOM.viewReview.classList.add('active');
-    } else {
-        DOM.viewPortal.classList.add('active');
-    }
-}
-
-// ═══════════ FILE UPLOAD & FORMS ═══════════
-function initDragAndDrop() {
-    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        DOM.dropZone.addEventListener(eventName, preventDefaults, false);
+    // Close modals
+    $('#btnCloseModal').addEventListener('click', closeUploadModal);
+    DOM.uploadModal.addEventListener('click', (e) => {
+        if (e.target === DOM.uploadModal) closeUploadModal();
     });
 
-    ['dragenter', 'dragover'].forEach(eventName => {
-        DOM.dropZone.addEventListener(eventName, () => DOM.dropZone.classList.add('drag-over'), false);
+    // Close drawer
+    $('#btnCloseDrawer').addEventListener('click', closeDrawer);
+    DOM.drawerOverlay.addEventListener('click', (e) => {
+        if (e.target === DOM.drawerOverlay) closeDrawer();
     });
 
-    ['dragleave', 'drop'].forEach(eventName => {
-        DOM.dropZone.addEventListener(eventName, () => DOM.dropZone.classList.remove('drag-over'), false);
-    });
-
-    DOM.dropZone.addEventListener('drop', handleDrop, false);
-    DOM.fileInput.addEventListener('change', handleFiles, false);
-}
-
-function preventDefaults(e) {
-    e.preventDefault();
-    e.stopPropagation();
-}
-
-function handleDrop(e) {
-    const dt = e.dataTransfer;
-    const files = dt.files;
-    handleFiles({ target: { files } });
-}
-
-function handleFiles(e) {
-    const newFiles = [...e.target.files];
-    STATE.files = [...STATE.files, ...newFiles];
-    renderPreviews();
-}
-
-function renderPreviews() {
-    DOM.filePreviews.innerHTML = '';
-    STATE.files.forEach(file => {
-        if (!file.type.startsWith('image/')) return;
-
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => {
-            const img = document.createElement('img');
-            img.src = reader.result;
-            img.style.cssText = 'width: 60px; height: 60px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); margin-right: 8px;';
-            DOM.filePreviews.appendChild(img);
-        }
-    });
-}
-
-function initForms() {
-    // Phase 1: Upload & Analyze
-    DOM.form.addEventListener('submit', async (e) => {
+    // File upload
+    DOM.dropZone.addEventListener('dragover', (e) => { e.preventDefault(); DOM.dropZone.classList.add('drag-over'); });
+    DOM.dropZone.addEventListener('dragleave', () => DOM.dropZone.classList.remove('drag-over'));
+    DOM.dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
+        DOM.dropZone.classList.remove('drag-over');
+        handleFiles(e.dataTransfer.files);
+    });
+    DOM.fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
 
-        if (STATE.files.length === 0) {
-            alert('Please select or drop at least one image of your cards.');
-            return;
-        }
+    // Upload submit
+    DOM.btnUploadSubmit.addEventListener('click', submitUpload);
 
-        DOM.btnSubmit.disabled = true;
-        DOM.btnSubmit.innerHTML = '<span>Uploading...</span>';
-        switchView('processing');
-        activateStep('upload');
-        logTerminal('info', `Initializing secure upload for ${STATE.files.length} images...`);
+    // Refresh prices
+    $('#btnRefreshPrices').addEventListener('click', refreshPrices);
 
-        const formData = new FormData();
-        STATE.files.forEach(file => formData.append('photos', file));
-
-        try {
-            const resp = await fetch('/api/analyze-lot', {
-                method: 'POST',
-                body: formData
-            });
-            const data = await resp.json();
-
-            if (data.success) {
-                logTerminal('success', 'Upload complete. Launching AI Pipeline...');
+    // Sort headers
+    $$('.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+            const field = th.dataset.sort;
+            if (STATE.sortField === field) {
+                STATE.sortDir = STATE.sortDir === 'desc' ? 'asc' : 'desc';
             } else {
-                logTerminal('error', `Upload failed: ${data.message}`);
-                DOM.btnSubmit.disabled = false;
-                DOM.btnSubmit.innerHTML = '<span>Initiate Apprasial Scan</span>';
+                STATE.sortField = field;
+                STATE.sortDir = 'desc';
             }
-        } catch (err) {
-            logTerminal('error', `Connection error: ${err.message}`);
-        }
+            renderTable();
+        });
     });
 
-    // Phase 3: Authenticate & List
-    DOM.authForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-
-        const username = document.getElementById('ebayUsername').value;
-        const password = document.getElementById('ebayPassword').value;
-
-        if (STATE.topCards.length === 0) {
-            alert('No cards available to list.');
-            return;
-        }
-
-        DOM.btnAuth.disabled = true;
-        DOM.btnAuth.innerHTML = '<span>Listing...</span>';
-        activateStep('listing');
-        logTerminal('info', `Initiating eBay Agent for ${STATE.topCards.length} cards...`);
-
-        try {
-            const resp = await fetch('/api/list-on-ebay', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    username,
-                    password,
-                    cardsToList: STATE.topCards
-                })
-            });
-            const data = await resp.json();
-
-            if (!data.success) {
-                logTerminal('error', `Listing failed: ${data.message}`);
-                DOM.btnAuth.disabled = false;
-                DOM.btnAuth.innerHTML = '<span>Create eBay Listings</span>';
-            }
-        } catch (err) {
-            logTerminal('error', `Connection error: ${err.message}`);
+    // Keyboard
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            closeUploadModal();
+            closeDrawer();
         }
     });
 }
 
-// ═══════════ PIPELINE & TERMINAL ═══════════
-function activateStep(stepName) {
-    Object.values(DOM.steps).forEach(s => s.classList.remove('active', 'completed'));
+// ═══════════════════════════════════════════════════
+//  DATA FETCHING
+// ═══════════════════════════════════════════════════
 
-    if (stepName === 'upload') {
-        DOM.steps.upload.classList.add('active');
-    } else if (stepName === 'vision') {
-        DOM.steps.upload.classList.add('completed');
-        DOM.steps.vision.classList.add('active');
-    } else if (stepName === 'valuation') {
-        DOM.steps.upload.classList.add('completed');
-        DOM.steps.vision.classList.add('completed');
-        DOM.steps.valuation.classList.add('active');
-    } else if (stepName === 'listing') {
-        DOM.steps.upload.classList.add('completed');
-        DOM.steps.vision.classList.add('completed');
-        DOM.steps.valuation.classList.add('completed');
-        DOM.steps.listing.classList.add('active');
+async function fetchPortfolio() {
+    try {
+        const resp = await fetch('/api/portfolio');
+        const data = await resp.json();
+        STATE.cards = data.cards || [];
+        STATE.stats = data.stats || { totalCards: 0, totalValue: 0, prevValue: 0 };
+        renderStats();
+        renderTable();
+    } catch (err) {
+        console.error('Failed to fetch portfolio:', err);
     }
 }
 
-function logTerminal(type, message) {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const cssClass = {
-        'info': 'info',
-        'success': 'success',
-        'error': 'error',
-        'ai': 'ai'
-    }[type] || 'info';
+// ═══════════════════════════════════════════════════
+//  SSE
+// ═══════════════════════════════════════════════════
 
-    const div = document.createElement('div');
-    div.className = `log-line ${cssClass}`;
-    div.innerHTML = `<span class="timestamp">[${time}]</span> ${escapeHtml(message)}`;
-
-    // Clear placeholder
-    const placeholder = DOM.activityLog.querySelector('.text-muted');
-    if (placeholder) placeholder.remove();
-
-    DOM.activityLog.appendChild(div);
-    DOM.activityLog.scrollTop = DOM.activityLog.scrollHeight;
-
-    // Keep max 100 lines
-    while (DOM.activityLog.children.length > 100) {
-        DOM.activityLog.removeChild(DOM.activityLog.firstChild);
-    }
-}
-
-function escapeHtml(unsafe) {
-    return (unsafe || '').toString()
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-}
-
-// ═══════════ SSE CONNECTION & STATE MAPPER ═══════════
 function connectSSE() {
     if (STATE.eventSource) STATE.eventSource.close();
     STATE.eventSource = new EventSource('/api/events');
@@ -272,141 +153,484 @@ function connectSSE() {
     STATE.eventSource.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            handleServerEvent(data);
-        } catch (err) { console.error('SSE Error:', err); }
+            if (data.type === 'portfolio_updated') {
+                fetchPortfolio();
+            } else if (data.type === 'activity') {
+                showToast(data.message);
+            }
+        } catch (err) { console.error('SSE parse error:', err); }
     };
 
     STATE.eventSource.onerror = () => {
-        setStatus('Reconnecting...', false);
         setTimeout(connectSSE, 5000);
     };
 }
 
-function handleServerEvent(data) {
-    if (data.type === 'connected') {
-        setStatus('System Online', true);
-        return;
+// ═══════════════════════════════════════════════════
+//  RENDERING: STATS
+// ═══════════════════════════════════════════════════
+
+function renderStats() {
+    const { totalCards, totalValue, prevValue } = STATE.stats;
+
+    DOM.statTotalValue.textContent = formatCurrency(totalValue);
+    DOM.statTotalCards.textContent = totalCards;
+
+    // Total change
+    if (prevValue > 0) {
+        const change = totalValue - prevValue;
+        const pctChange = (change / prevValue) * 100;
+        DOM.statTotalChange.textContent = `${change >= 0 ? '+' : ''}${formatCurrency(change)} (${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(1)}%)`;
+        DOM.statTotalChange.className = `stat-change ${change >= 0 ? 'positive' : 'negative'}`;
+    } else {
+        DOM.statTotalChange.textContent = '';
     }
 
-    if (data.type === 'listing_created') {
-        addListingCard(data.card);
-        return;
-    }
+    // Biggest gainer / loser
+    let biggestGainer = null, biggestLoser = null;
+    let maxGain = -Infinity, maxLoss = Infinity;
 
-    if (data.type === 'analysis_complete') {
-        if (data.success) {
-            STATE.topCards = data.cards;
-            data.cards.forEach(c => addListingCard(c, true));
-            switchView('review');
+    for (const card of STATE.cards) {
+        if (card.current_price && card.previous_price && card.previous_price > 0) {
+            const change = ((card.current_price - card.previous_price) / card.previous_price) * 100;
+            if (change > maxGain) { maxGain = change; biggestGainer = card; }
+            if (change < maxLoss) { maxLoss = change; biggestLoser = card; }
         }
+    }
+
+    if (biggestGainer && maxGain > 0) {
+        DOM.statGainer.textContent = truncate(biggestGainer.card_name, 16);
+        DOM.statGainerChange.textContent = `+${maxGain.toFixed(1)}%`;
+        DOM.statGainerChange.className = 'stat-change positive';
+    } else {
+        DOM.statGainer.textContent = '—';
+        DOM.statGainerChange.textContent = '';
+    }
+
+    if (biggestLoser && maxLoss < 0) {
+        DOM.statLoser.textContent = truncate(biggestLoser.card_name, 16);
+        DOM.statLoserChange.textContent = `${maxLoss.toFixed(1)}%`;
+        DOM.statLoserChange.className = 'stat-change negative';
+    } else {
+        DOM.statLoser.textContent = '—';
+        DOM.statLoserChange.textContent = '';
+    }
+}
+
+// ═══════════════════════════════════════════════════
+//  RENDERING: TABLE
+// ═══════════════════════════════════════════════════
+
+function renderTable() {
+    const cards = [...STATE.cards];
+
+    // Show/hide empty state
+    if (cards.length === 0) {
+        DOM.emptyState.style.display = 'flex';
+        DOM.tableWrapper.style.display = 'none';
         return;
     }
 
-    if (data.type !== 'activity') return;
+    DOM.emptyState.style.display = 'none';
+    DOM.tableWrapper.style.display = 'block';
 
-    const { activityType, message, details = {} } = data;
+    // Sort
+    cards.sort((a, b) => {
+        let valA, valB;
+        if (STATE.sortField === 'name') {
+            valA = (a.card_name || '').toLowerCase();
+            valB = (b.card_name || '').toLowerCase();
+            return STATE.sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+        } else if (STATE.sortField === 'price') {
+            valA = a.current_price || 0;
+            valB = b.current_price || 0;
+        } else if (STATE.sortField === 'change') {
+            valA = getChangePct(a);
+            valB = getChangePct(b);
+        }
+        return STATE.sortDir === 'asc' ? valA - valB : valB - valA;
+    });
 
-    // Map backend activity types to terminal styles
-    let logStyle = 'info';
-    if (['deal_found', 'scraper_done', 'cycle_complete'].includes(activityType)) logStyle = 'success';
-    if (['analyzing_image', 'ai_analyzing', 'card_identified'].includes(activityType)) logStyle = 'ai';
-    if (['error', 'scam_warning'].includes(activityType)) logStyle = 'error';
+    // Update sort indicators
+    $$('.sortable').forEach(th => {
+        th.classList.remove('sorted-asc', 'sorted-desc');
+        if (th.dataset.sort === STATE.sortField) {
+            th.classList.add(STATE.sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+        }
+    });
 
-    logTerminal(logStyle, message);
+    // Render rows
+    DOM.portfolioBody.innerHTML = cards.map(card => {
+        const price = card.current_price || 0;
+        const prevPrice = card.previous_price || 0;
+        const changePct = getChangePct(card);
+        const changeDir = changePct > 0 ? 'positive' : changePct < 0 ? 'negative' : 'neutral';
+        const changeArrow = changePct > 0 ? '↑' : changePct < 0 ? '↓' : '';
+        const changeText = changePct !== 0 ? `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%` : '—';
 
-    // Map backend activity to UI step progress and focus panel
-    switch (activityType) {
-        case 'analyzing_image':
-            activateStep('vision');
-            if (details.imageUrl) updateAiFocus(details.imageUrl, 'Detecting Card...', '--', '--');
-            break;
+        const thumbHtml = card.image_data
+            ? `<img class="card-thumb" src="${escapeAttr(card.image_data)}" alt="">`
+            : `<div class="card-thumb-placeholder">🃏</div>`;
 
-        case 'card_identified':
-            activateStep('valuation');
-            const conf = details.confidence ? `(${(details.confidence * 100).toFixed(0)}%)` : '';
-            updateAiFocus(null, `${details.cardName} ${conf}`, '--', '--');
-            break;
+        return `
+            <tr data-id="${card.id}" onclick="openCardDrawer(${card.id})">
+                <td class="cell-card" data-label="">
+                    <div class="card-cell">
+                        ${thumbHtml}
+                        <div>
+                            <div class="card-name">${esc(card.card_name)}</div>
+                            ${card.card_number ? `<div class="card-number">${esc(card.card_number)}</div>` : ''}
+                        </div>
+                    </div>
+                </td>
+                <td data-label="Set"><span class="rarity-badge">${esc(card.card_set || '—')}</span></td>
+                <td data-label="Rarity"><span class="rarity-badge">${esc(card.rarity || '—')}</span></td>
+                <td data-label="Condition"><span class="condition-badge">${esc(card.condition || '—')}</span></td>
+                <td class="price-cell" data-label="Price">${formatCurrency(price)}</td>
+                <td data-label="Change">
+                    <span class="change-cell ${changeDir}">
+                        <span class="change-arrow">${changeArrow}</span>
+                        ${changeText}
+                    </span>
+                </td>
+                <td class="sparkline-cell" data-label="Trend" id="spark-${card.id}"></td>
+                <td class="col-actions" data-label="">
+                    <button class="btn-delete" onclick="event.stopPropagation(); deleteCard(${card.id})" title="Remove">✕</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
 
-        case 'price_comparison':
-        case 'deal_found':
-            if (details.marketPrice) {
-                updateAiFocus(null, null, `$${details.marketPrice.toFixed(2)}`, details.dealTier || 'good');
-            }
-            break;
-
-        case 'scraper_start':
-        case 'search_terms':
-            activateStep('listing');
-            break;
-
-        case 'cycle_complete':
-        case 'error':
-            activateStep('completed');
-            setTimeout(() => { DOM.aiFocus.style.display = 'none'; }, 5000);
-            break;
-    }
+    // Load sparklines asynchronously
+    cards.forEach(card => loadSparkline(card.id));
 }
 
-// ═══════════ AI FOCUS PANEL ═══════════
-function updateAiFocus(imgUrl, title, estimate, tier) {
-    DOM.aiFocus.style.display = 'block';
+// ═══════════════════════════════════════════════════
+//  SPARKLINES (inline SVG)
+// ═══════════════════════════════════════════════════
 
-    if (imgUrl) DOM.focusImage.src = imgUrl;
-    if (title) DOM.focusTitle.textContent = title;
-    if (estimate) DOM.focusEstimate.textContent = estimate;
+async function loadSparkline(cardId) {
+    const container = document.getElementById(`spark-${cardId}`);
+    if (!container) return;
 
-    if (tier) {
-        DOM.focusTier.textContent = tier.toUpperCase();
-        DOM.focusTier.className = `stat-value card-tier ${tier}`;
-    }
-}
-
-// ═══════════ DASHBOARD RENDERING ═══════════
-async function fetchExistingListings() {
     try {
-        const resp = await fetch('/api/deals?limit=100');
-        const deals = await resp.json();
-        deals.forEach(d => addListingCard(d, true));
-    } catch (e) { console.error('Failed to fetch initial listings', e); }
+        const resp = await fetch(`/api/portfolio/${cardId}/history`);
+        const data = await resp.json();
+        const history = data.history || [];
+
+        if (history.length < 2) {
+            container.innerHTML = '<span style="color:var(--text-muted);font-size:0.75rem;">—</span>';
+            return;
+        }
+
+        const prices = history.map(h => h.price);
+        const w = 100, h = 32, pad = 2;
+        const min = Math.min(...prices);
+        const max = Math.max(...prices);
+        const range = max - min || 1;
+
+        const points = prices.map((p, i) => {
+            const x = pad + (i / (prices.length - 1)) * (w - 2 * pad);
+            const y = pad + (1 - (p - min) / range) * (h - 2 * pad);
+            return `${x},${y}`;
+        }).join(' ');
+
+        const trending = prices[prices.length - 1] >= prices[0];
+        const color = trending ? 'var(--green)' : 'var(--red)';
+
+        container.innerHTML = `
+            <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+                <polyline fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points="${points}"/>
+            </svg>
+        `;
+    } catch {
+        container.innerHTML = '';
+    }
 }
 
-function addListingCard(card, isHistory = false) {
-    STATE.listedStats.count++;
-    DOM.listedCount.textContent = STATE.listedStats.count;
+// ═══════════════════════════════════════════════════
+//  UPLOAD MODAL
+// ═══════════════════════════════════════════════════
 
-    const el = document.createElement('div');
-    el.className = 'listed-card';
+function openUploadModal() {
+    STATE.files = [];
+    DOM.filePreviews.innerHTML = '';
+    DOM.uploadContent.style.display = 'block';
+    DOM.btnUploadSubmit.disabled = true;
+    DOM.uploadStatus.textContent = 'AI will identify each card and fetch live market prices';
+    DOM.uploadModal.classList.add('open');
+}
 
-    const price = card.listing_price || card.market_price || card.marketPrice || card.avg_price || 0;
+function closeUploadModal() {
+    DOM.uploadModal.classList.remove('open');
+    STATE.files = [];
+}
 
-    const explanationDiv = card.explanation
-        ? `<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem; line-height: 1.3;"><i>${escapeHtml(card.explanation)}</i></div>`
-        : '';
+function handleFiles(fileList) {
+    const newFiles = [...fileList].filter(f => f.type.startsWith('image/'));
+    STATE.files = [...STATE.files, ...newFiles];
 
-    const verifyLink = card.sourceUrl
-        ? `<a href="${card.sourceUrl}" target="_blank" class="verify-link" style="color: var(--accent-primary); font-size: 0.85rem; text-decoration: none; display: block; margin-top: 0.75rem;">Verify Live Listing ↗</a>`
-        : `<span style="color: var(--text-secondary); font-size: 0.85rem; display: block; margin-top: 0.75rem; font-style: italic;">AI Estimated Value</span>`;
+    DOM.filePreviews.innerHTML = '';
+    STATE.files.forEach(file => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const img = document.createElement('img');
+            img.src = reader.result;
+            DOM.filePreviews.appendChild(img);
+        };
+        reader.readAsDataURL(file);
+    });
 
-    const imageElement = card.matchedImageUrl
-        ? `<div style="width: 100%; display: flex; justify-content: center; margin-bottom: 1rem;"><img src="${escapeHtml(card.matchedImageUrl)}" style="max-height: 200px; object-fit: contain; border-radius: 8px;"></div>`
-        : '';
+    DOM.btnUploadSubmit.disabled = STATE.files.length === 0;
 
-    el.innerHTML = `
-        <div class="card-header">
-            <span class="card-tier ${card.dealTier || 'good'}">${card.dealTier || 'PREMIUM'} CARD</span>
-            ${!isHistory ? '<span style="font-size: 10px; color: var(--accent-success);">● LISTED</span>' : ''}
-        </div>
-        ${imageElement}
-        <div class="card-title">${escapeHtml(card.title || card.card_name)}</div>
-        <div class="card-pricing">
-            <div class="price-block listed" style="margin-bottom: 0;">
-                <span>Market Value</span>
-                <strong>$${parseFloat(price).toFixed(2)}</strong>
-            </div>
-            ${explanationDiv}
-            ${verifyLink}
-        </div>
+    if (STATE.files.length > 0) {
+        DOM.uploadContent.style.display = 'none';
+    } else {
+        DOM.uploadContent.style.display = 'block';
+    }
+}
+
+async function submitUpload() {
+    if (STATE.files.length === 0) return;
+
+    DOM.btnUploadSubmit.disabled = true;
+    DOM.btnUploadSubmit.innerHTML = '<span class="spinner"></span><span>Scanning cards...</span>';
+    DOM.uploadStatus.textContent = 'Analyzing with Vision AI — this may take a minute...';
+
+    const formData = new FormData();
+    STATE.files.forEach(f => formData.append('photos', f));
+
+    try {
+        const resp = await fetch('/api/portfolio/upload', {
+            method: 'POST',
+            body: formData,
+        });
+        const data = await resp.json();
+        if (data.success) {
+            DOM.uploadStatus.textContent = 'Processing... cards will appear as they are identified.';
+        } else {
+            DOM.uploadStatus.textContent = `Error: ${data.message}`;
+            DOM.btnUploadSubmit.disabled = false;
+            DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
+        }
+    } catch (err) {
+        DOM.uploadStatus.textContent = `Connection error: ${err.message}`;
+        DOM.btnUploadSubmit.disabled = false;
+        DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
+    }
+}
+
+// ═══════════════════════════════════════════════════
+//  CARD DETAIL DRAWER
+// ═══════════════════════════════════════════════════
+
+async function openCardDrawer(cardId) {
+    const card = STATE.cards.find(c => c.id === cardId);
+    if (!card) return;
+
+    DOM.drawerCardName.textContent = card.card_name;
+
+    // Meta
+    DOM.drawerMeta.innerHTML = `
+        <div class="meta-item"><div class="meta-label">Set</div><div class="meta-value">${esc(card.card_set || '—')}</div></div>
+        <div class="meta-item"><div class="meta-label">Number</div><div class="meta-value">${esc(card.card_number || '—')}</div></div>
+        <div class="meta-item"><div class="meta-label">Rarity</div><div class="meta-value">${esc(card.rarity || '—')}</div></div>
+        <div class="meta-item"><div class="meta-label">Condition</div><div class="meta-value">${esc(card.condition || '—')}</div></div>
+        <div class="meta-item"><div class="meta-label">Current Price</div><div class="meta-value">${formatCurrency(card.current_price || 0)}</div></div>
+        <div class="meta-item"><div class="meta-label">Added</div><div class="meta-value">${formatDate(card.added_at)}</div></div>
     `;
 
-    DOM.listedGrid.appendChild(el);
+    DOM.drawerOverlay.classList.add('open');
+
+    // Fetch price history and draw chart
+    try {
+        const resp = await fetch(`/api/portfolio/${cardId}/history`);
+        const data = await resp.json();
+        const history = data.history || [];
+
+        drawPriceChart(history);
+
+        // Price list
+        DOM.drawerPriceList.innerHTML = '<h3>Price Log</h3>' +
+            history.slice().reverse().slice(0, 20).map(h => `
+                <div class="price-entry">
+                    <span class="price-date">${formatDateTime(h.recorded_at)}</span>
+                    <span class="price-amount">${formatCurrency(h.price)}</span>
+                </div>
+            `).join('');
+    } catch (err) {
+        console.error('Failed to load price history:', err);
+    }
+}
+
+function closeDrawer() {
+    DOM.drawerOverlay.classList.remove('open');
+}
+
+function drawPriceChart(history) {
+    const canvas = DOM.priceChart;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const w = rect.width;
+    const h = 180;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.scale(dpr, dpr);
+
+    ctx.clearRect(0, 0, w, h);
+
+    if (history.length < 2) {
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '13px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Not enough data yet', w / 2, h / 2);
+        return;
+    }
+
+    const prices = history.map(p => p.price);
+    const min = Math.min(...prices) * 0.95;
+    const max = Math.max(...prices) * 1.05;
+    const range = max - min || 1;
+    const padX = 8, padY = 16;
+
+    const trending = prices[prices.length - 1] >= prices[0];
+    const lineColor = trending ? '#16a34a' : '#dc2626';
+    const fillColor = trending ? 'rgba(22,163,74,0.06)' : 'rgba(220,38,38,0.06)';
+
+    // Grid lines
+    ctx.strokeStyle = '#f0f0f0';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = padY + (i / 4) * (h - 2 * padY);
+        ctx.beginPath();
+        ctx.moveTo(padX, y);
+        ctx.lineTo(w - padX, y);
+        ctx.stroke();
+    }
+
+    // Price line
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+
+    const points = prices.map((p, i) => ({
+        x: padX + (i / (prices.length - 1)) * (w - 2 * padX),
+        y: padY + (1 - (p - min) / range) * (h - 2 * padY)
+    }));
+
+    points.forEach((pt, i) => {
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+    });
+    ctx.stroke();
+
+    // Fill under curve
+    ctx.lineTo(points[points.length - 1].x, h - padY);
+    ctx.lineTo(points[0].x, h - padY);
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+
+    // Price labels
+    ctx.fillStyle = '#9ca3af';
+    ctx.font = '10px Inter, sans-serif';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+        const y = padY + (i / 4) * (h - 2 * padY);
+        const val = max - (i / 4) * range;
+        ctx.fillText('$' + val.toFixed(2), w - padX, y - 3);
+    }
+}
+
+// ═══════════════════════════════════════════════════
+//  ACTIONS
+// ═══════════════════════════════════════════════════
+
+async function deleteCard(cardId) {
+    if (!confirm('Remove this card from your portfolio?')) return;
+    try {
+        await fetch(`/api/portfolio/${cardId}`, { method: 'DELETE' });
+        showToast('Card removed');
+        fetchPortfolio();
+    } catch (err) {
+        showToast('Error removing card');
+    }
+}
+
+async function refreshPrices() {
+    const btn = $('#btnRefreshPrices');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span><span>Refreshing...</span>';
+    showToast('Refreshing market prices...');
+
+    try {
+        await fetch('/api/portfolio/refresh-prices', { method: 'POST' });
+    } catch (err) {
+        showToast('Error refreshing prices');
+    }
+
+    // Re-enable after a delay (the actual refresh runs in the background)
+    setTimeout(() => {
+        btn.disabled = false;
+        btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg><span>Refresh Prices</span>`;
+    }, 3000);
+}
+
+// Make functions globally accessible for inline onclick handlers
+window.openCardDrawer = openCardDrawer;
+window.deleteCard = deleteCard;
+
+// ═══════════════════════════════════════════════════
+//  UTILITIES
+// ═══════════════════════════════════════════════════
+
+function getChangePct(card) {
+    if (!card.current_price || !card.previous_price || card.previous_price === 0) return 0;
+    return ((card.current_price - card.previous_price) / card.previous_price) * 100;
+}
+
+function formatCurrency(val) {
+    return '$' + parseFloat(val || 0).toFixed(2);
+}
+
+function formatDate(dateStr) {
+    if (!dateStr) return '—';
+    return new Date(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function formatDateTime(dateStr) {
+    if (!dateStr) return '—';
+    return new Date(dateStr).toLocaleString('en-US', {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+}
+
+function truncate(str, len) {
+    if (!str) return '';
+    return str.length > len ? str.substring(0, len) + '…' : str;
+}
+
+function esc(str) {
+    const div = document.createElement('div');
+    div.textContent = str || '';
+    return div.innerHTML;
+}
+
+function escapeAttr(str) {
+    return (str || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function showToast(message) {
+    DOM.statusToast.textContent = message;
+    DOM.statusToast.classList.add('visible');
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => {
+        DOM.statusToast.classList.remove('visible');
+    }, 3000);
 }

@@ -4,182 +4,138 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Jack's Pokémon Packs | AI Auto-Lister</title>
-    <meta name="description" content="AI agent that identifies, valuate, and autobuys deals.">
+    <title>Jack's Pokemon Portfolio | Live Market Tracker</title>
+    <meta name="description" content="Track your Pokemon card collection with live market prices, trends, and portfolio analytics.">
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link
-        href="https://fonts.googleapis.com/css2?family=Clash+Display:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
-        rel="stylesheet">
-
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
-    <div class="background-ambient">
-        <div class="glow-orb orb-1"></div>
-        <div class="glow-orb orb-2"></div>
-        <div class="glow-orb orb-3"></div>
-    </div>
-
-    <!-- Navigation -->
-    <nav class="nav">
-        <div class="nav-brand">
-            <span class="nav-logo-icon">⚡</span>
-            <span class="nav-logo-text">Jack's Auto-Lister</span>
+    <!-- Top Navigation -->
+    <nav class="topbar">
+        <div class="topbar-left">
+            <h1 class="logo">Jack's Pokemon Portfolio</h1>
         </div>
-        <div class="nav-status">
-            <span class="status-indicator"></span>
-            <span id="systemStatus">System Idle</span>
+        <div class="topbar-right">
+            <button class="btn-refresh" id="btnRefreshPrices" title="Refresh market prices">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                <span>Refresh Prices</span>
+            </button>
+            <button class="btn-add" id="btnOpenUpload">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                <span>Add Cards</span>
+            </button>
         </div>
     </nav>
 
-    <main class="container">
-        <!-- VIEW 1: UPLOAD PORTAL -->
-        <section id="view-portal" class="view active">
-            <div class="portal-header">
-                <h1 class="hero-title">Automate Your <span class="gradient-text">Pokemon Sales</span></h1>
-                <p class="hero-subtitle">Upload your collection. Our AI will appraise your cards against live market
-                    prices and identify the top 100.</p>
-            </div>
+    <!-- Status Toast -->
+    <div class="status-toast" id="statusToast"></div>
 
-            <div class="glass-panel form-container">
-                <form id="autoListForm">
-                    <div class="upload-area" id="dropZone">
-                        <input type="file" id="cardPhotos" name="photos" accept="image/*" multiple required
-                            class="file-input-hidden">
-                        <div class="upload-content">
-                            <div class="upload-icon">📸</div>
-                            <h3>Drag & Drop Card Photos</h3>
-                            <p>or click to browse from your device</p>
-                            <span class="upload-hint">Upload high-res photos. The AI can detect multiple cards per
-                                image.</span>
-                        </div>
-                        <div id="filePreviews" class="file-previews"></div>
-                    </div>
+    <!-- Summary Stats -->
+    <section class="stats-bar">
+        <div class="stat-card primary">
+            <div class="stat-label">Portfolio Value</div>
+            <div class="stat-value" id="statTotalValue">$0.00</div>
+            <div class="stat-change" id="statTotalChange"></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total Cards</div>
+            <div class="stat-value" id="statTotalCards">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Biggest Gainer</div>
+            <div class="stat-value" id="statGainer">—</div>
+            <div class="stat-change positive" id="statGainerChange"></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Biggest Loser</div>
+            <div class="stat-value" id="statLoser">—</div>
+            <div class="stat-change negative" id="statLoserChange"></div>
+        </div>
+    </section>
 
-                    <button type="submit" class="btn-primary btn-submit" id="btnStartPipeline">
-                        <span class="btn-text">Initiate Apprasial Scan</span>
-                        <span class="btn-icon">✨</span>
-                    </button>
-                </form>
-            </div>
-        </section>
+    <!-- Portfolio Table -->
+    <main class="portfolio-container">
+        <!-- Empty state -->
+        <div class="empty-state" id="emptyState">
+            <div class="empty-icon">📦</div>
+            <h2>Your portfolio is empty</h2>
+            <p>Upload photos of your Pokemon cards to start tracking their market value.</p>
+            <button class="btn-add large" id="btnEmptyUpload">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                <span>Add Your First Cards</span>
+            </button>
+        </div>
 
-        <!-- VIEW 2: PROCESSING PIPELINE -->
-        <section id="view-processing" class="view">
-            <div class="processing-layout">
-                <div class="pipeline-tracker glass-panel">
-                    <h2>Operation Status</h2>
-                    <ul class="pipeline-steps">
-                        <li class="step active" id="step-upload">
-                            <div class="step-icon">📤</div>
-                            <div class="step-info">
-                                <h4>Uploading Assets</h4>
-                                <p>Transferring images to secure server</p>
-                            </div>
-                        </li>
-                        <li class="step" id="step-vision">
-                            <div class="step-icon">👁️</div>
-                            <div class="step-info">
-                                <h4>Vision AI Analysis</h4>
-                                <p>Detecting and identifying individual cards</p>
-                            </div>
-                        </li>
-                        <li class="step" id="step-valuation">
-                            <div class="step-icon">💎</div>
-                            <div class="step-info">
-                                <h4>Market Valuation</h4>
-                                <p>Cross-referencing global marketplaces</p>
-                            </div>
-                        </li>
-                        <li class="step" id="step-listing">
-                            <div class="step-icon">🛒</div>
-                            <div class="step-info">
-                                <h4>eBay Automation</h4>
-                                <p>Drafting and publishing listings via Agent</p>
-                            </div>
-                        </li>
-                    </ul>
-                </div>
-
-                <div class="terminal-container glass-panel">
-                    <div class="terminal-header">
-                        <div class="terminal-dots">
-                            <span></span><span></span><span></span>
-                        </div>
-                        <div class="terminal-title">agent_activity_log.sh</div>
-                    </div>
-                    <div class="terminal-body" id="activityLog">
-                        <!-- Logs inject here -->
-                        <div class="log-line text-muted">Awaiting pipeline initialization...</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Current AI Focus Visualization -->
-            <div class="ai-focus glass-panel" id="aiFocus" style="display: none;">
-                <div class="focus-grid">
-                    <div class="focus-image-container">
-                        <div class="scanner-sweep"></div>
-                        <img id="focusImage" src="" alt="AI Analysis Target">
-                    </div>
-                    <div class="focus-details">
-                        <h3 class="focus-label">Live Identification</h3>
-                        <div class="focus-title" id="focusTitle">Scanning...</div>
-                        <div class="focus-stats">
-                            <div class="stat-box">
-                                <span class="stat-label">AI Estimate</span>
-                                <span class="stat-value" id="focusEstimate">--</span>
-                            </div>
-                            <div class="stat-box">
-                                <span class="stat-label">Deal Tier</span>
-                                <span class="stat-value" id="focusTier">--</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- VIEW 3: REVIEW & AUTHENTICATE -->
-        <section id="view-review" class="view dashboard-section">
-            <div class="glass-panel cta-panel">
-                <div class="cta-content">
-                    <h2>Are you ready to list these cards on eBay?</h2>
-                    <p>Sign in with eBay and we'll automatically create a Pokémon store listing for all these cards at
-                        their highest market value.</p>
-                </div>
-
-                <form id="ebayAuthForm" class="auth-form">
-                    <div class="input-group">
-                        <input type="text" id="ebayUsername" name="username" placeholder="eBay Username or Email"
-                            required>
-                    </div>
-                    <div class="input-group">
-                        <input type="password" id="ebayPassword" name="password" placeholder="eBay Password" required>
-                    </div>
-                    <button type="submit" class="btn-primary btn-action" id="btnAuthEbay">
-                        <span class="btn-text">Create eBay Listings</span>
-                        <span class="btn-icon">🚀</span>
-                    </button>
-                </form>
-            </div>
-
-            <div class="dashboard-header">
-                <h2>Top Appraised Cards</h2>
-                <div class="listing-counter"><span id="listedCount">0</span> Selected</div>
-            </div>
-
-            <div class="card-grid" id="listedGrid">
-                <!-- Cards injected here -->
-            </div>
-        </section>
-
+        <!-- Table -->
+        <div class="table-wrapper" id="tableWrapper" style="display:none;">
+            <table class="portfolio-table" id="portfolioTable">
+                <thead>
+                    <tr>
+                        <th class="col-card sortable" data-sort="name">Card</th>
+                        <th class="col-set">Set</th>
+                        <th class="col-rarity">Rarity</th>
+                        <th class="col-condition">Condition</th>
+                        <th class="col-price sortable" data-sort="price">Price</th>
+                        <th class="col-change sortable" data-sort="change">Change</th>
+                        <th class="col-chart">7d Trend</th>
+                        <th class="col-actions"></th>
+                    </tr>
+                </thead>
+                <tbody id="portfolioBody">
+                </tbody>
+            </table>
+        </div>
     </main>
 
-    <div id="toastContainer" class="toast-container"></div>
+    <!-- Upload Modal -->
+    <div class="modal-overlay" id="uploadModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Add Cards</h2>
+                <button class="modal-close" id="btnCloseModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="upload-zone" id="dropZone">
+                    <input type="file" id="fileInput" accept="image/*" multiple class="file-input-hidden">
+                    <div class="upload-content" id="uploadContent">
+                        <div class="upload-icon">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        </div>
+                        <p class="upload-title">Drag & drop card photos here</p>
+                        <p class="upload-sub">or <span class="upload-browse">browse files</span></p>
+                    </div>
+                    <div id="filePreviews" class="file-previews"></div>
+                </div>
+                <button class="btn-add large full-width" id="btnUploadSubmit" disabled>
+                    <span>Scan & Add to Portfolio</span>
+                </button>
+                <p class="upload-note" id="uploadStatus">AI will identify each card and fetch live market prices</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Card Detail Drawer -->
+    <div class="drawer-overlay" id="drawerOverlay">
+        <div class="drawer" id="cardDrawer">
+            <div class="drawer-header">
+                <h2 id="drawerCardName">Card Name</h2>
+                <button class="modal-close" id="btnCloseDrawer">&times;</button>
+            </div>
+            <div class="drawer-body">
+                <div class="drawer-meta" id="drawerMeta"></div>
+                <div class="drawer-chart-container">
+                    <h3>Price History</h3>
+                    <canvas id="priceChart" width="500" height="200"></canvas>
+                </div>
+                <div class="drawer-price-list" id="drawerPriceList"></div>
+            </div>
+        </div>
+    </div>
+
     <script src="script.js"></script>
 </body>
 

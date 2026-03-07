@@ -314,22 +314,30 @@ function checkKnownCards(name, set) {
 async function lookupPrice(cardName, cardSet, cardNumber) {
     if (!cardName) return null;
     const key = `${cardName}|${cardSet || ''}`.toLowerCase();
+
+    // We want the search URL available everywhere now
+    const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
+    const sourceUrl = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
+
     const cached = priceCache.get(key);
-    if (cached && Date.now() - cached.ts < 86400000) return cached.price;
+    if (cached && Date.now() - cached.ts < 86400000) return { price: cached.price, sourceUrl };
 
     const dbCached = getCachedPrice(cardName, cardSet || '');
-    if (dbCached) { priceCache.set(key, { price: dbCached, ts: Date.now() }); return dbCached; }
+    if (dbCached) {
+        priceCache.set(key, { price: dbCached, ts: Date.now() });
+        return { price: dbCached, sourceUrl };
+    }
 
     const known = checkKnownCards(cardName, cardSet);
-    if (known) { priceCache.set(key, { price: known, ts: Date.now() }); return known; }
+    if (known) {
+        priceCache.set(key, { price: known, ts: Date.now() });
+        return { price: known, sourceUrl };
+    }
 
     // Try TCGPlayer scrape
     try {
         await sleep(RATE_LIMITS.priceCheck);
-        const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
-        const url = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
-        const proxyUrl = getProxyUrl(url);
-        const resp = await axios.get(proxyUrl, { headers: makeHeaders(), timeout: 20000 });
+        const resp = await axios.get(sourceUrl, { headers: makeHeaders(), timeout: 20000 });
         const { load } = await import('cheerio');
         const $ = load(resp.data);
         let price = null;
@@ -339,8 +347,13 @@ async function lookupPrice(cardName, cardSet, cardNumber) {
             const m = txt.match(/\$?([\d,]+\.?\d*)/);
             if (m) price = parseFloat(m[1].replace(',', ''));
         });
-        if (price) { priceCache.set(key, { price, ts: Date.now() }); return price; }
-    } catch { }
+        if (price) {
+            priceCache.set(key, { price, ts: Date.now() });
+            return { price, sourceUrl };
+        }
+    } catch (err) {
+        console.error(`  [Pricing] TCGPlayer scrape failed for ${cardName}:`, err.message);
+    }
 
     return null;
 }
@@ -807,6 +820,7 @@ Return ONLY valid JSON (no markdown fences):
        "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
        "is_holographic": true/false,
        "is_first_edition": true/false,
+       "estimated_value_usd": number,
        "confidence": 0.0 to 1.0,
        "notes": "Any identifying features or damage seen"
     }
@@ -830,6 +844,41 @@ async function analyzeImageBuffer(buffer, mimeType) {
     }
 }
 
+async function findHighestMarketListing(searchQuery) {
+    if (!searchQuery) return null;
+
+    // Execute all available active scrapers simultaneously
+    const activeScrapers = SCRAPERS.filter(s => s.enabled);
+    const scrapePromises = activeScrapers.map(scraper =>
+        scraper.fn(searchQuery).catch(err => {
+            console.error(`Scraper ${scraper.name} failed for "${searchQuery}":`, err.message);
+            return [];
+        })
+    );
+
+    // Wait for all to finish and flatten the arrays
+    const results = await Promise.all(scrapePromises);
+    let allListings = results.flat();
+
+    if (allListings.length === 0) return null;
+
+    // Filter out graded cards, proxies, lots, and custom junk to find raw card value
+    const negativeKeywords = ['psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'lot', 'collection', 'orica', 'metal', 'replica'];
+
+    allListings = allListings.filter(listing => {
+        const titleLower = listing.title.toLowerCase();
+        return !negativeKeywords.some(kw => titleLower.includes(kw));
+    });
+
+    if (allListings.length === 0) return null;
+
+    // Sort descending by price to find the absolute highest value
+    allListings.sort((a, b) => b.price - a.price);
+
+    // Return the #1 highest priced authentic listing
+    return allListings[0];
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 //  EXPRESS SERVER
@@ -840,61 +889,43 @@ const app = express();
 // Serve static files (index.html, styles.css, script.js, card.png, etc.)
 app.use(express.static(__dirname));
 
-// API: recent deals
-app.get('/api/deals', (req, res) => {
-    const limit = parseInt(req.query.limit || '5000', 10);
-    const deals = getRecentDeals(limit);
-    res.json(deals.map(d => ({ ...d, image_urls: d.image_urls ? JSON.parse(d.image_urls) : [] })));
-});
-
-// API: all identified cards
-app.get('/api/cards', (req, res) => {
-    const limit = parseInt(req.query.limit || '5000', 10);
-    const cards = getRecentCards(limit);
-    res.json(cards.map(c => ({ ...c, image_urls: c.image_urls ? JSON.parse(c.image_urls) : [] })));
-});
-
 // API: stats
 app.get('/api/stats', (req, res) => {
     const stats = getStats();
     res.json({ ...stats });
 });
 
-// New Auto-Lister API implementation
-app.post('/api/analyze-and-list', upload.array('photos'), async (req, res) => {
-    try {
-        const { username, password } = req.body;
-        const files = req.files;
+// ═══════════════════════════════════════════════════════════════
+// NEW 3-STAGE PIPELINE: PHASE 1 & 2 (Upload & Analyze)
+// ═══════════════════════════════════════════════════════════════
 
+app.post('/api/analyze-lot', upload.array('photos'), async (req, res) => {
+    try {
+        const files = req.files;
         if (!files || files.length === 0) {
             return res.status(400).json({ success: false, message: 'No photos provided.' });
         }
 
-        if (!username || !password) {
-            return res.status(400).json({ success: false, message: 'eBay credentials required.' });
-        }
+        broadcastActivity('cycle_start', `Received ${files.length} photos for analysis...`);
 
-        broadcastActivity('cycle_start', `Received ${files.length} photos for processing...`);
-
-        // This process handles the remaining pipeline entirely asynchronously, sending events via SSE
-        processUploadAndList(username, password, files).catch(err => {
-            console.error('Background processing error:', err);
-            broadcastActivity('error', `Pipeline error: ${err.message}`);
+        // We run the analysis asynchronously so the browser connection doesn't timeout
+        processLotAnalysis(files).catch(err => {
+            console.error('Background analysis error:', err);
+            broadcastActivity('error', `Analysis error: ${err.message}`);
         });
 
-        // Immediately respond to client with success
-        res.json({ success: true, message: 'Pipeline started successfully.' });
+        res.json({ success: true, message: 'Analysis started.' });
     } catch (err) {
         console.error('Upload Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// The core logic function handling the 5 steps mentioned
-async function processUploadAndList(username, password, files) {
+// Analyzes the images and evaluates market prices, emitting SSE events
+async function processLotAnalysis(files) {
     let allCards = [];
 
-    // Step 2 & 3: Vision AI Analysis
+    // Vision AI Analysis
     for (const [index, file] of files.entries()) {
         try {
             broadcastActivity('analyzing_image', `Analyzing photo ${index + 1} of ${files.length}...`);
@@ -902,25 +933,49 @@ async function processUploadAndList(username, password, files) {
             if (analysis && analysis.identified_cards && analysis.identified_cards.length > 0) {
                 broadcastActivity('card_identified', `Found ${analysis.identified_cards.length} cards in photo ${index + 1}.`);
                 for (const card of analysis.identified_cards) {
-                    // Get market valuation via price check
-                    broadcastActivity('price_comparison', `Fetching valuation for ${card.card_name}...`);
-                    let marketPrice = await lookupPrice(card.card_name, card.card_set, card.card_number);
-                    if (!marketPrice) {
-                        // Default fallback logic
-                        marketPrice = card.estimated_value_usd ? parseFloat(card.estimated_value_usd) : 5.0;
+
+                    broadcastActivity('price_comparison', `Fetching TCGPlayer search results for ${card.card_name}...`);
+
+                    let marketPrice = 5.0;
+                    let sourceUrl = null;
+                    let explanation = "AI Estimated Value from initial scan";
+                    let matchedImageUrl = null;
+
+                    // 1. Get the aggressive search query
+                    const q = [card.card_name, card.card_set, card.card_number].filter(Boolean).join(' ');
+
+                    // 2. Multi-marketplace scrape & locate highest value
+                    broadcastActivity('price_comparison', `Extracting live market visual data...`);
+                    const highestListing = await findHighestMarketListing(q);
+
+                    if (highestListing) {
+                        marketPrice = highestListing.price;
+                        sourceUrl = highestListing.listingUrl;
+                        explanation = `Highest live listing found on ${highestListing.marketplace.toUpperCase()} - ${highestListing.title.substring(0, 40)}...`;
+                        if (highestListing.imageUrls && highestListing.imageUrls.length > 0) {
+                            matchedImageUrl = highestListing.imageUrls[0];
+                        }
+                    } else if (card.estimated_value_usd) {
+                        marketPrice = parseFloat(card.estimated_value_usd);
                     }
+
+                    // Note: We avoid saving full buffers for the client to download here.
+                    // We'll base64 encode later if needed, but for now just send metrics.
                     allCards.push({
+                        id: Math.random().toString(36).substring(2, 9),
                         ...card,
                         marketPrice,
-                        originalImageBuffer: file.buffer,
-                        originalMimeType: file.mimetype
+                        sourceUrl,
+                        explanation,
+                        matchedImageUrl
                     });
+
                     broadcastActivity('card_identified', `Valued ${card.card_name} at $${marketPrice.toFixed(2)}`, {
                         cardName: card.card_name, cardSet: card.card_set, rarity: card.rarity, aiEstimate: marketPrice
                     });
                 }
             } else {
-                broadcastActivity('ai_no_result', `No cards found in photo ${index + 1}.`);
+                broadcastActivity('info', `No recognizable cards found in photo ${index + 1}.`);
             }
         } catch (err) {
             console.error(`Photo ${index + 1} analysis error:`, err.message);
@@ -929,23 +984,59 @@ async function processUploadAndList(username, password, files) {
     }
 
     if (allCards.length === 0) {
-        broadcastActivity('error', 'No cards identified in any given photos. Pipeline stopped.');
+        broadcastActivity('error', 'No cards identified in any photos. Pipeline stopped.');
+        broadcast({ type: 'analysis_complete', success: false, cards: [] });
         return;
     }
 
-    // Step 4: Sort by valuation
+    // Sort by valuation (Highest first)
     allCards.sort((a, b) => b.marketPrice - a.marketPrice);
-
-    // Pick top 100 for listing (as per user instruction)
     const topCards = allCards.slice(0, 100);
-    broadcastActivity('deal_found', `Proceeding to list the top ${topCards.length} cards.`);
 
-    // Step 5: Puppeteer upload
-    // We import and execute this from the ebay lister script
+    broadcastActivity('deal_found', `Analysis complete. Found ${topCards.length} high-value cards ready for listing.`);
+
+    // Broadcast the final results payload back to the client via SSE
+    broadcast({
+        type: 'analysis_complete',
+        success: true,
+        cards: topCards
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NEW 3-STAGE PIPELINE: PHASE 3 (Authenticate & List)
+// ═══════════════════════════════════════════════════════════════
+
+app.post('/api/list-on-ebay', express.json(), async (req, res) => {
+    try {
+        const { username, password, cardsToList } = req.body;
+
+        if (!username || !password) {
+            return res.status(400).json({ success: false, message: 'eBay credentials required.' });
+        }
+        if (!cardsToList || cardsToList.length === 0) {
+            return res.status(400).json({ success: false, message: 'No cards provided for listing.' });
+        }
+
+        broadcastActivity('cycle_start', `Starting eBay listing wrapper for ${cardsToList.length} cards...`);
+
+        // Execute puppeteer agent asynchronously
+        triggerEbayAgent(username, password, cardsToList).catch(err => {
+            console.error('eBay Agent error:', err);
+            broadcastActivity('error', `Agent execution failed: ${err.message}`);
+        });
+
+        res.json({ success: true, message: 'eBay listing Agent sequence initiated.' });
+    } catch (err) {
+        console.error('eBay Listing Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+async function triggerEbayAgent(username, password, topCards) {
     const { listCardsOnEbay } = await import('./ebayLister.js');
     await listCardsOnEbay(username, password, topCards, broadcastActivity, broadcast);
-
-    broadcastActivity('cycle_complete', 'All operations finished successfully!');
+    broadcastActivity('cycle_complete', 'eBay automation successfully populated draft listings!');
 }
 
 // SSE: real-time event stream

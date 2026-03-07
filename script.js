@@ -1,571 +1,412 @@
 /**
- * Jack's Pokemon Packs — Integrated Frontend
- * 
- * Handles:
- * 1. 3D holographic card effect (preserved from original)
- * 2. SSE connection for real-time scanner activity
- * 3. Live activity panel with AI analysis visualization
- * 4. Deal card rendering and filtering
- * 5. Smooth scroll navigation
+ * Jack's Pokemon Packs — Auto-Lister Frontend Logic
+ * Manages the UI state machine, SSE connection, and dynamic renders.
  */
 
 // ═══════════ STATE ═══════════
+const STATE = {
+    eventSource: null,
+    files: [],
+    topCards: [],
+    listedStats: {
+        count: 0,
+        totalValue: 0
+    }
+};
 
-let eventSource = null;
+// ═══════════ DOM ELEMENTS ═══════════
+const DOM = {
+    // Views
+    viewPortal: document.getElementById('view-portal'),
+    viewProcessing: document.getElementById('view-processing'),
+    viewReview: document.getElementById('view-review'),
+
+    // Portal Form
+    form: document.getElementById('autoListForm'),
+    dropZone: document.getElementById('dropZone'),
+    fileInput: document.getElementById('cardPhotos'),
+    filePreviews: document.getElementById('filePreviews'),
+    btnSubmit: document.getElementById('btnStartPipeline'),
+
+    // Processing Pipeline
+    steps: {
+        upload: document.getElementById('step-upload'),
+        vision: document.getElementById('step-vision'),
+        valuation: document.getElementById('step-valuation'),
+        listing: document.getElementById('step-listing')
+    },
+    activityLog: document.getElementById('activityLog'),
+
+    // AI Focus
+    aiFocus: document.getElementById('aiFocus'),
+    focusImage: document.getElementById('focusImage'),
+    focusTitle: document.getElementById('focusTitle'),
+    focusEstimate: document.getElementById('focusEstimate'),
+    focusTier: document.getElementById('focusTier'),
+
+    // Dashboard & Phase 3
+    listedGrid: document.getElementById('listedGrid'),
+    listedCount: document.getElementById('listedCount'),
+    authForm: document.getElementById('ebayAuthForm'),
+    btnAuth: document.getElementById('btnAuthEbay'),
+
+    // Shared
+    statusText: document.getElementById('systemStatus'),
+    statusDot: document.querySelector('.status-indicator')
+};
 
 // ═══════════ INIT ═══════════
-
 document.addEventListener('DOMContentLoaded', () => {
-    initParticles();
-    initNavigation();
-    initAutoListForm();
+    initDragAndDrop();
+    initForms();
     connectSSE();
-    fetchStats();
-    initFilters();
-
-    setInterval(fetchStats, 15000);
 });
 
-// ═══════════ PARTICLES ═══════════
+function setStatus(text, isActive = false) {
+    DOM.statusText.textContent = text;
+    DOM.statusDot.classList.toggle('active', isActive);
+}
 
-function initParticles() {
-    const container = document.getElementById('particles');
-    if (!container) return;
-    const colors = ['#fbbf24', '#a855f7', '#3b82f6', '#ec4899', '#22c55e'];
-    for (let i = 0; i < 25; i++) {
-        const p = document.createElement('div');
-        p.className = 'particle';
-        const size = Math.random() * 4 + 2;
-        const color = colors[Math.floor(Math.random() * colors.length)];
-        p.style.cssText = `width:${size}px;height:${size}px;left:${Math.random() * 100}%;background:${color};animation-delay:${Math.random() * 8}s;animation-duration:${Math.random() * 4 + 6}s;box-shadow:0 0 ${size * 2}px ${color};`;
-        container.appendChild(p);
+function switchView(viewId) {
+    DOM.viewPortal.classList.remove('active');
+    DOM.viewProcessing.classList.remove('active');
+    DOM.viewReview.classList.remove('active');
+
+    if (viewId === 'processing') {
+        DOM.viewProcessing.classList.add('active');
+    } else if (viewId === 'review') {
+        DOM.viewReview.classList.add('active');
+    } else {
+        DOM.viewPortal.classList.add('active');
     }
 }
 
-// ═══════════ NAVIGATION ═══════════
+// ═══════════ FILE UPLOAD & FORMS ═══════════
+function initDragAndDrop() {
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        DOM.dropZone.addEventListener(eventName, preventDefaults, false);
+    });
 
-function initNavigation() {
-    const nav = document.getElementById('nav');
-    const links = document.querySelectorAll('.nav-link');
-    const sections = ['hero', 'scanner', 'deals'];
+    ['dragenter', 'dragover'].forEach(eventName => {
+        DOM.dropZone.addEventListener(eventName, () => DOM.dropZone.classList.add('drag-over'), false);
+    });
 
-    window.addEventListener('scroll', () => {
-        nav.classList.toggle('scrolled', window.scrollY > 50);
+    ['dragleave', 'drop'].forEach(eventName => {
+        DOM.dropZone.addEventListener(eventName, () => DOM.dropZone.classList.remove('drag-over'), false);
+    });
 
-        // Update active nav link
-        const scrollY = window.scrollY + 100;
-        for (let i = sections.length - 1; i >= 0; i--) {
-            const section = document.getElementById(sections[i]);
-            if (section && scrollY >= section.offsetTop) {
-                links.forEach(l => l.classList.remove('active'));
-                links[i]?.classList.add('active');
-                break;
-            }
+    DOM.dropZone.addEventListener('drop', handleDrop, false);
+    DOM.fileInput.addEventListener('change', handleFiles, false);
+}
+
+function preventDefaults(e) {
+    e.preventDefault();
+    e.stopPropagation();
+}
+
+function handleDrop(e) {
+    const dt = e.dataTransfer;
+    const files = dt.files;
+    handleFiles({ target: { files } });
+}
+
+function handleFiles(e) {
+    const newFiles = [...e.target.files];
+    STATE.files = [...STATE.files, ...newFiles];
+    renderPreviews();
+}
+
+function renderPreviews() {
+    DOM.filePreviews.innerHTML = '';
+    STATE.files.forEach(file => {
+        if (!file.type.startsWith('image/')) return;
+
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => {
+            const img = document.createElement('img');
+            img.src = reader.result;
+            img.style.cssText = 'width: 60px; height: 60px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); margin-right: 8px;';
+            DOM.filePreviews.appendChild(img);
         }
     });
 }
 
-// ═══════════ FORM SUBMISSION ═══════════
-
-function initAutoListForm() {
-    const form = document.getElementById('autoListForm');
-    if (!form) return;
-
-    form.addEventListener('submit', async (e) => {
+function initForms() {
+    // Phase 1: Upload & Analyze
+    DOM.form.addEventListener('submit', async (e) => {
         e.preventDefault();
 
-        const username = document.getElementById('ebayUsername').value;
-        const password = document.getElementById('ebayPassword').value;
-        const files = document.getElementById('cardPhotos').files;
-
-        if (!files.length) return alert('Please select at least one photo.');
-
-        const btn = document.getElementById('btnSubmitAutoList');
-        btn.disabled = true;
-        btn.innerHTML = '<span class="cta-icon">⏳</span> Uploading...';
-
-        // Clear activity log and show live badge
-        document.getElementById('activityLog').innerHTML = '';
-        document.getElementById('liveBadge').style.display = 'flex';
-        document.getElementById('scanner').scrollIntoView({ behavior: 'smooth' });
-
-        const formData = new FormData();
-        formData.append('username', username);
-        formData.append('password', password);
-        for (let i = 0; i < files.length; i++) {
-            formData.append('photos', files[i]);
+        if (STATE.files.length === 0) {
+            alert('Please select or drop at least one image of your cards.');
+            return;
         }
 
+        DOM.btnSubmit.disabled = true;
+        DOM.btnSubmit.innerHTML = '<span>Uploading...</span>';
+        switchView('processing');
+        activateStep('upload');
+        logTerminal('info', `Initializing secure upload for ${STATE.files.length} images...`);
+
+        const formData = new FormData();
+        STATE.files.forEach(file => formData.append('photos', file));
+
         try {
-            const resp = await fetch('/api/analyze-and-list', {
+            const resp = await fetch('/api/analyze-lot', {
                 method: 'POST',
                 body: formData
             });
             const data = await resp.json();
 
             if (data.success) {
-                btn.innerHTML = '<span class="cta-icon">✅</span> Pipeline Started';
+                logTerminal('success', 'Upload complete. Launching AI Pipeline...');
             } else {
-                alert(`Error: ${data.message}`);
-                btn.disabled = false;
-                btn.innerHTML = '<span class="cta-icon">🚀</span> Analyze & Auto-List on eBay';
+                logTerminal('error', `Upload failed: ${data.message}`);
+                DOM.btnSubmit.disabled = false;
+                DOM.btnSubmit.innerHTML = '<span>Initiate Apprasial Scan</span>';
             }
         } catch (err) {
-            alert(`Upload failed: ${err.message}`);
-            btn.disabled = false;
-            btn.innerHTML = '<span class="cta-icon">🚀</span> Analyze & Auto-List on eBay';
+            logTerminal('error', `Connection error: ${err.message}`);
+        }
+    });
+
+    // Phase 3: Authenticate & List
+    DOM.authForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const username = document.getElementById('ebayUsername').value;
+        const password = document.getElementById('ebayPassword').value;
+
+        if (STATE.topCards.length === 0) {
+            alert('No cards available to list.');
+            return;
+        }
+
+        DOM.btnAuth.disabled = true;
+        DOM.btnAuth.innerHTML = '<span>Listing...</span>';
+        activateStep('listing');
+        logTerminal('info', `Initiating eBay Agent for ${STATE.topCards.length} cards...`);
+
+        try {
+            const resp = await fetch('/api/list-on-ebay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username,
+                    password,
+                    cardsToList: STATE.topCards
+                })
+            });
+            const data = await resp.json();
+
+            if (!data.success) {
+                logTerminal('error', `Listing failed: ${data.message}`);
+                DOM.btnAuth.disabled = false;
+                DOM.btnAuth.innerHTML = '<span>Create eBay Listings</span>';
+            }
+        } catch (err) {
+            logTerminal('error', `Connection error: ${err.message}`);
         }
     });
 }
 
-// ═══════════ SSE CONNECTION ═══════════
+// ═══════════ PIPELINE & TERMINAL ═══════════
+function activateStep(stepName) {
+    Object.values(DOM.steps).forEach(s => s.classList.remove('active', 'completed'));
 
+    if (stepName === 'upload') {
+        DOM.steps.upload.classList.add('active');
+    } else if (stepName === 'vision') {
+        DOM.steps.upload.classList.add('completed');
+        DOM.steps.vision.classList.add('active');
+    } else if (stepName === 'valuation') {
+        DOM.steps.upload.classList.add('completed');
+        DOM.steps.vision.classList.add('completed');
+        DOM.steps.valuation.classList.add('active');
+    } else if (stepName === 'listing') {
+        DOM.steps.upload.classList.add('completed');
+        DOM.steps.vision.classList.add('completed');
+        DOM.steps.valuation.classList.add('completed');
+        DOM.steps.listing.classList.add('active');
+    }
+}
+
+function logTerminal(type, message) {
+    const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const cssClass = {
+        'info': 'info',
+        'success': 'success',
+        'error': 'error',
+        'ai': 'ai'
+    }[type] || 'info';
+
+    const div = document.createElement('div');
+    div.className = `log-line ${cssClass}`;
+    div.innerHTML = `<span class="timestamp">[${time}]</span> ${escapeHtml(message)}`;
+
+    // Clear placeholder
+    const placeholder = DOM.activityLog.querySelector('.text-muted');
+    if (placeholder) placeholder.remove();
+
+    DOM.activityLog.appendChild(div);
+    DOM.activityLog.scrollTop = DOM.activityLog.scrollHeight;
+
+    // Keep max 100 lines
+    while (DOM.activityLog.children.length > 100) {
+        DOM.activityLog.removeChild(DOM.activityLog.firstChild);
+    }
+}
+
+function escapeHtml(unsafe) {
+    return (unsafe || '').toString()
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+
+// ═══════════ SSE CONNECTION & STATE MAPPER ═══════════
 function connectSSE() {
-    if (eventSource) eventSource.close();
-    eventSource = new EventSource('/api/events');
+    if (STATE.eventSource) STATE.eventSource.close();
+    STATE.eventSource = new EventSource('/api/events');
 
-    eventSource.onmessage = (e) => {
+    STATE.eventSource.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
-            switch (data.type) {
-                case 'connected':
-                    setNavStatus('Connected', true);
-                    break;
-                case 'activity':
-                    handleActivity(data);
-                    break;
-                case 'listing_created':
-                    addDeal(data.card); // Repurpose addDeal for created listings
-                    break;
-            }
-        } catch (err) { console.error('SSE parse error:', err); }
+            handleServerEvent(data);
+        } catch (err) { console.error('SSE Error:', err); }
     };
 
-    eventSource.onerror = () => {
-        setNavStatus('Reconnecting...', false);
+    STATE.eventSource.onerror = () => {
+        setStatus('Reconnecting...', false);
         setTimeout(connectSSE, 5000);
     };
 }
 
-// ═══════════ ACTIVITY HANDLER ═══════════
+function handleServerEvent(data) {
+    if (data.type === 'connected') {
+        setStatus('System Online', true);
+        return;
+    }
 
-function handleActivity(data) {
-    const { activityType, message, details } = data;
+    if (data.type === 'listing_created') {
+        addListingCard(data.card);
+        return;
+    }
 
-    // Add to the activity log
-    const logClass = getLogClass(activityType);
-    const icon = getLogIcon(activityType);
-    addLogEntry(icon, message, logClass);
+    if (data.type === 'analysis_complete') {
+        if (data.success) {
+            STATE.topCards = data.cards;
+            data.cards.forEach(c => addListingCard(c, true));
+            switchView('review');
+        }
+        return;
+    }
 
-    // Update the AI analysis panel for specific activity types
+    if (data.type !== 'activity') return;
+
+    const { activityType, message, details = {} } = data;
+
+    // Map backend activity types to terminal styles
+    let logStyle = 'info';
+    if (['deal_found', 'scraper_done', 'cycle_complete'].includes(activityType)) logStyle = 'success';
+    if (['analyzing_image', 'ai_analyzing', 'card_identified'].includes(activityType)) logStyle = 'ai';
+    if (['error', 'scam_warning'].includes(activityType)) logStyle = 'error';
+
+    logTerminal(logStyle, message);
+
+    // Map backend activity to UI step progress and focus panel
     switch (activityType) {
         case 'analyzing_image':
-            showAiPanel(details.imageUrl, details.listingTitle, details.listingPrice);
-            break;
-
-        case 'ai_analyzing':
-            showScanningOverlay(true);
+            activateStep('vision');
+            if (details.imageUrl) updateAiFocus(details.imageUrl, 'Detecting Card...', '--', '--');
             break;
 
         case 'card_identified':
-            showScanningOverlay(false);
-            showAiResult(details);
+            activateStep('valuation');
+            const conf = details.confidence ? `(${(details.confidence * 100).toFixed(0)}%)` : '';
+            updateAiFocus(null, `${details.cardName} ${conf}`, '--', '--');
             break;
 
         case 'price_comparison':
-            updateAiPrices(details.listingPrice, details.marketPrice);
-            break;
-
         case 'deal_found':
-            showAiVerdict(details.dealTier, details.discountPct);
+            if (details.marketPrice) {
+                updateAiFocus(null, null, `$${details.marketPrice.toFixed(2)}`, details.dealTier || 'good');
+            }
             break;
 
-        case 'no_deal':
-            showAiVerdict('no-deal', 0);
-            break;
-
-        case 'skip_listing':
-        case 'ai_no_result':
-        case 'no_price':
-            hideAiPanel();
-            break;
-
-        case 'cycle_start':
-            setNavStatus('Scanning...', true);
+        case 'scraper_start':
+        case 'search_terms':
+            activateStep('listing');
             break;
 
         case 'cycle_complete':
-            setNavStatus('Monitoring', true);
+        case 'error':
+            activateStep('completed');
+            setTimeout(() => { DOM.aiFocus.style.display = 'none'; }, 5000);
             break;
     }
 }
 
-function getLogClass(type) {
-    const map = {
-        deal_found: 'deal', error: 'error', scam_warning: 'error',
-        analyzing_image: 'ai', ai_analyzing: 'ai', card_identified: 'ai',
-        price_comparison: 'ai', scraper_start: 'scraper', scraper_done: 'scraper',
-    };
-    return map[type] || '';
-}
+// ═══════════ AI FOCUS PANEL ═══════════
+function updateAiFocus(imgUrl, title, estimate, tier) {
+    DOM.aiFocus.style.display = 'block';
 
-function getLogIcon(type) {
-    const map = {
-        cycle_start: '🔄', cycle_complete: '✅', search_terms: '🔎',
-        scraper_start: '📡', scraper_done: '✅', search_result: '📋',
-        new_listings: '🆕', analyzing_image: '📸', ai_analyzing: '🤖',
-        card_identified: '🎴', price_comparison: '💰', deal_found: '🎯',
-        no_deal: '➖', skip_listing: '⏭️', ai_no_result: '❓',
-        no_price: '❓', scam_warning: '⚠️', error: '❌',
-    };
-    return map[type] || '📌';
-}
+    if (imgUrl) DOM.focusImage.src = imgUrl;
+    if (title) DOM.focusTitle.textContent = title;
+    if (estimate) DOM.focusEstimate.textContent = estimate;
 
-// ═══════════ AI PANEL ═══════════
-
-function showAiPanel(imageUrl, title, listingPrice) {
-    const panel = document.getElementById('aiCurrent');
-    const img = document.getElementById('aiCurrentImg');
-    const titleEl = document.getElementById('aiCurrentTitle');
-    const resultEl = document.getElementById('aiResult');
-    const verdictRow = document.getElementById('aiVerdictRow');
-
-    panel.style.display = 'flex';
-    if (imageUrl) img.src = imageUrl;
-    img.onerror = () => img.src = '';
-    titleEl.textContent = title || 'Analyzing listing...';
-    resultEl.style.display = 'none';
-    verdictRow.style.display = 'none';
-    showScanningOverlay(true);
-
-    // Removed scrollIntoView to prevent the page from jumping while scanning
-}
-
-function showScanningOverlay(show) {
-    const overlay = document.getElementById('aiScanOverlay');
-    if (overlay) overlay.style.display = show ? 'flex' : 'none';
-}
-
-function showAiResult(details) {
-    const resultEl = document.getElementById('aiResult');
-    resultEl.style.display = 'flex';
-
-    setText('aiCardName', details.cardName || '—');
-    setText('aiCardSet', details.cardSet || '—');
-    setText('aiCardRarity', details.rarity || '—');
-    setText('aiCardCondition', details.condition || '—');
-    setText('aiCardConfidence', details.confidence ? `${(details.confidence * 100).toFixed(0)}%` : '—');
-
-    if (details.listingPrice) {
-        setText('aiListedPrice', `$${details.listingPrice.toFixed(2)}`);
-    }
-    if (details.aiEstimate) {
-        setText('aiMarketPrice', `~$${parseFloat(details.aiEstimate).toFixed(2)} (AI est.)`);
+    if (tier) {
+        DOM.focusTier.textContent = tier.toUpperCase();
+        DOM.focusTier.className = `stat-value card-tier ${tier}`;
     }
 }
 
-function updateAiPrices(listingPrice, marketPrice) {
-    setText('aiListedPrice', `$${listingPrice.toFixed(2)}`);
-    setText('aiMarketPrice', `$${marketPrice.toFixed(2)}`);
-    document.getElementById('aiMarketPrice').style.textDecoration = 'line-through';
-}
-
-function showAiVerdict(tier, discountPct) {
-    const row = document.getElementById('aiVerdictRow');
-    const el = document.getElementById('aiVerdict');
-    row.style.display = 'flex';
-
-    const labels = {
-        incredible: `🔥 INCREDIBLE — ${(discountPct * 100).toFixed(0)}% OFF!`,
-        great: `💎 GREAT DEAL — ${(discountPct * 100).toFixed(0)}% OFF!`,
-        good: `👍 GOOD DEAL — ${(discountPct * 100).toFixed(0)}% OFF`,
-        'no-deal': '➖ Fair price — not a deal',
-    };
-
-    el.textContent = labels[tier] || 'Analyzed';
-    el.className = `ai-verdict ${tier}`;
-}
-
-function hideAiPanel() {
-    // Don't hide immediately — let it linger briefly
-    setTimeout(() => {
-        const panel = document.getElementById('aiCurrent');
-        if (panel) panel.style.display = 'none';
-    }, 2000);
-}
-
-// ═══════════ ACTIVITY LOG ═══════════
-
-function addLogEntry(icon, message, cssClass) {
-    const log = document.getElementById('activityLog');
-    const placeholder = log.querySelector('.log-placeholder');
-    if (placeholder) placeholder.remove();
-
-    const entry = document.createElement('div');
-    entry.className = `log-entry ${cssClass}`;
-
-    const time = new Date().toLocaleTimeString();
-    entry.innerHTML = `<span class="log-icon">${icon}</span><span class="log-time">${time}</span><span class="log-text">${escapeHtml(message)}</span>`;
-    log.appendChild(entry);
-    log.scrollTop = log.scrollHeight;
-
-    // Keep max 80 entries
-    while (log.children.length > 80) log.removeChild(log.firstChild);
-}
-
-// ═══════════ DEALS & TRACKER ═══════════
-
-const FIRST_151 = [
-    "Bulbasaur", "Ivysaur", "Venusaur", "Charmander", "Charmeleon", "Charizard", "Squirtle", "Wartortle", "Blastoise", "Caterpie", "Metapod", "Butterfree", "Weedle", "Kakuna", "Beedrill", "Pidgey", "Pidgeotto", "Pidgeot", "Rattata", "Raticate", "Spearow", "Fearow", "Ekans", "Arbok", "Pikachu", "Raichu", "Sandshrew", "Sandslash", "Nidoran♀", "Nidorina", "Nidoqueen", "Nidoran♂", "Nidorino", "Nidoking", "Clefairy", "Clefable", "Vulpix", "Ninetales", "Jigglypuff", "Wigglytuff", "Zubat", "Golbat", "Oddish", "Gloom", "Vileplume", "Paras", "Parasect", "Venonat", "Venomoth", "Diglett", "Dugtrio", "Meowth", "Persian", "Psyduck", "Golduck", "Mankey", "Primeape", "Growlithe", "Arcanine", "Poliwag", "Poliwhirl", "Poliwrath", "Abra", "Kadabra", "Alakazam", "Machop", "Machoke", "Machamp", "Bellsprout", "Weepinbell", "Victreebel", "Tentacool", "Tentacruel", "Geodude", "Graveler", "Golem", "Ponyta", "Rapidash", "Slowpoke", "Slowbro", "Magnemite", "Magneton", "Farfetch'd", "Doduo", "Dodrio", "Seel", "Dewgong", "Grimer", "Muk", "Shellder", "Cloyster", "Gastly", "Haunter", "Gengar", "Onix", "Drowzee", "Hypno", "Krabby", "Kingler", "Voltorb", "Electrode", "Exeggcute", "Exeggutor", "Cubone", "Marowak", "Hitmonlee", "Hitmonchan", "Lickitung", "Koffing", "Weezing", "Rhyhorn", "Rhydon", "Chansey", "Tangela", "Kangaskhan", "Horsea", "Seadra", "Goldeen", "Seaking", "Staryu", "Starmie", "Mr. Mime", "Scyther", "Jynx", "Electabuzz", "Magmar", "Pinsir", "Tauros", "Magikarp", "Gyarados", "Lapras", "Ditto", "Eevee", "Vaporeon", "Jolteon", "Flareon", "Porygon", "Omanyte", "Omastar", "Kabuto", "Kabutops", "Aerodactyl", "Snorlax", "Articuno", "Zapdos", "Moltres", "Dratini", "Dragonair", "Dragonite", "Mewtwo", "Mew"
-];
-
-let currentFeed = 'deals'; // 'deals' or 'all' or 'first-edition' or 'tracker-151'
-let allDeals = [];
-let allCards = [];
-let currentFilter = 'all';
-
-async function fetchDeals() {
+// ═══════════ DASHBOARD RENDERING ═══════════
+async function fetchExistingListings() {
     try {
-        const resp = await fetch('/api/deals?limit=5000');
+        const resp = await fetch('/api/deals?limit=100');
         const deals = await resp.json();
-        allDeals = deals;
-        if (currentFeed === 'deals') renderDeals();
-    } catch { }
+        deals.forEach(d => addListingCard(d, true));
+    } catch (e) { console.error('Failed to fetch initial listings', e); }
 }
 
-async function fetchCards() {
-    try {
-        const resp = await fetch('/api/cards?limit=5000');
-        const cards = await resp.json();
-        allCards = cards;
-        if (currentFeed === 'all') renderDeals();
-    } catch { }
-}
+function addListingCard(card, isHistory = false) {
+    STATE.listedStats.count++;
+    DOM.listedCount.textContent = STATE.listedStats.count;
 
-async function fetchStats() {
-    try {
-        const resp = await fetch('/api/stats');
-        const stats = await resp.json();
-        setText('statListings', formatNum(stats.totalListings || 0));
-        setText('statAnalyzed', formatNum(stats.scanState?.cardsAnalyzed || 0));
-        setText('statDeals', formatNum(stats.totalDeals || 0));
-        if (stats.scanState) updateScanState(stats.scanState);
-    } catch { }
-}
+    const el = document.createElement('div');
+    el.className = 'listed-card';
 
-function updateScanState(state) {
-    if (state.nextCycleAt) {
-        const diff = new Date(state.nextCycleAt) - Date.now();
-        if (diff > 0) {
-            const m = Math.floor(diff / 60000), s = Math.floor((diff % 60000) / 1000);
-            setText('statNextScan', `${m}:${s.toString().padStart(2, '0')}`);
-        } else {
-            setText('statNextScan', 'Now');
-        }
-    }
-    if (state.isRunning) setNavStatus('Scanning...', true);
-}
+    const price = card.listing_price || card.market_price || card.marketPrice || card.avg_price || 0;
 
-function addDeal(deal) {
-    deal.image_urls = deal.image_urls ? (typeof deal.image_urls === 'string' ? JSON.parse(deal.image_urls) : deal.image_urls) : [];
-    allDeals.unshift(deal);
-    renderDeals();
-}
+    const explanationDiv = card.explanation
+        ? `<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem; line-height: 1.3;"><i>${escapeHtml(card.explanation)}</i></div>`
+        : '';
 
-function renderDeals() {
-    const grid = document.getElementById('dealGrid');
-    const empty = document.getElementById('emptyState');
-    const filterContainer = document.getElementById('tierFilters');
+    const verifyLink = card.sourceUrl
+        ? `<a href="${card.sourceUrl}" target="_blank" class="verify-link" style="color: var(--accent-primary); font-size: 0.85rem; text-decoration: none; display: block; margin-top: 0.75rem;">Verify Live Listing ↗</a>`
+        : `<span style="color: var(--text-secondary); font-size: 0.85rem; display: block; margin-top: 0.75rem; font-style: italic;">AI Estimated Value</span>`;
 
-    // Hide/Show tier filters based on active tab
-    if (filterContainer) filterContainer.style.display = currentFeed === 'deals' ? 'flex' : 'none';
+    const imageElement = card.matchedImageUrl
+        ? `<div style="width: 100%; display: flex; justify-content: center; margin-bottom: 1rem;"><img src="${escapeHtml(card.matchedImageUrl)}" style="max-height: 200px; object-fit: contain; border-radius: 8px;"></div>`
+        : '';
 
-    if (currentFeed === 'tracker-151') {
-        renderTracker151();
-        return;
-    }
-
-    grid.className = 'deal-grid'; // Ensure standard grid class is active
-    const sourceData = currentFeed === 'deals' ? allDeals : allCards;
-
-    let filtered = [];
-    if (currentFeed === 'first-edition') {
-        filtered = allCards.filter(d => d.is_1st_ed === 1 || d.is_1st_ed === true);
-    } else {
-        filtered = sourceData.filter(d =>
-            currentFeed === 'all' || currentFilter === 'all' || d.deal_tier === currentFilter
-        );
-    }
-
-    if (!filtered.length) {
-        grid.innerHTML = '';
-        if (empty) { grid.appendChild(empty); empty.style.display = ''; }
-        return;
-    }
-
-    if (empty) empty.style.display = 'none';
-    grid.innerHTML = filtered.map(dealCardHTML).join('');
-}
-
-function dealCardHTML(d) {
-    const images = d.image_urls || [];
-    const img = images[0] || '';
-
-    // Distinguish between a deal object and a raw card object
-    const isDeal = !!d.deal_tier;
-    const tier = d.deal_tier || 'none';
-    const emoji = { incredible: '🔥', great: '💎', good: '👍' }[tier] || '🔍';
-
-    const disc = d.discount_pct ? `${(d.discount_pct * 100).toFixed(0)}%` : '';
-    const name = d.card_name || d.title || 'Unknown';
-    const tags = [];
-
-    if (d.is_holo) tags.push('<span class="tag holo">✦ Holo</span>');
-    if (d.is_1st_ed) tags.push('<span class="tag first-edition">1st Ed</span>');
-    if (d.rarity && d.rarity !== 'Unknown') tags.push(`<span class="tag rarity">${d.rarity}</span>`);
-    if (d.condition_est && d.condition_est !== 'Unknown') tags.push(`<span class="tag condition">${d.condition_est}</span>`);
-    if (d.watchers > 0) tags.push(`<span class="tag watchers">👀 ${d.watchers} Watching</span>`);
-
-    return `<div class="deal-card ${isDeal ? `tier-${tier}` : 'tier-none'}">
-        <span class="deal-tier-badge ${tier}" ${!isDeal ? 'style="display:none;"' : ''}>${emoji} ${tier.toUpperCase()}</span>
-        <div class="deal-card-image">
-            ${img ? `<img src="${img}" alt="${escapeHtml(name)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=\\'no-image\\'>🃏</div>'">` : '<div class="no-image">🃏</div>'}
-            <span class="marketplace-badge">${d.marketplace || ''}</span>
+    el.innerHTML = `
+        <div class="card-header">
+            <span class="card-tier ${card.dealTier || 'good'}">${card.dealTier || 'PREMIUM'} CARD</span>
+            ${!isHistory ? '<span style="font-size: 10px; color: var(--accent-success);">● LISTED</span>' : ''}
         </div>
-        <div class="deal-card-info">
-            <div class="deal-card-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
-            <div class="deal-card-set">${escapeHtml(d.card_set || '')}</div>
-            ${tags.length ? `<div class="deal-card-tags">${tags.join('')}</div>` : ''}
-            <div class="deal-price-row">
-                <span class="deal-listed-price">$${(d.listing_price || d.price || 0).toFixed(2)}</span>
-                <span class="deal-market-price ${!d.market_price ? 'hidden' : ''}">$${(d.market_price || 0).toFixed(2)}</span>
+        ${imageElement}
+        <div class="card-title">${escapeHtml(card.title || card.card_name)}</div>
+        <div class="card-pricing">
+            <div class="price-block listed" style="margin-bottom: 0;">
+                <span>Market Value</span>
+                <strong>$${parseFloat(price).toFixed(2)}</strong>
             </div>
-            
-            <div class="date-listed-label" style="font-size: 11px; color: var(--text-muted); margin-top: 10px;">
-                Listed: ${new Date(d.posted_at || d.created_at).toLocaleString()}
-            </div>
-            
-            ${isDeal ? `
-            <div class="discount-bar"><div class="discount-bar-fill" style="width:${Math.min((d.discount_pct || 0) * 100, 100)}%"></div></div>
-            <div class="deal-discount-label">
-                <span>Save $${((d.market_price || 0) - (d.listing_price || 0)).toFixed(2)}</span>
-                <span class="deal-discount-value">${disc} OFF</span>
-            </div>
-            ` : ''}
-            
-            <a href="${d.listing_url || '#'}" target="_blank" rel="noopener" class="deal-buy-btn">BUY NOW →</a>
+            ${explanationDiv}
+            ${verifyLink}
         </div>
-    </div>`;
-}
-
-function renderTracker151() {
-    const grid = document.getElementById('dealGrid');
-    const empty = document.getElementById('emptyState');
-    if (empty) empty.style.display = 'none';
-
-    grid.className = 'tracker-151-grid';
-
-    const foundNames = new Set(
-        allCards.map(c => c.card_name).filter(Boolean).map(n => n.toLowerCase())
-    );
-
-    let foundCount = 0;
-    const slotsHtml = FIRST_151.map((pokemon, index) => {
-        const pkmnLower = pokemon.toLowerCase();
-
-        // Find if any card in our database includes this pokemon's name
-        const isFound = Array.from(foundNames).some(name => {
-            // Match exact names or names that start with the pokemon name (e.g., "Charizard EX")
-            const parts = name.split(/[^a-z0-9]/);
-            return parts.includes(pkmnLower) || name.includes(` ${pkmnLower} `) || name.startsWith(`${pkmnLower} `) || name === pkmnLower;
-        });
-
-        if (isFound) foundCount++;
-
-        return `
-        <div class="tracker-slot ${isFound ? 'found' : 'missing'}">
-            <div class="tracker-number">#${(index + 1).toString().padStart(3, '0')}</div>
-            <div class="tracker-name">${pokemon}</div>
-        </div>
-        `;
-    }).join('');
-
-    const pct = Math.round((foundCount / 151) * 100);
-
-    grid.innerHTML = `
-        <div class="tracker-stats-banner">
-            <h3>Original 151 Pokedex</h3>
-            <div class="tracker-progress-bar">
-                <div class="tracker-progress-fill" style="width: ${pct}%"></div>
-            </div>
-            <div class="tracker-fraction">${foundCount} / 151</div>
-        </div>
-        ${slotsHtml}
     `;
-}
 
-// ═══════════ FILTERS & TABS ═══════════
-
-function initFilters() {
-    // Tier Filters (Only for Deals feed)
-    document.querySelectorAll('.filter-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentFilter = btn.dataset.filter;
-            renderDeals();
-        });
-    });
-
-    // Feed Tabs (Deals vs All Finds)
-    document.querySelectorAll('.feed-tab').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.feed-tab').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentFeed = btn.dataset.feed;
-
-            // Depending on which tab, display that data
-            if ((currentFeed === 'all' || currentFeed === 'first-edition' || currentFeed === 'tracker-151') && !allCards.length) {
-                fetchCards();
-            } else {
-                renderDeals();
-            }
-        });
-    });
-}
-
-// ═══════════ TOAST ═══════════
-
-function showToast(deal) {
-    const container = document.getElementById('toastContainer');
-    const toast = document.createElement('div');
-    toast.className = 'toast';
-    const emoji = { incredible: '🔥', great: '💎', good: '👍' }[deal.deal_tier] || '📦';
-    toast.innerHTML = `<div class="toast-title">${emoji} ${(deal.deal_tier || 'deal').toUpperCase()} Deal!</div>
-        <div class="toast-body">${escapeHtml(deal.card_name || deal.title || 'Pokemon Card')} — $${(deal.listing_price || 0).toFixed(2)}</div>`;
-    container.appendChild(toast);
-    setTimeout(() => { toast.classList.add('toast-out'); setTimeout(() => toast.remove(), 300); }, 6000);
-}
-
-// ═══════════ HELPERS ═══════════
-
-function setNavStatus(text, ok) {
-    const el = document.getElementById('navStatusText');
-    const dot = document.querySelector('.nav-pulse');
-    if (el) el.textContent = text;
-    if (dot) dot.style.background = ok ? 'var(--accent-green)' : 'var(--accent-fire)';
-}
-
-function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
-
-function formatNum(n) {
-    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
-    if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
-    return n.toString();
-}
-
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str || '';
-    return div.innerHTML;
+    DOM.listedGrid.appendChild(el);
 }

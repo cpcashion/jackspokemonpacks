@@ -1,7 +1,10 @@
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { writeFileSync, unlinkSync } from 'fs';
+
+puppeteer.use(StealthPlugin());
 
 /**
  * Automates logging into eBay and listing a set of Pokemon cards.

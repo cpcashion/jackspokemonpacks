@@ -4,135 +4,182 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Jack's Pokemon Packs | AI Card Deal Finder</title>
-    <meta name="description"
-        content="Jack's Pokemon Packs — AI-powered agent that finds underpriced Pokemon cards across eBay, Mercari, OfferUp, and Facebook Marketplace.">
+    <title>Jack's Pokémon Packs | AI Auto-Lister</title>
+    <meta name="description" content="AI agent that identifies, valuate, and autobuys deals.">
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link
-        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;500;700&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap"
+        href="https://fonts.googleapis.com/css2?family=Clash+Display:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
         rel="stylesheet">
+
     <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
+    <div class="background-ambient">
+        <div class="glow-orb orb-1"></div>
+        <div class="glow-orb orb-2"></div>
+        <div class="glow-orb orb-3"></div>
+    </div>
+
     <!-- Navigation -->
-    <nav class="nav" id="nav">
-        <div class="nav-left">
+    <nav class="nav">
+        <div class="nav-brand">
             <span class="nav-logo-icon">⚡</span>
-            <span class="nav-logo-text">Jack's Pokemon Packs</span>
-        </div>
-        <div class="nav-links">
-            <a href="#hero" class="nav-link active">Home</a>
-            <a href="#scanner" class="nav-link">Live Scanner</a>
-            <a href="#deals" class="nav-link">Deals</a>
+            <span class="nav-logo-text">Jack's Auto-Lister</span>
         </div>
         <div class="nav-status">
-            <span class="nav-pulse"></span>
-            <span id="navStatusText">Starting...</span>
+            <span class="status-indicator"></span>
+            <span id="systemStatus">System Idle</span>
         </div>
     </nav>
 
-    <!-- ═══════════ SECTION 1: UPLOAD & AUTO-LIST ═══════════ -->
-    <section class="hero" id="hero">
-        <div class="background-glow"></div>
-        <div class="particles" id="particles"></div>
+    <main class="container">
+        <!-- VIEW 1: UPLOAD PORTAL -->
+        <section id="view-portal" class="view active">
+            <div class="portal-header">
+                <h1 class="hero-title">Automate Your <span class="gradient-text">Pokemon Sales</span></h1>
+                <p class="hero-subtitle">Upload your collection. Our AI will appraise your cards against live market
+                    prices and identify the top 100.</p>
+            </div>
 
-        <div class="hero-content" style="max-width: 800px;">
-            <header class="hero-header">
-                <h1 class="logo">
-                    <span class="logo-icon">⚡</span>
-                    Jack's Auto-Lister
-                </h1>
-                <p class="hero-subtitle">Upload cards, let AI price them, and auto-list to eBay</p>
-            </header>
+            <div class="glass-panel form-container">
+                <form id="autoListForm">
+                    <div class="upload-area" id="dropZone">
+                        <input type="file" id="cardPhotos" name="photos" accept="image/*" multiple required
+                            class="file-input-hidden">
+                        <div class="upload-content">
+                            <div class="upload-icon">📸</div>
+                            <h3>Drag & Drop Card Photos</h3>
+                            <p>or click to browse from your device</p>
+                            <span class="upload-hint">Upload high-res photos. The AI can detect multiple cards per
+                                image.</span>
+                        </div>
+                        <div id="filePreviews" class="file-previews"></div>
+                    </div>
 
-            <div class="upload-portal">
-                <form id="autoListForm" class="auto-list-form">
-                    <div class="form-group">
-                        <label for="ebayUsername">eBay Username</label>
-                        <input type="text" id="ebayUsername" placeholder="e.g., pokemaster99" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="ebayPassword">eBay Password</label>
-                        <input type="password" id="ebayPassword" placeholder="••••••••" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="cardPhotos">Upload Card Photos</label>
-                        <input type="file" id="cardPhotos" accept="image/*" multiple required>
-                        <p class="help-text">You can upload multiple photos. The AI will find all cards in every photo.
-                        </p>
-                    </div>
-                    <button type="submit" class="hero-cta" id="btnSubmitAutoList"
-                        style="width: 100%; justify-content: center; margin-top: 20px;">
-                        <span class="cta-icon">🚀</span>
-                        Analyze & Auto-List on eBay
+                    <button type="submit" class="btn-primary btn-submit" id="btnStartPipeline">
+                        <span class="btn-text">Initiate Apprasial Scan</span>
+                        <span class="btn-icon">✨</span>
                     </button>
                 </form>
             </div>
-        </div>
-    </section>
+        </section>
 
-    <!-- ═══════════ SECTION 2: LIVE ACTIVITY ═══════════ -->
-    <section class="scanner-section" id="scanner">
-        <!-- Live Activity Panel -->
-        <div class="activity-panel">
-            <div class="activity-header">
-                <h2>🔍 Auto-Lister Progress</h2>
-                <div class="live-badge" id="liveBadge" style="display: none;">
-                    <span class="live-dot"></span>
-                    ACTIVE
+        <!-- VIEW 2: PROCESSING PIPELINE -->
+        <section id="view-processing" class="view">
+            <div class="processing-layout">
+                <div class="pipeline-tracker glass-panel">
+                    <h2>Operation Status</h2>
+                    <ul class="pipeline-steps">
+                        <li class="step active" id="step-upload">
+                            <div class="step-icon">📤</div>
+                            <div class="step-info">
+                                <h4>Uploading Assets</h4>
+                                <p>Transferring images to secure server</p>
+                            </div>
+                        </li>
+                        <li class="step" id="step-vision">
+                            <div class="step-icon">👁️</div>
+                            <div class="step-info">
+                                <h4>Vision AI Analysis</h4>
+                                <p>Detecting and identifying individual cards</p>
+                            </div>
+                        </li>
+                        <li class="step" id="step-valuation">
+                            <div class="step-icon">💎</div>
+                            <div class="step-info">
+                                <h4>Market Valuation</h4>
+                                <p>Cross-referencing global marketplaces</p>
+                            </div>
+                        </li>
+                        <li class="step" id="step-listing">
+                            <div class="step-icon">🛒</div>
+                            <div class="step-info">
+                                <h4>eBay Automation</h4>
+                                <p>Drafting and publishing listings via Agent</p>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+
+                <div class="terminal-container glass-panel">
+                    <div class="terminal-header">
+                        <div class="terminal-dots">
+                            <span></span><span></span><span></span>
+                        </div>
+                        <div class="terminal-title">agent_activity_log.sh</div>
+                    </div>
+                    <div class="terminal-body" id="activityLog">
+                        <!-- Logs inject here -->
+                        <div class="log-line text-muted">Awaiting pipeline initialization...</div>
+                    </div>
                 </div>
             </div>
 
-            <!-- Current AI Analysis (featured) -->
-            <div class="ai-current" id="aiCurrent" style="display:none;">
-                <!-- Re-used structure but we can just use the activity log for now to keep it simple -->
-            </div>
-
-            <!-- Activity Log -->
-            <div class="activity-log" id="activityLog">
-                <div class="log-entry log-placeholder">
-                    <span class="log-icon">⏳</span>
-                    <span class="log-text">Waiting for photos to be uploaded...</span>
+            <!-- Current AI Focus Visualization -->
+            <div class="ai-focus glass-panel" id="aiFocus" style="display: none;">
+                <div class="focus-grid">
+                    <div class="focus-image-container">
+                        <div class="scanner-sweep"></div>
+                        <img id="focusImage" src="" alt="AI Analysis Target">
+                    </div>
+                    <div class="focus-details">
+                        <h3 class="focus-label">Live Identification</h3>
+                        <div class="focus-title" id="focusTitle">Scanning...</div>
+                        <div class="focus-stats">
+                            <div class="stat-box">
+                                <span class="stat-label">AI Estimate</span>
+                                <span class="stat-value" id="focusEstimate">--</span>
+                            </div>
+                            <div class="stat-box">
+                                <span class="stat-label">Deal Tier</span>
+                                <span class="stat-value" id="focusTier">--</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </div>
-    </section>
+        </section>
 
-    <!-- ═══════════ SECTION 3: TOP 100 CARDS LISTED ═══════════ -->
-    <section class="deals-section" id="deals">
-        <div class="deals-header">
-            <h2>🎯 Top Cards Listed on eBay</h2>
+        <!-- VIEW 3: REVIEW & AUTHENTICATE -->
+        <section id="view-review" class="view dashboard-section">
+            <div class="glass-panel cta-panel">
+                <div class="cta-content">
+                    <h2>Are you ready to list these cards on eBay?</h2>
+                    <p>Sign in with eBay and we'll automatically create a Pokémon store listing for all these cards at
+                        their highest market value.</p>
+                </div>
 
-            <div class="feed-tabs">
-                <button class="feed-tab active" data-feed="deals" id="tabDeals">🔥 Deals Only</button>
-                <button class="feed-tab" data-feed="all" id="tabAll">👀 All Finds</button>
-                <button class="feed-tab" data-feed="first-edition" id="tabFirstEdition">1️⃣ 1st Edition</button>
-                <button class="feed-tab" data-feed="tracker-151" id="tab151">📖 151 Tracker</button>
+                <form id="ebayAuthForm" class="auth-form">
+                    <div class="input-group">
+                        <input type="text" id="ebayUsername" name="username" placeholder="eBay Username or Email"
+                            required>
+                    </div>
+                    <div class="input-group">
+                        <input type="password" id="ebayPassword" name="password" placeholder="eBay Password" required>
+                    </div>
+                    <button type="submit" class="btn-primary btn-action" id="btnAuthEbay">
+                        <span class="btn-text">Create eBay Listings</span>
+                        <span class="btn-icon">🚀</span>
+                    </button>
+                </form>
             </div>
 
-            <div class="deal-filters" id="tierFilters">
-                <button class="filter-btn active" data-filter="all">All Tiers</button>
-                <button class="filter-btn" data-filter="incredible">🔥 Incredible</button>
-                <button class="filter-btn" data-filter="great">💎 Great</button>
-                <button class="filter-btn" data-filter="good">👍 Good</button>
+            <div class="dashboard-header">
+                <h2>Top Appraised Cards</h2>
+                <div class="listing-counter"><span id="listedCount">0</span> Selected</div>
             </div>
-        </div>
 
-        <div class="deal-grid" id="dealGrid">
-            <div class="empty-state" id="emptyState">
-                <div class="empty-icon">🔍</div>
-                <h3>Scanning marketplaces...</h3>
-                <p>Deals will appear here as the AI discovers underpriced Pokemon cards across eBay, Mercari, OfferUp,
-                    and Facebook Marketplace.</p>
+            <div class="card-grid" id="listedGrid">
+                <!-- Cards injected here -->
             </div>
-        </div>
-    </section>
+        </section>
 
-    <!-- Toast -->
-    <div class="toast-container" id="toastContainer"></div>
+    </main>
 
+    <div id="toastContainer" class="toast-container"></div>
     <script src="script.js"></script>
 </body>
 

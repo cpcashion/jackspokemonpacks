@@ -13,41 +13,17 @@ import 'dotenv/config';
 import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { mkdirSync } from 'fs';
+import { mkdirSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
-import puppeteer from 'puppeteer';
 import multer from 'multer';
 import sharp from 'sharp';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-
-// ═══════════════════════════════════════════════════════════════
-//  SHARED PUPPETEER BROWSER
-// ═══════════════════════════════════════════════════════════════
-
-let browser = null;
-async function getBrowser() {
-    if (browser && browser.isConnected()) return browser;
-    console.log('  [Puppeteer] Launching headless Chrome...');
-    browser = await puppeteer.launch({
-        headless: 'new',
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--window-size=1920,1080',
-        ],
-    });
-    console.log('  [Puppeteer] Browser launched successfully.');
-    return browser;
-}
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -356,8 +332,11 @@ async function analyzeImageBuffer(buffer, mimeType) {
 
 const priceCache = new Map();
 
+const uploadDir = join(tmpdir(), 'pokemon-uploads');
+mkdirSync(uploadDir, { recursive: true });
+
 const upload = multer({
-    storage: multer.memoryStorage(),
+    dest: uploadDir,
     limits: {
         fileSize: 100 * 1024 * 1024, // 100MB per file
         files: 50                     // up to 50 files at once
@@ -681,31 +660,40 @@ app.post('/api/portfolio/upload', (req, res) => {
 async function processPortfolioUpload(files) {
     let totalAdded = 0;
 
-    broadcastActivity('analyzing', `Scanning ${files.length} photos with AI (parallel)...`);
+    broadcastActivity('analyzing', `Scanning ${files.length} photos with AI (processing sequentially to save memory)...`);
 
-    // 1. Analyze ALL images in parallel with Gemini — this is the big speedup
-    const analysisResults = await Promise.all(
-        files.map(async (file, index) => {
+    // 1. Analyze images sequentially to prevent Out-Of-Memory limits on Render
+    const analysisResults = [];
+    for (let index = 0; index < files.length; index++) {
+        const file = files[index];
+        broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
+        
+        try {
+            const buffer = readFileSync(file.path);
+            const analysis = await analyzeImageBuffer(buffer, file.mimetype);
+            
+            // Always create a JPEG thumbnail using sharp
+            let thumbDataUrl = '';
             try {
-                const analysis = await analyzeImageBuffer(file.buffer, file.mimetype);
-                // Always create a JPEG thumbnail using sharp
-                let thumbDataUrl = '';
-                try {
-                    const thumbBuffer = await sharp(file.buffer)
-                        .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
-                        .jpeg({ quality: 80 })
-                        .toBuffer();
-                    thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
-                } catch (thumbErr) {
-                    console.error(`  [Thumb] Failed for photo ${index + 1}:`, thumbErr.message);
-                }
-                return { index, file, analysis, thumbDataUrl };
-            } catch (err) {
-                console.error(`Photo ${index + 1} AI error:`, err.message);
-                return { index, file, analysis: null, thumbDataUrl: '' };
+                const thumbBuffer = await sharp(buffer)
+                    .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
+                    .jpeg({ quality: 80 })
+                    .toBuffer();
+                thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
+            } catch (thumbErr) {
+                console.error(`  [Thumb] Failed for photo ${index + 1}:`, thumbErr.message);
             }
-        })
-    );
+            
+            // Immediately delete the file off disk to free resources
+            try { rmSync(file.path, { force: true }); } catch { }
+            
+            analysisResults.push({ index, file, analysis, thumbDataUrl });
+        } catch (err) {
+            console.error(`Photo ${index + 1} AI error:`, err.message);
+            try { rmSync(file.path, { force: true }); } catch { }
+            analysisResults.push({ index, file, analysis: null, thumbDataUrl: '' });
+        }
+    }
 
     // 2. Insert all identified cards and look up TCGdex images
     const cardIds = [];

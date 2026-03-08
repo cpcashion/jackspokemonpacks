@@ -1,778 +1,732 @@
-/**
- * Jack's Pokemon Portfolio — Frontend
- * Portfolio rendering, sparklines, upload modal, card detail drawer.
- */
+/* ═══════════════════════════════════════════════════════════════
+   Jack's Pokémon Portfolio — Main Client Script
+   ═══════════════════════════════════════════════════════════════ */
 
-// ═══════════════════════════════════════════════════
-//  STATE
-// ═══════════════════════════════════════════════════
+'use strict';
 
-const STATE = {
-    cards: [],
-    stats: { totalCards: 0, totalValue: 0, prevValue: 0 },
-    sortField: 'price',
-    sortDir: 'desc',
-    files: [],
-    eventSource: null,
-    uploadInProgress: false,
-    viewMode: 'grid',  // 'table' or 'grid'
-};
+// ── STATE ────────────────────────────────────────────────────────
+let portfolio = [];          // array of card objects from API
+let currentSort = { key: 'price', dir: 'desc' };
+let currentView = 'table';   // 'table' | 'grid'
+let searchQuery = '';
+let activeDrawerCard = null;
+let chartInstance = null;
+let priceChartDays = 7;
+let toastTimeout = null;
 
-// ═══════════════════════════════════════════════════
-//  DOM
-// ═══════════════════════════════════════════════════
+// ── DOM REFS ─────────────────────────────────────────────────────
+const topbarTotal       = document.getElementById('portfolioTotal');
+const topbarChange      = document.getElementById('portfolioChange');
+const statTotalCards    = document.getElementById('statTotalCards');
+const statPortfolioVal  = document.getElementById('statPortfolioValue');
+const stat24h           = document.getElementById('stat24hChange');
+const statGainer        = document.getElementById('statBiggestGainer');
+const statLoser         = document.getElementById('statBiggestLoser');
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+const emptyState        = document.getElementById('emptyState');
+const tableView         = document.getElementById('tableView');
+const gridView          = document.getElementById('gridView');
+const tableBody         = document.getElementById('portfolioTableBody');
+const lastUpdatedEl     = document.getElementById('lastUpdated');
 
-const DOM = {
-    // Stats
-    statTotalValue: $('#statTotalValue'),
-    statTotalChange: $('#statTotalChange'),
-    statTotalCards: $('#statTotalCards'),
-    statGainer: $('#statGainer'),
-    statGainerChange: $('#statGainerChange'),
-    statLoser: $('#statLoser'),
-    statLoserChange: $('#statLoserChange'),
+const openUploadBtn     = document.getElementById('openUploadBtn');
+const emptyUploadBtn    = document.getElementById('emptyUploadBtn');
+const uploadModal       = document.getElementById('uploadModal');
+const closeUploadBtn    = document.getElementById('closeUploadBtn');
+const dropZone          = document.getElementById('dropZone');
+const fileInput         = document.getElementById('fileInput');
+const uploadQueue       = document.getElementById('uploadQueue');
+const queueTitle        = document.getElementById('queueTitle');
+const queueStatus       = document.getElementById('queueStatus');
+const queueItems        = document.getElementById('queueItems');
 
-    // Views
-    viewControls: $('#viewControls'),
-    emptyState: $('#emptyState'),
-    tableWrapper: $('#tableWrapper'),
-    gridWrapper: $('#gridWrapper'),
-    cardGrid: $('#cardGrid'),
-    portfolioBody: $('#portfolioBody'),
+const drawerOverlay     = document.getElementById('drawerOverlay');
+const closeDrawerBtn    = document.getElementById('closeDrawerBtn');
+const drawerCardName    = document.getElementById('drawerCardName');
+const drawerCardMeta    = document.getElementById('drawerCardMeta');
+const drawerCurrentPx   = document.getElementById('drawerCurrentPrice');
+const drawerChange      = document.getElementById('drawerChange');
+const drawerCardImg     = document.getElementById('drawerCardImg');
+const deleteCardBtn     = document.getElementById('deleteCardBtn');
 
-    // Upload Modal
-    uploadModal: $('#uploadModal'),
-    dropZone: $('#dropZone'),
-    fileInput: $('#fileInput'),
-    filePreviews: $('#filePreviews'),
-    uploadContent: $('#uploadContent'),
-    btnUploadSubmit: $('#btnUploadSubmit'),
-    uploadStatus: $('#uploadStatus'),
+const tableViewBtn      = document.getElementById('tableViewBtn');
+const gridViewBtn       = document.getElementById('gridViewBtn');
+const searchInput       = document.getElementById('searchInput');
+const refreshBtn        = document.getElementById('refreshPricesBtn');
 
-    // Drawer
-    drawerOverlay: $('#drawerOverlay'),
-    cardDrawer: $('#cardDrawer'),
-    drawerCardName: $('#drawerCardName'),
-    drawerMeta: $('#drawerMeta'),
-    priceChart: $('#priceChart'),
-    drawerPriceList: $('#drawerPriceList'),
-
-    // Toast
-    statusToast: $('#statusToast'),
-};
-
-// ═══════════════════════════════════════════════════
-//  INIT
-// ═══════════════════════════════════════════════════
-
-document.addEventListener('DOMContentLoaded', () => {
-    initEventListeners();
-    connectSSE();
-    fetchPortfolio();
-});
-
-function initEventListeners() {
-    // Open upload modal
-    $('#btnOpenUpload').addEventListener('click', openUploadModal);
-    $('#btnEmptyUpload')?.addEventListener('click', openUploadModal);
-
-    // Close modals
-    $('#btnCloseModal').addEventListener('click', closeUploadModal);
-    DOM.uploadModal.addEventListener('click', (e) => {
-        if (e.target === DOM.uploadModal) closeUploadModal();
-    });
-
-    // Close drawer
-    $('#btnCloseDrawer').addEventListener('click', closeDrawer);
-    DOM.drawerOverlay.addEventListener('click', (e) => {
-        if (e.target === DOM.drawerOverlay) closeDrawer();
-    });
-
-    // File upload
-    DOM.dropZone.addEventListener('dragover', (e) => { e.preventDefault(); DOM.dropZone.classList.add('drag-over'); });
-    DOM.dropZone.addEventListener('dragleave', () => DOM.dropZone.classList.remove('drag-over'));
-    DOM.dropZone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        DOM.dropZone.classList.remove('drag-over');
-        handleFiles(e.dataTransfer.files);
-    });
-    DOM.fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
-
-    // Upload submit
-    DOM.btnUploadSubmit.addEventListener('click', submitUpload);
-
-    // Refresh prices
-    $('#btnRefreshPrices').addEventListener('click', refreshPrices);
-
-    // View toggle
-    $('#btnTableView').addEventListener('click', () => setViewMode('table'));
-    $('#btnGridView').addEventListener('click', () => setViewMode('grid'));
-
-    // Sort headers
-    $$('.sortable').forEach(th => {
-        th.addEventListener('click', () => {
-            const field = th.dataset.sort;
-            if (STATE.sortField === field) {
-                STATE.sortDir = STATE.sortDir === 'desc' ? 'asc' : 'desc';
-            } else {
-                STATE.sortField = field;
-                STATE.sortDir = 'desc';
-            }
-            renderPortfolio();
-        });
-    });
-
-    // Keyboard
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-            closeUploadModal();
-            closeDrawer();
-        }
-    });
+// ── HELPERS ──────────────────────────────────────────────────────
+function fmt(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function setViewMode(mode) {
-    STATE.viewMode = mode;
-    $('#btnTableView').classList.toggle('active', mode === 'table');
-    $('#btnGridView').classList.toggle('active', mode === 'grid');
-    renderPortfolio();
+function fmtChange(current, previous) {
+  if (!current || !previous || previous === 0) return null;
+  const pct = ((current - previous) / previous) * 100;
+  return pct;
 }
 
-// ═══════════════════════════════════════════════════
-//  DATA FETCHING
-// ═══════════════════════════════════════════════════
-
-async function fetchPortfolio() {
-    try {
-        const resp = await fetch('/api/portfolio');
-        const data = await resp.json();
-        STATE.cards = data.cards || [];
-        STATE.stats = data.stats || { totalCards: 0, totalValue: 0, prevValue: 0 };
-        renderStats();
-        renderPortfolio();
-    } catch (err) {
-        console.error('Failed to fetch portfolio:', err);
-    }
+function changeBadge(pct, includePrice, deltaPrice) {
+  if (pct === null || pct === undefined) return `<span class="badge-neutral">—</span>`;
+  const dir = pct >= 0 ? 'positive' : 'negative';
+  const arrow = pct >= 0 ? '↑' : '↓';
+  const formatted = `${arrow} ${Math.abs(pct).toFixed(1)}%`;
+  if (includePrice && deltaPrice !== undefined) {
+    const sign = deltaPrice >= 0 ? '+' : '-';
+    return `<span class="badge-${dir}">${formatted} (${sign}${fmt(Math.abs(deltaPrice)).slice(1)})</span>`;
+  }
+  return `<span class="badge-${dir}">${formatted}</span>`;
 }
 
-// ═══════════════════════════════════════════════════
-//  SSE
-// ═══════════════════════════════════════════════════
-
-function connectSSE() {
-    if (STATE.eventSource) STATE.eventSource.close();
-    STATE.eventSource = new EventSource('/api/events');
-
-    STATE.eventSource.onmessage = (e) => {
-        try {
-            const data = JSON.parse(e.data);
-            if (data.type === 'portfolio_updated') {
-                fetchPortfolio();
-                // If an upload is in progress, close modal and show success
-                if (STATE.uploadInProgress) {
-                    STATE.uploadInProgress = false;
-                    closeUploadModal();
-                    resetUploadButton();
-                    showToast('Cards added to your portfolio!');
-                }
-            } else if (data.type === 'activity') {
-                showToast(data.message);
-                // Update modal status text if upload is in progress
-                if (STATE.uploadInProgress && data.message) {
-                    DOM.uploadStatus.textContent = data.message;
-                    if (data.activityType === 'error') {
-                        STATE.uploadInProgress = false;
-                        resetUploadButton();
-                        setTimeout(closeUploadModal, 4000);
-                    }
-                }
-            }
-        } catch (err) { console.error('SSE parse error:', err); }
-    };
-
-    STATE.eventSource.onerror = () => {
-        setTimeout(connectSSE, 5000);
-    };
+function rarityClass(rarity) {
+  if (!rarity) return '';
+  const r = rarity.toLowerCase();
+  if (r.includes('secret')) return 'rarity-secret';
+  if (r.includes('ultra') || r.includes('v max') || r.includes('alt art')) return 'rarity-ultra';
+  if (r.includes('illustration')) return 'rarity-ultra';
+  if (r.includes('holo')) return 'rarity-holo';
+  if (r.includes('rare')) return 'rarity-rare';
+  if (r.includes('uncommon')) return 'rarity-uncommon';
+  return 'rarity-common';
 }
 
-// ═══════════════════════════════════════════════════
-//  RENDERING: STATS
-// ═══════════════════════════════════════════════════
-
-function renderStats() {
-    const { totalCards, totalValue, prevValue } = STATE.stats;
-
-    DOM.statTotalValue.textContent = formatCurrency(totalValue);
-    DOM.statTotalCards.textContent = totalCards;
-
-    // Total change
-    if (prevValue > 0) {
-        const change = totalValue - prevValue;
-        const pctChange = (change / prevValue) * 100;
-        DOM.statTotalChange.textContent = `${change >= 0 ? '+' : ''}${formatCurrency(change)} (${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(1)}%)`;
-        DOM.statTotalChange.className = `stat-change ${change >= 0 ? 'positive' : 'negative'}`;
-    } else {
-        DOM.statTotalChange.textContent = '';
-    }
-
-    // Biggest gainer / loser
-    let biggestGainer = null, biggestLoser = null;
-    let maxGain = -Infinity, maxLoss = Infinity;
-
-    for (const card of STATE.cards) {
-        if (card.current_price && card.previous_price && card.previous_price > 0) {
-            const change = ((card.current_price - card.previous_price) / card.previous_price) * 100;
-            if (change > maxGain) { maxGain = change; biggestGainer = card; }
-            if (change < maxLoss) { maxLoss = change; biggestLoser = card; }
-        }
-    }
-
-    if (biggestGainer && maxGain > 0) {
-        DOM.statGainer.textContent = truncate(biggestGainer.card_name, 16);
-        DOM.statGainerChange.textContent = `+${maxGain.toFixed(1)}%`;
-        DOM.statGainerChange.className = 'stat-change positive';
-    } else {
-        DOM.statGainer.textContent = '—';
-        DOM.statGainerChange.textContent = '';
-    }
-
-    if (biggestLoser && maxLoss < 0) {
-        DOM.statLoser.textContent = truncate(biggestLoser.card_name, 16);
-        DOM.statLoserChange.textContent = `${maxLoss.toFixed(1)}%`;
-        DOM.statLoserChange.className = 'stat-change negative';
-    } else {
-        DOM.statLoser.textContent = '—';
-        DOM.statLoserChange.textContent = '';
-    }
+function showToast(msg, type = 'info', duration = 4000) {
+  const container = document.querySelector('.toast-container') || (() => {
+    const c = document.createElement('div');
+    c.className = 'toast-container';
+    document.body.appendChild(c);
+    return c;
+  })();
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+  t.innerHTML = `<span>${icons[type] || ''}</span><span>${msg}</span>`;
+  container.appendChild(t);
+  setTimeout(() => t.remove(), duration);
 }
 
-// ═══════════════════════════════════════════════════
-//  RENDERING: PORTFOLIO (table + grid)
-// ═══════════════════════════════════════════════════
-
-function renderPortfolio() {
-    const cards = getSortedCards();
-
-    // Show/hide empty state
-    if (cards.length === 0) {
-        DOM.emptyState.style.display = 'flex';
-        DOM.tableWrapper.style.display = 'none';
-        DOM.gridWrapper.style.display = 'none';
-        DOM.viewControls.style.display = 'none';
-        return;
-    }
-
-    DOM.emptyState.style.display = 'none';
-    DOM.viewControls.style.display = 'flex';
-
-    if (STATE.viewMode === 'grid') {
-        DOM.tableWrapper.style.display = 'none';
-        DOM.gridWrapper.style.display = 'block';
-        renderGrid(cards);
-    } else {
-        DOM.tableWrapper.style.display = 'block';
-        DOM.gridWrapper.style.display = 'none';
-        renderTable(cards);
-    }
+// ── SPARKLINE SVG ─────────────────────────────────────────────────
+function renderSparkline(priceHistory, positive) {
+  const prices = (priceHistory || []).slice(-14).map(p => Number(p.price || 0));
+  if (prices.length < 2) {
+    return `<svg class="sparkline" width="80" height="28" viewBox="0 0 80 28">
+      <line x1="0" y1="14" x2="80" y2="14" stroke="#e5e7eb" stroke-width="1.5" stroke-dasharray="4 3"/>
+    </svg>`;
+  }
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const W = 80, H = 28, PAD = 3;
+  const pts = prices.map((p, i) => {
+    const x = PAD + (i / (prices.length - 1)) * (W - PAD * 2);
+    const y = PAD + ((1 - (p - min) / range) * (H - PAD * 2));
+    return `${x},${y}`;
+  });
+  const color = positive ? '#16a34a' : '#dc2626';
+  const last = prices[prices.length - 1];
+  const first = prices[0];
+  const isPos = last >= first;
+  const lineColor = isPos ? '#16a34a' : '#dc2626';
+  return `<svg class="sparkline" width="80" height="28" viewBox="0 0 80 28">
+    <polyline points="${pts.join(' ')}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
 }
 
-function getSortedCards() {
-    const cards = [...STATE.cards];
-    cards.sort((a, b) => {
-        let valA, valB;
-        if (STATE.sortField === 'name') {
-            valA = (a.card_name || '').toLowerCase();
-            valB = (b.card_name || '').toLowerCase();
-            return STATE.sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
-        } else if (STATE.sortField === 'price') {
-            valA = a.current_price || 0;
-            valB = b.current_price || 0;
-        } else if (STATE.sortField === 'change') {
-            valA = getChangePct(a);
-            valB = getChangePct(b);
-        }
-        return STATE.sortDir === 'asc' ? valA - valB : valB - valA;
-    });
-    return cards;
-}
+// ── PORTFOLIO RENDERING ───────────────────────────────────────────
+function getFilteredSorted() {
+  let cards = portfolio.filter(c => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      (c.card_name || '').toLowerCase().includes(q) ||
+      (c.card_set || '').toLowerCase().includes(q) ||
+      (c.rarity || '').toLowerCase().includes(q)
+    );
+  });
 
-function getCardImageHtml(card, size = 'thumb') {
-    const imgUrl = card.image_url || card.image_data;
-    if (imgUrl) {
-        const cls = size === 'large' ? 'card-image-large' : 'card-thumb';
-        return `<img class="${cls}" src="${escapeAttr(imgUrl)}" alt="${esc(card.card_name)}" loading="lazy">`;
+  cards.sort((a, b) => {
+    let av, bv;
+    if (currentSort.key === 'name') {
+      av = (a.card_name || '').toLowerCase();
+      bv = (b.card_name || '').toLowerCase();
+      return currentSort.dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
     }
-    return `<div class="card-thumb-placeholder">🃏</div>`;
-}
-
-function getSourceBadge(source) {
-    if (!source) return '';
-    const labels = {
-        'ebay': 'eBay',
-        'tcgplayer': 'TCGPlayer',
-        'ai_estimate': 'AI Est.',
-        'initial': 'Initial',
-        'known_value': 'Known',
-        'market': 'Market',
-    };
-    const verified = ['ebay', 'tcgplayer', 'known_value', 'market'];
-    const label = labels[source] || source;
-    const cls = verified.includes(source) ? 'source-verified' : 'source-estimate';
-    return `<span class="source-badge ${cls}">${label}</span>`;
+    if (currentSort.key === 'price') {
+      av = a.current_price || 0;
+      bv = b.current_price || 0;
+    }
+    if (currentSort.key === 'change') {
+      av = fmtChange(a.current_price, a.previous_price) || 0;
+      bv = fmtChange(b.current_price, b.previous_price) || 0;
+    }
+    return currentSort.dir === 'asc' ? av - bv : bv - av;
+  });
+  return cards;
 }
 
 function renderTable(cards) {
-    // Update sort indicators
-    $$('.sortable').forEach(th => {
-        th.classList.remove('sorted-asc', 'sorted-desc');
-        if (th.dataset.sort === STATE.sortField) {
-            th.classList.add(STATE.sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
-        }
-    });
+  tableBody.innerHTML = '';
+  cards.forEach(card => {
+    const pct = fmtChange(card.current_price, card.previous_price);
+    const delta = card.current_price && card.previous_price ? card.current_price - card.previous_price : null;
+    const prices = card.price_history || [];
+    const isPos = pct !== null && pct >= 0;
 
-    // Render rows
-    DOM.portfolioBody.innerHTML = cards.map(card => {
-        const price = card.current_price || 0;
-        const changePct = getChangePct(card);
-        const changeDir = changePct > 0 ? 'positive' : changePct < 0 ? 'negative' : 'neutral';
-        const changeArrow = changePct > 0 ? '↑' : changePct < 0 ? '↓' : '';
-        const changeText = changePct !== 0 ? `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%` : '—';
+    const imgSrc = card.image_url || card.image_data || '';
+    const thumbHtml = imgSrc
+      ? `<img class="card-thumb" src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
+      : `<div class="card-thumb-placeholder">🃏</div>`;
 
-        return `
-            <tr data-id="${card.id}" onclick="openCardDrawer(${card.id})">
-                <td class="cell-card" data-label="">
-                    <div class="card-cell">
-                        ${getCardImageHtml(card)}
-                        <div>
-                            <div class="card-name">${esc(card.card_name)}</div>
-                            ${card.card_number ? `<div class="card-number">${esc(card.card_number)}</div>` : ''}
-                        </div>
-                    </div>
-                </td>
-                <td data-label="Set"><span class="rarity-badge">${esc(card.card_set || '—')}</span></td>
-                <td data-label="Rarity"><span class="rarity-badge">${esc(card.rarity || '—')}</span></td>
-                <td data-label="Condition"><span class="condition-badge">${esc(card.condition || '—')}</span></td>
-                <td class="price-cell" data-label="Price">
-                    ${formatCurrency(price)}
-                    ${getSourceBadge(card.price_source)}
-                </td>
-                <td data-label="Change">
-                    <span class="change-cell ${changeDir}">
-                        <span class="change-arrow">${changeArrow}</span>
-                        ${changeText}
-                    </span>
-                </td>
-                <td class="sparkline-cell" data-label="Trend" id="spark-${card.id}"></td>
-                <td class="col-actions" data-label="">
-                    <button class="btn-delete" onclick="event.stopPropagation(); deleteCard(${card.id})" title="Remove">✕</button>
-                </td>
-            </tr>
-        `;
-    }).join('');
+    const sourceLabel = card.price_source || 'market';
 
-    // Load sparklines asynchronously
-    cards.forEach(card => loadSparkline(card.id));
+    const tr = document.createElement('tr');
+    tr.dataset.id = card.id;
+    tr.innerHTML = `
+      <td class="col-thumb">${thumbHtml}</td>
+      <td class="col-name">
+        <div class="card-name-cell">
+          <div class="card-name">${card.card_name || 'Unknown'}</div>
+          <div class="card-badges">
+            ${card.is_holo ? '<span class="badge-holo">Holo</span>' : ''}
+            ${card.is_first_edition ? '<span class="badge-first">1st Ed</span>' : ''}
+          </div>
+        </div>
+      </td>
+      <td class="col-set">${card.card_set || '—'}</td>
+      <td class="col-rarity"><span class="${rarityClass(card.rarity)}">${card.rarity || '—'}</span></td>
+      <td class="col-condition">${card.condition || '—'}</td>
+      <td class="col-price">${fmt(card.current_price)}</td>
+      <td class="col-change">${changeBadge(pct, false)}</td>
+      <td class="col-sparkline">${renderSparkline(prices, isPos)}</td>
+      <td class="col-source"><span class="source-badge">${sourceLabel}</span></td>
+      <td class="col-actions">
+        <button class="delete-row-btn" data-id="${card.id}" title="Remove card" onclick="event.stopPropagation();confirmDelete(${card.id})">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+        </button>
+      </td>`;
+    tr.addEventListener('click', () => openDrawer(card));
+    tableBody.appendChild(tr);
+  });
 }
 
 function renderGrid(cards) {
-    DOM.cardGrid.innerHTML = cards.map(card => {
-        const price = card.current_price || 0;
-        const changePct = getChangePct(card);
-        const changeDir = changePct > 0 ? 'positive' : changePct < 0 ? 'negative' : 'neutral';
-        const changeArrow = changePct > 0 ? '↑' : changePct < 0 ? '↓' : '';
-        const changeText = changePct !== 0 ? `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%` : '';
-
-        const imgUrl = card.image_url || card.image_data;
-        const imgHtml = imgUrl
-            ? `<img class="grid-card-image" src="${escapeAttr(imgUrl)}" alt="${esc(card.card_name)}" loading="lazy">`
-            : `<div class="grid-card-placeholder">🃏</div>`;
-
-        return `
-            <div class="grid-card" onclick="openCardDrawer(${card.id})">
-                <div class="grid-card-img-wrapper">
-                    ${imgHtml}
-                    <button class="grid-card-delete" onclick="event.stopPropagation(); deleteCard(${card.id})" title="Remove">✕</button>
-                </div>
-                <div class="grid-card-info">
-                    <div class="grid-card-name">${esc(card.card_name)}</div>
-                    <div class="grid-card-set">${esc(card.card_set || '')}</div>
-                    <div class="grid-card-price-row">
-                        <span class="grid-card-price">${formatCurrency(price)}</span>
-                        ${changeText ? `<span class="grid-card-change ${changeDir}">${changeArrow} ${changeText}</span>` : ''}
-                    </div>
-                    <div class="grid-card-source">${getSourceBadge(card.price_source)}</div>
-                </div>
-            </div>
-        `;
-    }).join('');
+  gridView.innerHTML = '';
+  cards.forEach(card => {
+    const pct = fmtChange(card.current_price, card.previous_price);
+    const imgSrc = card.image_url || card.image_data || '';
+    const div = document.createElement('div');
+    div.className = 'grid-card';
+    div.innerHTML = `
+      ${imgSrc
+        ? `<div class="grid-card-img"><img src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'grid-card-placeholder\\'>🃏</div>'"></div>`
+        : `<div class="grid-card-placeholder">🃏</div>`}
+      <div class="grid-card-body">
+        <div class="grid-card-name">${card.card_name || 'Unknown'}</div>
+        <div class="grid-card-set">${card.card_set || '—'}</div>
+        <div class="grid-card-price-row">
+          <span class="grid-card-price">${fmt(card.current_price)}</span>
+          ${changeBadge(pct, false)}
+        </div>
+      </div>`;
+    div.addEventListener('click', () => openDrawer(card));
+    gridView.appendChild(div);
+  });
 }
 
-// ═══════════════════════════════════════════════════
-//  SPARKLINES (inline SVG)
-// ═══════════════════════════════════════════════════
+function renderPortfolio() {
+  const cards = getFilteredSorted();
+  const hasCards = portfolio.length > 0;
 
-async function loadSparkline(cardId) {
-    const container = document.getElementById(`spark-${cardId}`);
-    if (!container) return;
+  emptyState.style.display = hasCards || searchQuery ? 'none' : 'block';
 
-    try {
-        const resp = await fetch(`/api/portfolio/${cardId}/history`);
-        const data = await resp.json();
-        const history = data.history || [];
+  if (currentView === 'table') {
+    tableView.style.display  = hasCards ? 'block' : 'none';
+    gridView.style.display   = 'none';
+    if (hasCards) renderTable(cards);
+  } else {
+    tableView.style.display  = 'none';
+    gridView.style.display   = hasCards ? 'grid' : 'none';
+    if (hasCards) renderGrid(cards);
+  }
 
-        if (history.length < 2) {
-            container.innerHTML = '<span style="color:var(--text-muted);font-size:0.75rem;">—</span>';
-            return;
-        }
+  if (searchQuery && cards.length === 0 && hasCards) {
+    emptyState.style.display = 'block';
+    document.querySelector('.empty-title').textContent = 'No cards match your search';
+    document.querySelector('.empty-subtitle').textContent = `Try a different name or set.`;
+  }
+}
 
-        const prices = history.map(h => h.price);
-        const w = 100, h = 32, pad = 2;
-        const min = Math.min(...prices);
-        const max = Math.max(...prices);
-        const range = max - min || 1;
+function updateStats() {
+  let totalValue = 0, prevValue = 0;
+  let maxGain = null, maxLoss = null;
+  let maxGainCard = null, maxLossCard = null;
 
-        const points = prices.map((p, i) => {
-            const x = pad + (i / (prices.length - 1)) * (w - 2 * pad);
-            const y = pad + (1 - (p - min) / range) * (h - 2 * pad);
-            return `${x},${y}`;
-        }).join(' ');
-
-        const trending = prices[prices.length - 1] >= prices[0];
-        const color = trending ? 'var(--green)' : 'var(--red)';
-
-        container.innerHTML = `
-            <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
-                <polyline fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points="${points}"/>
-            </svg>
-        `;
-    } catch {
-        container.innerHTML = '';
+  portfolio.forEach(c => {
+    const price = c.current_price || 0;
+    const prev  = c.previous_price || 0;
+    totalValue += price;
+    prevValue  += prev;
+    const pct = fmtChange(price, prev);
+    if (pct !== null) {
+      if (maxGain === null || pct > maxGain) { maxGain = pct; maxGainCard = c; }
+      if (maxLoss === null || pct < maxLoss) { maxLoss = pct; maxLossCard = c; }
     }
+  });
+
+  const delta = totalValue - prevValue;
+  const deltaPct = prevValue > 0 ? (delta / prevValue) * 100 : null;
+
+  topbarTotal.textContent = fmt(totalValue);
+  if (deltaPct !== null) {
+    const cls = deltaPct >= 0 ? 'positive' : 'negative';
+    const arrow = deltaPct >= 0 ? '↑' : '↓';
+    topbarChange.textContent = `${arrow} ${Math.abs(deltaPct).toFixed(2)}%`;
+    topbarChange.className = `portfolio-change ${cls}`;
+  } else {
+    topbarChange.textContent = '—';
+    topbarChange.className = 'portfolio-change neutral';
+  }
+
+  statTotalCards.textContent = portfolio.length;
+  statPortfolioVal.textContent = fmt(totalValue);
+
+  if (deltaPct !== null) {
+    const sign = delta >= 0 ? '+' : '';
+    stat24h.textContent = `${sign}${fmt(delta)} (${delta >= 0 ? '+' : ''}${deltaPct.toFixed(2)}%)`;
+    stat24h.className = `stat-value ${deltaPct >= 0 ? 'positive' : 'negative'}`;
+  } else {
+    stat24h.textContent = '—';
+    stat24h.className = 'stat-value neutral';
+  }
+
+  if (maxGainCard) {
+    statGainer.textContent = `${maxGainCard.card_name} +${maxGain.toFixed(1)}%`;
+  } else {
+    statGainer.textContent = '—';
+  }
+
+  if (maxLossCard) {
+    statLoser.textContent = `${maxLossCard.card_name} ${maxLoss.toFixed(1)}%`;
+  } else {
+    statLoser.textContent = '—';
+  }
 }
 
-// ═══════════════════════════════════════════════════
-//  UPLOAD MODAL
-// ═══════════════════════════════════════════════════
-
-function openUploadModal() {
-    STATE.files = [];
-    DOM.filePreviews.innerHTML = '';
-    DOM.uploadContent.style.display = 'block';
-    DOM.btnUploadSubmit.disabled = true;
-    DOM.uploadStatus.textContent = 'AI will identify each card and fetch live market prices';
-    DOM.uploadModal.classList.add('open');
+// ── FETCH PORTFOLIO ───────────────────────────────────────────────
+async function fetchPortfolio() {
+  try {
+    const res = await fetch('/api/portfolio');
+    if (!res.ok) throw new Error(`Status ${res.status}`);
+    const data = await res.json();
+    portfolio = data.cards || [];
+    // Also fetch history for sparklines
+    await fetchSparklineData();
+    updateStats();
+    renderPortfolio();
+    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    console.error('Failed to fetch portfolio:', err);
+    showToast('Failed to load portfolio data', 'error');
+  }
 }
 
-function closeUploadModal() {
-    DOM.uploadModal.classList.remove('open');
-    STATE.files = [];
+async function fetchSparklineData() {
+  // Fetch 7-day history for each card (batch)
+  const fetches = portfolio.map(async card => {
+    try {
+      const res = await fetch(`/api/portfolio/${card.id}/history`);
+      if (res.ok) {
+        const data = await res.json();
+        card.price_history = data.history || [];
+      }
+    } catch { /* skip — sparkline will show flat line */ }
+  });
+  await Promise.allSettled(fetches);
 }
 
-function handleFiles(fileList) {
-    const newFiles = [...fileList].filter(f => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
-    STATE.files = [...STATE.files, ...newFiles];
-
-    DOM.filePreviews.innerHTML = '';
-    STATE.files.forEach(file => {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'file-preview-item';
-
-        const reader = new FileReader();
-        reader.onload = () => {
-            const img = document.createElement('img');
-            img.src = reader.result;
-            img.alt = file.name;
-            img.onerror = () => {
-                // Browser can't render this format — show a placeholder
-                wrapper.innerHTML = `<div class="file-preview-fallback">🃏<span>${file.name.split('.').pop().toUpperCase()}</span></div>`;
-            };
-            wrapper.appendChild(img);
-            DOM.filePreviews.appendChild(wrapper);
-        };
-        reader.onerror = () => {
-            wrapper.innerHTML = `<div class="file-preview-fallback">🃏<span>${file.name.split('.').pop().toUpperCase()}</span></div>`;
-            DOM.filePreviews.appendChild(wrapper);
-        };
-        reader.readAsDataURL(file);
-    });
-
-    DOM.btnUploadSubmit.disabled = STATE.files.length === 0;
-
-    if (STATE.files.length > 0) {
-        DOM.uploadContent.style.display = 'none';
+// ── SORT ──────────────────────────────────────────────────────────
+document.querySelectorAll('th.sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    if (currentSort.key === key) {
+      currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
     } else {
-        DOM.uploadContent.style.display = 'block';
+      currentSort.key = key;
+      currentSort.dir = key === 'name' ? 'asc' : 'desc';
     }
+    document.querySelectorAll('th.sortable').forEach(h => {
+      h.classList.remove('sort-asc', 'sort-desc');
+    });
+    th.classList.add(currentSort.dir === 'asc' ? 'sort-asc' : 'sort-desc');
+    renderPortfolio();
+  });
+});
+
+// ── VIEW TOGGLE ───────────────────────────────────────────────────
+tableViewBtn.addEventListener('click', () => {
+  currentView = 'table';
+  tableViewBtn.classList.add('active');
+  gridViewBtn.classList.remove('active');
+  renderPortfolio();
+});
+gridViewBtn.addEventListener('click', () => {
+  currentView = 'grid';
+  gridViewBtn.classList.add('active');
+  tableViewBtn.classList.remove('active');
+  renderPortfolio();
+});
+
+// ── SEARCH ────────────────────────────────────────────────────────
+searchInput.addEventListener('input', () => {
+  searchQuery = searchInput.value.trim();
+  renderPortfolio();
+});
+
+// ── REFRESH PRICES ────────────────────────────────────────────────
+refreshBtn.addEventListener('click', async () => {
+  if (portfolio.length === 0) {
+    showToast('No cards to refresh', 'info');
+    return;
+  }
+  refreshBtn.classList.add('loading');
+  refreshBtn.disabled = true;
+  try {
+    const res = await fetch('/api/portfolio/refresh-prices', { method: 'POST' });
+    const data = await res.json();
+    showToast(data.message || 'Prices refreshed!', 'success');
+    await fetchPortfolio();
+  } catch (err) {
+    showToast('Failed to refresh prices', 'error');
+  } finally {
+    refreshBtn.classList.remove('loading');
+    refreshBtn.disabled = false;
+  }
+});
+
+// ── UPLOAD MODAL ──────────────────────────────────────────────────
+function openModal() {
+  uploadModal.classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeModal() {
+  uploadModal.classList.remove('open');
+  document.body.style.overflow = '';
+  // Reset state if not uploading
+  if (!document.querySelector('.queue-item')) {
+    dropZone.style.display = 'block';
+    uploadQueue.style.display = 'none';
+    queueItems.innerHTML = '';
+  }
 }
 
-async function submitUpload() {
-    if (STATE.files.length === 0) return;
+openUploadBtn.addEventListener('click', openModal);
+emptyUploadBtn.addEventListener('click', openModal);
+closeUploadBtn.addEventListener('click', closeModal);
+uploadModal.addEventListener('click', e => { if (e.target === uploadModal) closeModal(); });
 
-    STATE.uploadInProgress = true;
-    DOM.btnUploadSubmit.disabled = true;
-    DOM.btnUploadSubmit.innerHTML = '<span class="spinner"></span><span>Scanning cards...</span>';
-    DOM.uploadStatus.textContent = `Processing ${STATE.files.length} photos...`;
+// File input trigger
+dropZone.addEventListener('click', () => fileInput.click());
 
-    const formData = new FormData();
-    STATE.files.forEach(f => formData.append('photos', f));
+// Drag and drop
+['dragenter','dragover'].forEach(evt => {
+  dropZone.addEventListener(evt, e => {
+    e.preventDefault();
+    dropZone.classList.add('drag-over');
+  });
+});
+['dragleave','dragend'].forEach(evt => {
+  dropZone.addEventListener(evt, () => dropZone.classList.remove('drag-over'));
+});
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.name.match(/\.(heic|heif)$/i));
+  if (files.length) processFiles(files);
+});
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  if (files.length) processFiles(files);
+  fileInput.value = '';
+});
+
+// ── FILE PROCESSING ───────────────────────────────────────────────
+async function processFiles(files) {
+  dropZone.style.display = 'none';
+  uploadQueue.style.display = 'block';
+  queueTitle.textContent = `Processing ${files.length} card${files.length > 1 ? 's' : ''}…`;
+  queueStatus.textContent = '';
+  queueItems.innerHTML = '';
+
+  const itemEls = files.map((file, i) => {
+    const el = document.createElement('div');
+    el.className = 'queue-item';
+    el.id = `qitem-${i}`;
+    const preview = URL.createObjectURL(file);
+    el.innerHTML = `
+      <img class="queue-item-thumb" src="${preview}" alt="${file.name}">
+      <div class="queue-item-info">
+        <div class="queue-item-name">${file.name}</div>
+        <div class="queue-item-status">Waiting…</div>
+        <div class="queue-item-progress"><div class="queue-item-progress-bar" style="width:0%"></div></div>
+      </div>
+      <div class="queue-item-status-icon">⏳</div>`;
+    queueItems.appendChild(el);
+    return el;
+  });
+
+  let success = 0, fail = 0;
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const el = itemEls[i];
+    const statusEl = el.querySelector('.queue-item-status');
+    const progress = el.querySelector('.queue-item-progress-bar');
+    const icon = el.querySelector('.queue-item-status-icon');
+
+    statusEl.textContent = 'Analyzing with AI…';
+    progress.style.width = '30%';
+    icon.textContent = '🔍';
 
     try {
-        const resp = await fetch('/api/portfolio/upload', {
-            method: 'POST',
-            body: formData,
-        });
+      const formData = new FormData();
+      formData.append('cards', file);
 
-        // Guard against non-JSON responses (e.g. HTML error pages)
-        const contentType = resp.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-            await resp.text();
-            throw new Error(resp.ok ? 'Unexpected server response' : `Server error (${resp.status})`);
-        }
+      progress.style.width = '60%';
+      statusEl.textContent = 'Fetching market price…';
 
-        const data = await resp.json();
-        if (data.success) {
-            DOM.uploadStatus.textContent = data.message || 'AI is analyzing your cards...';
-            // Safety timeout: if SSE never fires portfolio_updated, reset after 60s
-            setTimeout(() => {
-                if (STATE.uploadInProgress) {
-                    STATE.uploadInProgress = false;
-                    closeUploadModal();
-                    resetUploadButton();
-                    fetchPortfolio();
-                    showToast('Cards processed — check your portfolio!');
-                }
-            }, 60000);
-        } else {
-            STATE.uploadInProgress = false;
-            DOM.uploadStatus.textContent = `Error: ${data.message}`;
-            resetUploadButton();
-        }
+      const res = await fetch('/api/portfolio/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      progress.style.width = '90%';
+
+      if (!res.ok) {
+        let errMsg = `Upload failed (${res.status})`;
+        try { const d = await res.json(); errMsg = d.error || errMsg; } catch {}
+        throw new Error(errMsg);
+      }
+
+      const data = await res.json();
+      progress.style.width = '100%';
+
+      const cards = data.cards || data.results || [];
+      if (cards.length > 0) {
+        const c = cards[0];
+        statusEl.textContent = `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
+        icon.textContent = '✅';
+        success++;
+      } else {
+        statusEl.textContent = '⚠️ No card detected in image';
+        icon.textContent = '⚠️';
+      }
     } catch (err) {
-        STATE.uploadInProgress = false;
-        DOM.uploadStatus.textContent = `Upload failed: ${err.message}`;
-        resetUploadButton();
+      statusEl.textContent = `❌ ${err.message}`;
+      icon.textContent = '❌';
+      progress.style.width = '100%';
+      progress.style.background = '#dc2626';
+      fail++;
     }
+  }
+
+  queueTitle.textContent = `Done! ${success} card${success !== 1 ? 's' : ''} added`;
+  queueStatus.textContent = fail > 0 ? `${fail} failed` : '✓ All successful';
+  queueStatus.style.color = fail > 0 ? '#dc2626' : '#16a34a';
+
+  // Refresh portfolio
+  await fetchPortfolio();
+
+  // Reset upload form for next upload
+  setTimeout(() => {
+    dropZone.style.display = 'block';
+    uploadQueue.style.display = 'none';
+    queueItems.innerHTML = '';
+  }, 5000);
 }
 
-function resetUploadButton() {
-    DOM.btnUploadSubmit.disabled = false;
-    DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
+// ── CARD DETAIL DRAWER ─────────────────────────────────────────────
+function openDrawer(card) {
+  activeDrawerCard = card;
+  const pct = fmtChange(card.current_price, card.previous_price);
+  const delta = card.current_price && card.previous_price ? card.current_price - card.previous_price : null;
+
+  drawerCardName.textContent = card.card_name || 'Unknown Card';
+  drawerCardMeta.textContent = [card.card_set, card.rarity, card.condition].filter(Boolean).join(' • ') || '—';
+  drawerCurrentPx.textContent = fmt(card.current_price);
+
+  if (pct !== null) {
+    const sign = delta >= 0 ? '+' : '';
+    drawerChange.textContent = `${delta >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(2)}% (${sign}${fmt(delta)})`;
+    drawerChange.className = `drawer-change ${pct >= 0 ? 'badge-positive' : 'badge-negative'}`;
+  } else {
+    drawerChange.textContent = '';
+  }
+
+  const imgSrc = card.image_url || card.image_data || '';
+  if (imgSrc) {
+    drawerCardImg.src = imgSrc;
+    drawerCardImg.style.display = 'block';
+  } else {
+    drawerCardImg.style.display = 'none';
+  }
+
+  // Detail fields
+  setDetail('drawerSet', card.card_set);
+  setDetail('drawerNumber', card.card_number);
+  setDetail('drawerRarity', card.rarity);
+  setDetail('drawerCondition', card.condition);
+  setDetail('drawerHolo', card.is_holo ? '✓ Yes' : 'No');
+  setDetail('drawer1stEd', card.is_first_edition ? '✓ Yes' : 'No');
+  setDetail('drawerConfidence', card.confidence != null ? `${Math.round(card.confidence * 100)}%` : '—');
+  setDetail('drawerPriceSource', card.price_source || '—');
+
+  drawerOverlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+
+  // Load price chart
+  priceChartDays = 7;
+  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.chart-tab[data-days="7"]').classList.add('active');
+  fetchAndDrawChart(card.id, 7);
 }
 
-// ═══════════════════════════════════════════════════
-//  CARD DETAIL DRAWER
-// ═══════════════════════════════════════════════════
-
-async function openCardDrawer(cardId) {
-    const card = STATE.cards.find(c => c.id === cardId);
-    if (!card) return;
-
-    DOM.drawerCardName.textContent = card.card_name;
-
-    // Meta
-    DOM.drawerMeta.innerHTML = `
-        <div class="meta-item"><div class="meta-label">Set</div><div class="meta-value">${esc(card.card_set || '—')}</div></div>
-        <div class="meta-item"><div class="meta-label">Number</div><div class="meta-value">${esc(card.card_number || '—')}</div></div>
-        <div class="meta-item"><div class="meta-label">Rarity</div><div class="meta-value">${esc(card.rarity || '—')}</div></div>
-        <div class="meta-item"><div class="meta-label">Condition</div><div class="meta-value">${esc(card.condition || '—')}</div></div>
-        <div class="meta-item"><div class="meta-label">Current Price</div><div class="meta-value">${formatCurrency(card.current_price || 0)}</div></div>
-        <div class="meta-item"><div class="meta-label">Added</div><div class="meta-value">${formatDate(card.added_at)}</div></div>
-    `;
-
-    DOM.drawerOverlay.classList.add('open');
-
-    // Fetch price history and draw chart
-    try {
-        const resp = await fetch(`/api/portfolio/${cardId}/history`);
-        const data = await resp.json();
-        const history = data.history || [];
-
-        drawPriceChart(history);
-
-        // Price list
-        DOM.drawerPriceList.innerHTML = '<h3>Price Log</h3>' +
-            history.slice().reverse().slice(0, 20).map(h => `
-                <div class="price-entry">
-                    <span class="price-date">${formatDateTime(h.recorded_at)}</span>
-                    <span class="price-amount">${formatCurrency(h.price)}</span>
-                </div>
-            `).join('');
-    } catch (err) {
-        console.error('Failed to load price history:', err);
-    }
+function setDetail(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val || '—';
 }
 
 function closeDrawer() {
-    DOM.drawerOverlay.classList.remove('open');
+  drawerOverlay.classList.remove('open');
+  document.body.style.overflow = '';
+  activeDrawerCard = null;
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
 }
 
-function drawPriceChart(history) {
-    const canvas = DOM.priceChart;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
+closeDrawerBtn.addEventListener('click', closeDrawer);
+drawerOverlay.addEventListener('click', e => { if (e.target === drawerOverlay) closeDrawer(); });
 
-    const rect = canvas.parentElement.getBoundingClientRect();
-    const w = rect.width;
-    const h = 180;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
-    ctx.scale(dpr, dpr);
+// Chart tab switching
+document.querySelectorAll('.chart-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    priceChartDays = parseInt(tab.dataset.days);
+    if (activeDrawerCard) fetchAndDrawChart(activeDrawerCard.id, priceChartDays);
+  });
+});
 
-    ctx.clearRect(0, 0, w, h);
+async function fetchAndDrawChart(cardId, days) {
+  try {
+    const res = await fetch(`/api/portfolio/${cardId}/history`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const history = (data.history || []);
 
-    if (history.length < 2) {
-        ctx.fillStyle = '#9ca3af';
-        ctx.font = '13px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Not enough data yet', w / 2, h / 2);
-        return;
-    }
+    // Filter to `days` window
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const filtered = history.filter(h => new Date(h.recorded_at) >= cutoff);
+    const pts = filtered.length >= 2 ? filtered : history.slice(-2);
 
-    const prices = history.map(p => p.price);
-    const min = Math.min(...prices) * 0.95;
-    const max = Math.max(...prices) * 1.05;
-    const range = max - min || 1;
-    const padX = 8, padY = 16;
-
-    const trending = prices[prices.length - 1] >= prices[0];
-    const lineColor = trending ? '#16a34a' : '#dc2626';
-    const fillColor = trending ? 'rgba(22,163,74,0.06)' : 'rgba(220,38,38,0.06)';
-
-    // Grid lines
-    ctx.strokeStyle = '#f0f0f0';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-        const y = padY + (i / 4) * (h - 2 * padY);
-        ctx.beginPath();
-        ctx.moveTo(padX, y);
-        ctx.lineTo(w - padX, y);
-        ctx.stroke();
-    }
-
-    // Price line
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-
-    const points = prices.map((p, i) => ({
-        x: padX + (i / (prices.length - 1)) * (w - 2 * padX),
-        y: padY + (1 - (p - min) / range) * (h - 2 * padY)
-    }));
-
-    points.forEach((pt, i) => {
-        if (i === 0) ctx.moveTo(pt.x, pt.y);
-        else ctx.lineTo(pt.x, pt.y);
-    });
-    ctx.stroke();
-
-    // Fill under curve
-    ctx.lineTo(points[points.length - 1].x, h - padY);
-    ctx.lineTo(points[0].x, h - padY);
-    ctx.closePath();
-    ctx.fillStyle = fillColor;
-    ctx.fill();
-
-    // Price labels
-    ctx.fillStyle = '#9ca3af';
-    ctx.font = '10px Inter, sans-serif';
-    ctx.textAlign = 'right';
-    for (let i = 0; i <= 4; i++) {
-        const y = padY + (i / 4) * (h - 2 * padY);
-        const val = max - (i / 4) * range;
-        ctx.fillText('$' + val.toFixed(2), w - padX, y - 3);
-    }
+    drawChart(pts);
+  } catch (err) {
+    console.error('Chart fetch failed:', err);
+  }
 }
 
-// ═══════════════════════════════════════════════════
-//  ACTIONS
-// ═══════════════════════════════════════════════════
+function drawChart(pts) {
+  const canvas = document.getElementById('priceChart');
+  if (!canvas) return;
 
-async function deleteCard(cardId) {
-    if (!confirm('Remove this card from your portfolio?')) return;
+  if (chartInstance) chartInstance.destroy();
+
+  const labels = pts.map(p => {
+    const d = new Date(p.recorded_at);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  });
+  const prices = pts.map(p => Number(p.price));
+  const isUp = prices.length >= 2 ? prices[prices.length - 1] >= prices[0] : true;
+  const color = isUp ? '#16a34a' : '#dc2626';
+
+  chartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data: prices,
+        borderColor: color,
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        pointRadius: pts.length <= 10 ? 3 : 0,
+        pointBackgroundColor: color,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      animation: { duration: 300 },
+      plugins: { legend: { display: false }, tooltip: {
+        callbacks: {
+          label: ctx => `$${Number(ctx.raw).toFixed(2)}`
+        }
+      }},
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#9ca3af', font: { size: 11 } } },
+        y: {
+          grid: { color: '#f3f4f6' },
+          ticks: {
+            color: '#9ca3af',
+            font: { size: 11 },
+            callback: v => `$${v.toFixed(0)}`
+          }
+        }
+      }
+    }
+  });
+}
+
+// ── DELETE CARD ────────────────────────────────────────────────────
+async function confirmDelete(cardId) {
+  if (!confirm('Remove this card from your portfolio?')) return;
+  try {
+    const res = await fetch(`/api/portfolio/${cardId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Delete failed');
+    portfolio = portfolio.filter(c => c.id !== cardId);
+    updateStats();
+    renderPortfolio();
+    showToast('Card removed from portfolio', 'success');
+    if (activeDrawerCard && activeDrawerCard.id === cardId) closeDrawer();
+  } catch {
+    showToast('Failed to remove card', 'error');
+  }
+}
+
+deleteCardBtn.addEventListener('click', () => {
+  if (activeDrawerCard) confirmDelete(activeDrawerCard.id);
+});
+
+// Make confirmDelete accessible globally (called from inline onclick)
+window.confirmDelete = confirmDelete;
+
+// ── SSE (Server-Sent Events) live updates ─────────────────────────
+function connectSSE() {
+  const evtSource = new EventSource('/api/events');
+  evtSource.onmessage = async (e) => {
     try {
-        await fetch(`/api/portfolio/${cardId}`, { method: 'DELETE' });
-        showToast('Card removed');
-        fetchPortfolio();
-    } catch (err) {
-        showToast('Error removing card');
-    }
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'card_added' || msg.type === 'prices_refreshed') {
+        await fetchPortfolio();
+      }
+    } catch {}
+  };
+  evtSource.onerror = () => {
+    // SSE disconnected — retry after 10 seconds
+    evtSource.close();
+    setTimeout(connectSSE, 10000);
+  };
 }
 
-async function refreshPrices() {
-    const btn = $('#btnRefreshPrices');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span><span>Refreshing...</span>';
-    showToast('Refreshing market prices...');
-
-    try {
-        await fetch('/api/portfolio/refresh-prices', { method: 'POST' });
-    } catch (err) {
-        showToast('Error refreshing prices');
-    }
-
-    // Re-enable after a delay (the actual refresh runs in the background)
-    setTimeout(() => {
-        btn.disabled = false;
-        btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg><span>Refresh Prices</span>`;
-    }, 3000);
-}
-
-// Make functions globally accessible for inline onclick handlers
-window.openCardDrawer = openCardDrawer;
-window.deleteCard = deleteCard;
-
-// ═══════════════════════════════════════════════════
-//  UTILITIES
-// ═══════════════════════════════════════════════════
-
-function getChangePct(card) {
-    if (!card.current_price || !card.previous_price || card.previous_price === 0) return 0;
-    return ((card.current_price - card.previous_price) / card.previous_price) * 100;
-}
-
-function formatCurrency(val) {
-    return '$' + parseFloat(val || 0).toFixed(2);
-}
-
-function formatDate(dateStr) {
-    if (!dateStr) return '—';
-    return new Date(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
-function formatDateTime(dateStr) {
-    if (!dateStr) return '—';
-    return new Date(dateStr).toLocaleString('en-US', {
-        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
-    });
-}
-
-function truncate(str, len) {
-    if (!str) return '';
-    return str.length > len ? str.substring(0, len) + '…' : str;
-}
-
-function esc(str) {
-    const div = document.createElement('div');
-    div.textContent = str || '';
-    return div.innerHTML;
-}
-
-function escapeAttr(str) {
-    return (str || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-function showToast(message) {
-    DOM.statusToast.textContent = message;
-    DOM.statusToast.classList.add('visible');
-    clearTimeout(showToast._timer);
-    showToast._timer = setTimeout(() => {
-        DOM.statusToast.classList.remove('visible');
-    }, 3000);
-}
+// ── INIT ──────────────────────────────────────────────────────────
+(async function init() {
+  await fetchPortfolio();
+  connectSSE();
+})();

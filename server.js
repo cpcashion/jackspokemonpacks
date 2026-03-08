@@ -1,11 +1,11 @@
 /**
- * Jack's Pokemon Packs — Portfolio Tracker Server
- * 
+ * Jack's Pokemon Packs — Portfolio Tracker Server v3
+ *
  * Express server that:
  * 1. Serves the portfolio dashboard (static HTML/CSS/JS)
  * 2. Stores cards permanently in a SQLite portfolio database
  * 3. Analyzes uploaded card photos with Gemini Vision AI
- * 4. Scrapes marketplace prices (eBay, Mercari, etc.)
+ * 4. Fetches accurate market prices via Pokemon TCG API + eBay
  * 5. Tracks price history over time with background refresh
  */
 
@@ -24,6 +24,7 @@ import sharp from 'sharp';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const POKEMON_TCG_KEY = process.env.POKEMON_TCG_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -136,13 +137,31 @@ function insertPricePoint(cardId, price, source) {
 }
 
 function getAllPortfolioCards() {
+    // Use a CTE to get current and previous prices reliably (avoids OFFSET on subquery bug)
     return db.prepare(`
+        WITH ranked_prices AS (
+            SELECT
+                card_id,
+                price,
+                source,
+                recorded_at,
+                ROW_NUMBER() OVER (PARTITION BY card_id ORDER BY recorded_at DESC) as rn
+            FROM price_history
+        ),
+        latest AS (
+            SELECT card_id, price as current_price, source as price_source FROM ranked_prices WHERE rn = 1
+        ),
+        prev AS (
+            SELECT card_id, price as previous_price FROM ranked_prices WHERE rn = 2
+        )
         SELECT pc.*,
-            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) as current_price,
-            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1 OFFSET 1) as previous_price,
-            (SELECT ph.source FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) as price_source
+            COALESCE(l.current_price, NULL) as current_price,
+            COALESCE(p.previous_price, NULL) as previous_price,
+            COALESCE(l.price_source, NULL) as price_source
         FROM portfolio_cards pc
-        ORDER BY (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) DESC
+        LEFT JOIN latest l ON l.card_id = pc.id
+        LEFT JOIN prev   p ON p.card_id  = pc.id
+        ORDER BY COALESCE(l.current_price, 0) DESC
     `).all();
 }
 
@@ -240,8 +259,8 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
 let geminiModel = null;
 if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.5 Flash)');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash Exp)');
 } else {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
@@ -385,11 +404,63 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
 
     const known = checkKnownCards(cardName, cardSet);
     if (known) {
-        priceCache.set(key, { price: known, source: 'known_value', ts: Date.now() });
-        return { price: known, source: 'known_value' };
+        priceCache.set(key, { price: known, source: 'reference', ts: Date.now() });
+        return { price: known, source: 'reference' };
     }
 
-    // Strategy 1: Specific eBay search with card number
+    // ── Strategy 1: Pokemon TCG API (free tier — 1000 req/day, has TCGPlayer market prices) ──
+    try {
+        const headers = { 'Accept': 'application/json' };
+        if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
+
+        // Build query — try card number + name, or just name
+        let searchUrl;
+        if (cardNumber) {
+            const num = cardNumber.split('/')[0].replace(/^0+/, '');
+            searchUrl = `https://api.pokemontcg.io/v2/cards?q=name:"${encodeURIComponent(cardName)}" number:${num}&pageSize=10`;
+        } else {
+            searchUrl = `https://api.pokemontcg.io/v2/cards?q=name:"${encodeURIComponent(cardName)}"&orderBy=-tcgplayer.prices.holofoil.market&pageSize=10`;
+        }
+
+        const resp = await axios.get(searchUrl, { headers, timeout: 15000 });
+        const results = resp.data?.data || [];
+
+        // Try to match set if we have one
+        let match = null;
+        if (cardSet && results.length > 1) {
+            const setLower = cardSet.toLowerCase();
+            match = results.find(c => (c.set?.name || '').toLowerCase().includes(setLower) || setLower.includes((c.set?.name || '').toLowerCase()));
+        }
+        if (!match) match = results[0];
+
+        if (match) {
+            // Extract market price from TCGPlayer data (prefer holofoil > normal > 1st edition)
+            const prices = match.tcgplayer?.prices;
+            let price = null;
+            if (prices) {
+                price = prices.holofoil?.market
+                    || prices.reverseHolofoil?.market
+                    || prices.normal?.market
+                    || prices['1stEditionHolofoil']?.market
+                    || prices.unlimited?.market
+                    || null;
+            }
+            // Fallback to cardmarket
+            if (!price && match.cardmarket?.prices) {
+                price = match.cardmarket.prices.averageSellPrice || match.cardmarket.prices.trendPrice || null;
+            }
+
+            if (price && price > 0) {
+                console.log(`  [Pricing] Pokemon TCG API for "${cardName}": $${price.toFixed(2)} (${match.set?.name})`);
+                priceCache.set(key, { price, source: 'pokemon_tcg_api', ts: Date.now() });
+                return { price, source: 'pokemon_tcg_api' };
+            }
+        }
+    } catch (err) {
+        console.error(`  [Pricing] Pokemon TCG API failed for "${cardName}":`, err.message);
+    }
+
+    // ── Strategy 2: eBay RSS (multiple query variants) ──
     const searchQueries = [
         cardNumber ? `"${cardName}" ${cardNumber} pokemon card` : null,
         `"${cardName}" ${cardSet || ''} pokemon card`,
@@ -406,13 +477,13 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
                 });
                 if (filtered.length >= 2) {
                     filtered.sort((a, b) => a.price - b.price);
-                    const medianPrice = filtered[Math.floor(filtered.length / 2)].price;
+                    const medianIdx = Math.floor(filtered.length / 2);
+                    const medianPrice = filtered[medianIdx].price;
                     console.log(`  [Pricing] eBay median for "${cardName}": $${medianPrice.toFixed(2)} (${filtered.length} listings)`);
                     priceCache.set(key, { price: medianPrice, source: 'ebay', ts: Date.now() });
                     return { price: medianPrice, source: 'ebay' };
                 } else if (filtered.length === 1) {
                     const price = filtered[0].price;
-                    console.log(`  [Pricing] eBay single listing for "${cardName}": $${price.toFixed(2)}`);
                     priceCache.set(key, { price, source: 'ebay', ts: Date.now() });
                     return { price, source: 'ebay' };
                 }
@@ -421,30 +492,6 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
         } catch (err) {
             console.error(`  [Pricing] eBay scrape failed for "${cardName}":`, err.message);
         }
-    }
-
-    // Strategy 2: TCGPlayer scrape
-    try {
-        const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
-        const sourceUrl = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
-        await sleep(RATE_LIMITS.priceCheck);
-        const resp = await axios.get(sourceUrl, { headers: makeHeaders(), timeout: 20000 });
-        const { load } = await import('cheerio');
-        const $ = load(resp.data);
-        let price = null;
-        $('[class*="product-card"], .search-result').each((i, el) => {
-            if (i > 0 || price) return;
-            const txt = $(el).find('[class*="market-price"], [class*="price"], .price').first().text();
-            const m = txt.match(/\$?([\d,]+\.?\d*)/);
-            if (m) price = parseFloat(m[1].replace(',', ''));
-        });
-        if (price) {
-            console.log(`  [Pricing] TCGPlayer for "${cardName}": $${price.toFixed(2)}`);
-            priceCache.set(key, { price, source: 'tcgplayer', ts: Date.now() });
-            return { price, source: 'tcgplayer' };
-        }
-    } catch (err) {
-        console.error(`  [Pricing] TCGPlayer scrape failed for ${cardName}:`, err.message);
     }
 
     console.log(`  [Pricing] No market price found for "${cardName}"`);
@@ -574,6 +621,15 @@ setTimeout(() => {
 const app = express();
 app.use(express.json());
 
+// CORS — allow local dev
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 // Serve static files
 app.use(express.static(__dirname));
 
@@ -622,84 +678,78 @@ app.post('/api/portfolio/refresh-prices', async (req, res) => {
 });
 
 // Upload photos → AI identifies → saves to portfolio
+// Accepts field name 'cards' (from the frontend drop-zone) OR 'photos' (legacy)
 app.post('/api/portfolio/upload', (req, res) => {
-    const uploader = upload.array('photos');
-    uploader(req, res, (err) => {
+    const uploader = upload.fields([
+        { name: 'cards', maxCount: 20 },
+        { name: 'photos', maxCount: 20 },
+    ]);
+    uploader(req, res, async (err) => {
         if (err) {
-            // Multer errors (file too large, too many files, etc.) → return JSON
             const message = err.code === 'LIMIT_FILE_SIZE'
-                ? `File too large. Max 100 MB per image.`
+                ? 'File too large. Max 100 MB per image.'
                 : err.code === 'LIMIT_FILE_COUNT'
-                    ? `Too many files. Max 50 images per upload.`
+                    ? 'Too many files. Max 20 images per upload.'
                     : err.message || 'Upload failed.';
             console.error('Upload error:', err.message);
-            return res.status(400).json({ success: false, message });
+            return res.status(400).json({ success: false, error: message });
         }
 
         try {
-            const files = req.files;
-            if (!files || files.length === 0) {
-                return res.status(400).json({ success: false, message: 'No photos provided.' });
+            const files = [
+                ...(req.files?.cards || []),
+                ...(req.files?.photos || []),
+            ];
+            if (!files.length) {
+                return res.status(400).json({ success: false, error: 'No photos provided.' });
             }
 
-            broadcastActivity('upload_start', `Analyzing ${files.length} photos...`);
+            broadcastActivity('upload_start', `Analyzing ${files.length} photo${files.length > 1 ? 's' : ''}...`);
 
-            // Process asynchronously
-            processPortfolioUpload(files).catch(err => {
-                console.error('Portfolio upload error:', err);
-                broadcastActivity('error', `Upload error: ${err.message}`);
-            });
-
-            res.json({ success: true, message: `Processing ${files.length} photos...` });
+            // Process synchronously so we can return the results
+            const result = await processPortfolioUpload(files);
+            res.json({ success: true, cards: result.cards, message: `Added ${result.totalAdded} card(s)` });
         } catch (err) {
-            res.status(500).json({ success: false, message: err.message });
+            console.error('Portfolio upload error:', err);
+            res.status(500).json({ success: false, error: err.message });
         }
     });
 });
 
 async function processPortfolioUpload(files) {
     let totalAdded = 0;
+    const addedCards = [];
 
-    broadcastActivity('analyzing', `Scanning ${files.length} photos with AI (processing sequentially to save memory)...`);
+    broadcastActivity('analyzing', `Scanning ${files.length} photo${files.length > 1 ? 's' : ''} with AI...`);
 
-    // 1. Analyze images sequentially to prevent Out-Of-Memory limits on Render
-    const analysisResults = [];
+    // 1. Analyze images sequentially (prevents OOM on Render free tier)
     for (let index = 0; index < files.length; index++) {
         const file = files[index];
         broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
-        
+
+        let buffer, analysis, thumbDataUrl = '';
         try {
-            const buffer = readFileSync(file.path);
-            const analysis = await analyzeImageBuffer(buffer, file.mimetype);
-            
-            // Always create a JPEG thumbnail using sharp
-            let thumbDataUrl = '';
+            buffer = readFileSync(file.path);
+            analysis = await analyzeImageBuffer(buffer, file.mimetype);
+
+            // Create thumbnail
             try {
                 const thumbBuffer = await sharp(buffer)
                     .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
                     .jpeg({ quality: 80 })
                     .toBuffer();
                 thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
-            } catch (thumbErr) {
-                console.error(`  [Thumb] Failed for photo ${index + 1}:`, thumbErr.message);
-            }
-            
-            // Immediately delete the file off disk to free resources
-            try { rmSync(file.path, { force: true }); } catch { }
-            
-            analysisResults.push({ index, file, analysis, thumbDataUrl });
-        } catch (err) {
-            console.error(`Photo ${index + 1} AI error:`, err.message);
-            try { rmSync(file.path, { force: true }); } catch { }
-            analysisResults.push({ index, file, analysis: null, thumbDataUrl: '' });
-        }
-    }
+            } catch (e) { console.error(`  [Thumb] Failed for photo ${index + 1}:`, e.message); }
 
-    // 2. Insert all identified cards and look up TCGdex images
-    const cardIds = [];
-    for (const { index, file, analysis, thumbDataUrl } of analysisResults) {
-        if (!analysis || !analysis.cards || analysis.cards.length === 0) {
-            broadcastActivity('info', `No cards found in photo ${index + 1}.`);
+            try { rmSync(file.path, { force: true }); } catch { }
+        } catch (err) {
+            console.error(`Photo ${index + 1} error:`, err.message);
+            try { rmSync(file.path, { force: true }); } catch { }
+            continue;
+        }
+
+        if (!analysis?.cards?.length) {
+            broadcastActivity('info', `No Pokemon card detected in photo ${index + 1}.`);
             continue;
         }
 
@@ -712,7 +762,7 @@ async function processPortfolioUpload(files) {
                 imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
             } catch { /* continue without image */ }
 
-            const result = insertPortfolioCard({
+            const dbResult = insertPortfolioCard({
                 card_name: card.card_name,
                 card_set: card.card_set || '',
                 card_number: card.card_number || '',
@@ -726,30 +776,47 @@ async function processPortfolioUpload(files) {
                 notes: card.notes || ''
             });
 
-            const cardId = result.lastInsertRowid;
-            cardIds.push(cardId);
+            const cardId = dbResult.lastInsertRowid;
 
-            // Use AI estimated price immediately — no slow marketplace scraping
-            const price = card.estimated_value_usd || 0;
-            if (price > 0) {
-                insertPricePoint(cardId, price, 'ai_estimate');
+            // Use AI estimate as initial price — background refresh will add real prices
+            const aiPrice = card.estimated_value_usd || 0;
+            if (aiPrice > 0) {
+                insertPricePoint(cardId, aiPrice, 'ai_estimate');
             }
 
             totalAdded++;
-            const imgStatus = imageUrl ? '🖼️' : '';
-            broadcastActivity('card_added', `Added ${card.card_name} ${imgStatus} — $${price.toFixed(2)} (AI est.)`);
+            addedCards.push({
+                id: cardId,
+                card_name: card.card_name,
+                card_set: card.card_set || '',
+                card_number: card.card_number || '',
+                rarity: card.rarity || 'Unknown',
+                condition: card.condition_estimate || 'Unknown',
+                is_holo: card.is_holographic || false,
+                is_first_edition: card.is_first_edition || false,
+                confidence: card.confidence || 0,
+                image_url: imageUrl || '',
+                image_data: thumbDataUrl ? thumbDataUrl.substring(0, 100) + '...' : '',  // truncate for response
+                current_price: aiPrice,
+                estimated_value: aiPrice,
+                price_source: 'ai_estimate',
+            });
+
+            broadcastActivity('card_added', `✅ ${card.card_name} — $${aiPrice.toFixed(2)} (AI estimate)${imageUrl ? ' 🖼️' : ''}`);
         }
     }
 
-    broadcastActivity('upload_complete', `Added ${totalAdded} cards to your portfolio!`);
-    broadcast({ type: 'portfolio_updated' });
+    broadcastActivity('upload_complete', `Added ${totalAdded} card${totalAdded !== 1 ? 's' : ''} to your portfolio!`);
+    broadcast({ type: 'card_added' });
 
-    // 3. Kick off a background price refresh to get real market prices
-    //    This runs AFTER the user already sees their cards
+    // Fire-and-forget: get real market prices after user sees cards
     if (totalAdded > 0) {
-        broadcastActivity('info', 'Fetching live market prices in background...');
-        refreshAllPrices().catch(err => console.error('[Post-upload refresh] Error:', err.message));
+        setTimeout(() => {
+            refreshAllPrices().catch(err => console.error('[Post-upload refresh] Error:', err.message));
+        }, 2000);
     }
+
+    return { totalAdded, cards: addedCards };
 }
 
 // SSE endpoint
@@ -769,10 +836,11 @@ app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 
 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  📊 Jack's Pokemon Portfolio Tracker             ║
-║  Live market values for your collection          ║
+║  ⚡ Jack's Pokemon Portfolio Tracker v3          ║
+║  AI Vision + Live Market Prices                  ║
 ╚══════════════════════════════════════════════════╝
 `);
+console.log('💰 Pokemon TCG API:', POKEMON_TCG_KEY ? '✅ Key loaded' : '⚠️  No key (rate-limited)');
 
 app.listen(PORT, () => {
     console.log(`🌐 Dashboard running at http://localhost:${PORT}`);

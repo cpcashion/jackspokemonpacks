@@ -1,159 +1,236 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Jack's Pokemon Portfolio | Live Market Tracker</title>
-    <meta name="description" content="Track your Pokemon card collection with live market prices, trends, and portfolio analytics.">
-
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jack's Pokémon Portfolio | Live Market Tracker</title>
+  <meta name="description" content="Track the market value of your Pokémon card collection in real time. AI-powered card identification with stock-market-style price tracking." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
-
 <body>
-    <!-- Top Navigation -->
-    <nav class="topbar">
-        <div class="topbar-left">
-            <h1 class="logo">Jack's Pokemon Portfolio</h1>
-        </div>
-        <div class="topbar-right">
-            <button class="btn-refresh" id="btnRefreshPrices" title="Refresh market prices">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                <span>Refresh Prices</span>
-            </button>
-            <button class="btn-add" id="btnOpenUpload">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                <span>Add Cards</span>
-            </button>
-        </div>
-    </nav>
 
-    <!-- Status Toast -->
-    <div class="status-toast" id="statusToast"></div>
+  <!-- ── TOP NAVIGATION BAR ─────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="topbar-logo">⚡</div>
+      <span class="topbar-name">Jack's Pokémon Portfolio</span>
+    </div>
+    <div class="topbar-portfolio">
+      <span class="portfolio-total" id="portfolioTotal">$0.00</span>
+      <span class="portfolio-change neutral" id="portfolioChange">—</span>
+    </div>
+    <button class="btn-primary" id="openUploadBtn">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      Add Cards
+    </button>
+  </header>
 
-    <!-- Summary Stats -->
-    <section class="stats-bar">
-        <div class="stat-card primary">
-            <div class="stat-label">Portfolio Value</div>
-            <div class="stat-value" id="statTotalValue">$0.00</div>
-            <div class="stat-change" id="statTotalChange"></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Total Cards</div>
-            <div class="stat-value" id="statTotalCards">0</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Biggest Gainer</div>
-            <div class="stat-value" id="statGainer">—</div>
-            <div class="stat-change positive" id="statGainerChange"></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Biggest Loser</div>
-            <div class="stat-value" id="statLoser">—</div>
-            <div class="stat-change negative" id="statLoserChange"></div>
-        </div>
-    </section>
+  <!-- ── SUMMARY STATS ROW ──────────────────────────────────── -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <span class="stat-label">Total Cards</span>
+      <span class="stat-value" id="statTotalCards">0</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Portfolio Value</span>
+      <span class="stat-value" id="statPortfolioValue">$0.00</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">24h Change</span>
+      <span class="stat-value neutral" id="stat24hChange">—</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Biggest Gainer</span>
+      <span class="stat-value positive" id="statBiggestGainer">—</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Biggest Loser</span>
+      <span class="stat-value negative" id="statBiggestLoser">—</span>
+    </div>
+  </div>
 
-    <!-- Portfolio Table -->
-    <main class="portfolio-container">
-        <!-- View Toggle -->
-        <div class="view-controls" id="viewControls" style="display:none;">
-            <div class="view-toggle">
-                <button class="view-btn active" id="btnTableView" title="Table view">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
-                </button>
-                <button class="view-btn" id="btnGridView" title="Grid view">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-                </button>
-            </div>
-        </div>
+  <!-- ── MAIN CONTENT ───────────────────────────────────────── -->
+  <main class="main-content">
 
-        <!-- Empty state -->
-        <div class="empty-state" id="emptyState">
-            <div class="empty-icon">📦</div>
-            <h2>Your portfolio is empty</h2>
-            <p>Upload photos of your Pokemon cards to start tracking their market value.</p>
-            <button class="btn-add large" id="btnEmptyUpload">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                <span>Add Your First Cards</span>
-            </button>
-        </div>
-
-        <!-- Table View -->
-        <div class="table-wrapper" id="tableWrapper" style="display:none;">
-            <table class="portfolio-table" id="portfolioTable">
-                <thead>
-                    <tr>
-                        <th class="col-card sortable" data-sort="name">Card</th>
-                        <th class="col-set">Set</th>
-                        <th class="col-rarity">Rarity</th>
-                        <th class="col-condition">Condition</th>
-                        <th class="col-price sortable" data-sort="price">Price</th>
-                        <th class="col-change sortable" data-sort="change">Change</th>
-                        <th class="col-chart">7d Trend</th>
-                        <th class="col-actions"></th>
-                    </tr>
-                </thead>
-                <tbody id="portfolioBody">
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Grid View -->
-        <div class="grid-wrapper" id="gridWrapper" style="display:none;">
-            <div class="card-grid" id="cardGrid"></div>
-        </div>
-    </main>
-
-    <!-- Upload Modal -->
-    <div class="modal-overlay" id="uploadModal">
-        <div class="modal">
-            <div class="modal-header">
-                <h2>Add Cards</h2>
-                <button class="modal-close" id="btnCloseModal">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="upload-zone" id="dropZone">
-                    <input type="file" id="fileInput" accept="image/*" multiple class="file-input-hidden">
-                    <div class="upload-content" id="uploadContent">
-                        <div class="upload-icon">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                        </div>
-                        <p class="upload-title">Drag & drop card photos here</p>
-                        <p class="upload-sub">or <span class="upload-browse">browse files</span></p>
-                    </div>
-                    <div id="filePreviews" class="file-previews"></div>
-                </div>
-                <button class="btn-add large full-width" id="btnUploadSubmit" disabled>
-                    <span>Scan & Add to Portfolio</span>
-                </button>
-                <p class="upload-note" id="uploadStatus">AI will identify each card and fetch live market prices</p>
-            </div>
-        </div>
+    <!-- Controls bar -->
+    <div class="controls-bar">
+      <div class="view-toggle">
+        <button class="view-btn active" id="tableViewBtn" title="Table View">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+        </button>
+        <button class="view-btn" id="gridViewBtn" title="Grid View">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        </button>
+      </div>
+      <div class="search-box">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="searchInput" placeholder="Search cards…" autocomplete="off" />
+      </div>
+      <div class="refresh-section">
+        <button class="btn-ghost" id="refreshPricesBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          Refresh Prices
+        </button>
+        <span class="last-updated" id="lastUpdated"></span>
+      </div>
     </div>
 
-    <!-- Card Detail Drawer -->
-    <div class="drawer-overlay" id="drawerOverlay">
-        <div class="drawer" id="cardDrawer">
-            <div class="drawer-header">
-                <h2 id="drawerCardName">Card Name</h2>
-                <button class="modal-close" id="btnCloseDrawer">&times;</button>
-            </div>
-            <div class="drawer-body">
-                <div class="drawer-meta" id="drawerMeta"></div>
-                <div class="drawer-chart-container">
-                    <h3>Price History</h3>
-                    <canvas id="priceChart" width="500" height="200"></canvas>
-                </div>
-                <div class="drawer-price-list" id="drawerPriceList"></div>
-            </div>
-        </div>
+    <!-- Empty state -->
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">🃏</div>
+      <h2 class="empty-title">Your portfolio is empty</h2>
+      <p class="empty-subtitle">Upload photos of your Pokémon cards to start tracking their market value.</p>
+      <button class="btn-primary" id="emptyUploadBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add Your First Cards
+      </button>
     </div>
 
-    <script src="script.js"></script>
+    <!-- Table View -->
+    <div class="table-container" id="tableView" style="display:none;">
+      <table class="portfolio-table" id="portfolioTable">
+        <thead>
+          <tr>
+            <th class="col-thumb"></th>
+            <th class="col-name sortable" data-sort="name">
+              Card
+              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            </th>
+            <th class="col-set">Set</th>
+            <th class="col-rarity">Rarity</th>
+            <th class="col-condition">Condition</th>
+            <th class="col-price sortable" data-sort="price">
+              Price
+              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            </th>
+            <th class="col-change sortable" data-sort="change">
+              Change
+              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            </th>
+            <th class="col-sparkline">7d Trend</th>
+            <th class="col-source">Source</th>
+            <th class="col-actions"></th>
+          </tr>
+        </thead>
+        <tbody id="portfolioTableBody">
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Grid View -->
+    <div class="cards-grid" id="gridView" style="display:none;"></div>
+
+  </main>
+
+  <!-- ── UPLOAD MODAL ───────────────────────────────────────── -->
+  <div class="modal-overlay" id="uploadModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 class="modal-title">Add Pokemon Cards</h2>
+        <button class="modal-close" id="closeUploadBtn" aria-label="Close">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-icon">📸</div>
+          <p class="drop-text">Drag &amp; drop card photos here</p>
+          <p class="drop-subtext">or</p>
+          <label class="btn-secondary" for="fileInput">Browse Files</label>
+          <input type="file" id="fileInput" accept="image/*,.heic,.heif" multiple hidden />
+          <p class="drop-hint">Supports JPG, PNG, HEIC, WEBP — up to 10 photos at once<br>AI will identify each card and fetch live market prices</p>
+        </div>
+
+        <div class="upload-queue" id="uploadQueue" style="display:none;">
+          <div class="queue-header">
+            <span class="queue-title" id="queueTitle">Processing 0 cards…</span>
+            <span class="queue-status" id="queueStatus"></span>
+          </div>
+          <div class="queue-items" id="queueItems"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CARD DETAIL DRAWER ─────────────────────────────────── -->
+  <div class="drawer-overlay" id="drawerOverlay">
+    <div class="drawer" id="cardDrawer">
+      <div class="drawer-header">
+        <div class="drawer-card-info">
+          <h3 class="drawer-card-name" id="drawerCardName">Card Name</h3>
+          <p class="drawer-card-meta" id="drawerCardMeta">Set • Rarity • Condition</p>
+        </div>
+        <button class="modal-close" id="closeDrawerBtn" aria-label="Close">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="drawer-body">
+        <div class="drawer-price-row">
+          <div>
+            <span class="drawer-current-price" id="drawerCurrentPrice">$0.00</span>
+            <span class="drawer-change" id="drawerChange"></span>
+          </div>
+          <div class="drawer-card-img-wrap">
+            <img class="drawer-card-img" id="drawerCardImg" src="" alt="Card image" loading="lazy" />
+          </div>
+        </div>
+        <div class="chart-container">
+          <div class="chart-tabs">
+            <button class="chart-tab active" data-days="7">7D</button>
+            <button class="chart-tab" data-days="30">1M</button>
+            <button class="chart-tab" data-days="90">3M</button>
+          </div>
+          <canvas id="priceChart" height="200"></canvas>
+        </div>
+        <div class="drawer-details">
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span class="detail-label">Set</span>
+              <span class="detail-value" id="drawerSet">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Number</span>
+              <span class="detail-value" id="drawerNumber">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Rarity</span>
+              <span class="detail-value" id="drawerRarity">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Condition</span>
+              <span class="detail-value" id="drawerCondition">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Holographic</span>
+              <span class="detail-value" id="drawerHolo">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">1st Edition</span>
+              <span class="detail-value" id="drawer1stEd">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">AI Confidence</span>
+              <span class="detail-value" id="drawerConfidence">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">Price Source</span>
+              <span class="detail-value" id="drawerPriceSource">—</span>
+            </div>
+          </div>
+          <button class="btn-danger-outline" id="deleteCardBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+            Remove from Portfolio
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="script.js"></script>
 </body>
-
 </html>

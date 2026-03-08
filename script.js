@@ -183,6 +183,11 @@ function connectSSE() {
                 // Update modal status text if upload is in progress
                 if (STATE.uploadInProgress && data.message) {
                     DOM.uploadStatus.textContent = data.message;
+                    if (data.activityType === 'error') {
+                        STATE.uploadInProgress = false;
+                        resetUploadButton();
+                        setTimeout(closeUploadModal, 4000);
+                    }
                 }
             }
         } catch (err) { console.error('SSE parse error:', err); }
@@ -467,7 +472,7 @@ function closeUploadModal() {
 }
 
 function handleFiles(fileList) {
-    const newFiles = [...fileList].filter(f => f.type.startsWith('image/') || /\.(heic|heif|dng|cr2|nef|arw|raw)$/i.test(f.name));
+    const newFiles = [...fileList].filter(f => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name));
     STATE.files = [...STATE.files, ...newFiles];
 
     DOM.filePreviews.innerHTML = '';

@@ -14,6 +14,8 @@ const STATE = {
     sortDir: 'desc',
     files: [],
     eventSource: null,
+    uploadInProgress: false,
+    viewMode: 'grid',  // 'table' or 'grid'
 };
 
 // ═══════════════════════════════════════════════════
@@ -33,9 +35,12 @@ const DOM = {
     statLoser: $('#statLoser'),
     statLoserChange: $('#statLoserChange'),
 
-    // Table
+    // Views
+    viewControls: $('#viewControls'),
     emptyState: $('#emptyState'),
     tableWrapper: $('#tableWrapper'),
+    gridWrapper: $('#gridWrapper'),
+    cardGrid: $('#cardGrid'),
     portfolioBody: $('#portfolioBody'),
 
     // Upload Modal
@@ -102,6 +107,10 @@ function initEventListeners() {
     // Refresh prices
     $('#btnRefreshPrices').addEventListener('click', refreshPrices);
 
+    // View toggle
+    $('#btnTableView').addEventListener('click', () => setViewMode('table'));
+    $('#btnGridView').addEventListener('click', () => setViewMode('grid'));
+
     // Sort headers
     $$('.sortable').forEach(th => {
         th.addEventListener('click', () => {
@@ -112,7 +121,7 @@ function initEventListeners() {
                 STATE.sortField = field;
                 STATE.sortDir = 'desc';
             }
-            renderTable();
+            renderPortfolio();
         });
     });
 
@@ -123,6 +132,13 @@ function initEventListeners() {
             closeDrawer();
         }
     });
+}
+
+function setViewMode(mode) {
+    STATE.viewMode = mode;
+    $('#btnTableView').classList.toggle('active', mode === 'table');
+    $('#btnGridView').classList.toggle('active', mode === 'grid');
+    renderPortfolio();
 }
 
 // ═══════════════════════════════════════════════════
@@ -136,7 +152,7 @@ async function fetchPortfolio() {
         STATE.cards = data.cards || [];
         STATE.stats = data.stats || { totalCards: 0, totalValue: 0, prevValue: 0 };
         renderStats();
-        renderTable();
+        renderPortfolio();
     } catch (err) {
         console.error('Failed to fetch portfolio:', err);
     }
@@ -155,8 +171,19 @@ function connectSSE() {
             const data = JSON.parse(e.data);
             if (data.type === 'portfolio_updated') {
                 fetchPortfolio();
+                // If an upload is in progress, close modal and show success
+                if (STATE.uploadInProgress) {
+                    STATE.uploadInProgress = false;
+                    closeUploadModal();
+                    resetUploadButton();
+                    showToast('Cards added to your portfolio!');
+                }
             } else if (data.type === 'activity') {
                 showToast(data.message);
+                // Update modal status text if upload is in progress
+                if (STATE.uploadInProgress && data.message) {
+                    DOM.uploadStatus.textContent = data.message;
+                }
             }
         } catch (err) { console.error('SSE parse error:', err); }
     };
@@ -218,23 +245,37 @@ function renderStats() {
 }
 
 // ═══════════════════════════════════════════════════
-//  RENDERING: TABLE
+//  RENDERING: PORTFOLIO (table + grid)
 // ═══════════════════════════════════════════════════
 
-function renderTable() {
-    const cards = [...STATE.cards];
+function renderPortfolio() {
+    const cards = getSortedCards();
 
     // Show/hide empty state
     if (cards.length === 0) {
         DOM.emptyState.style.display = 'flex';
         DOM.tableWrapper.style.display = 'none';
+        DOM.gridWrapper.style.display = 'none';
+        DOM.viewControls.style.display = 'none';
         return;
     }
 
     DOM.emptyState.style.display = 'none';
-    DOM.tableWrapper.style.display = 'block';
+    DOM.viewControls.style.display = 'flex';
 
-    // Sort
+    if (STATE.viewMode === 'grid') {
+        DOM.tableWrapper.style.display = 'none';
+        DOM.gridWrapper.style.display = 'block';
+        renderGrid(cards);
+    } else {
+        DOM.tableWrapper.style.display = 'block';
+        DOM.gridWrapper.style.display = 'none';
+        renderTable(cards);
+    }
+}
+
+function getSortedCards() {
+    const cards = [...STATE.cards];
     cards.sort((a, b) => {
         let valA, valB;
         if (STATE.sortField === 'name') {
@@ -250,7 +291,35 @@ function renderTable() {
         }
         return STATE.sortDir === 'asc' ? valA - valB : valB - valA;
     });
+    return cards;
+}
 
+function getCardImageHtml(card, size = 'thumb') {
+    const imgUrl = card.image_url || card.image_data;
+    if (imgUrl) {
+        const cls = size === 'large' ? 'card-image-large' : 'card-thumb';
+        return `<img class="${cls}" src="${escapeAttr(imgUrl)}" alt="${esc(card.card_name)}" loading="lazy">`;
+    }
+    return `<div class="card-thumb-placeholder">🃏</div>`;
+}
+
+function getSourceBadge(source) {
+    if (!source) return '';
+    const labels = {
+        'ebay': 'eBay',
+        'tcgplayer': 'TCGPlayer',
+        'ai_estimate': 'AI Est.',
+        'initial': 'Initial',
+        'known_value': 'Known',
+        'market': 'Market',
+    };
+    const verified = ['ebay', 'tcgplayer', 'known_value', 'market'];
+    const label = labels[source] || source;
+    const cls = verified.includes(source) ? 'source-verified' : 'source-estimate';
+    return `<span class="source-badge ${cls}">${label}</span>`;
+}
+
+function renderTable(cards) {
     // Update sort indicators
     $$('.sortable').forEach(th => {
         th.classList.remove('sorted-asc', 'sorted-desc');
@@ -262,21 +331,16 @@ function renderTable() {
     // Render rows
     DOM.portfolioBody.innerHTML = cards.map(card => {
         const price = card.current_price || 0;
-        const prevPrice = card.previous_price || 0;
         const changePct = getChangePct(card);
         const changeDir = changePct > 0 ? 'positive' : changePct < 0 ? 'negative' : 'neutral';
         const changeArrow = changePct > 0 ? '↑' : changePct < 0 ? '↓' : '';
         const changeText = changePct !== 0 ? `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%` : '—';
 
-        const thumbHtml = card.image_data
-            ? `<img class="card-thumb" src="${escapeAttr(card.image_data)}" alt="">`
-            : `<div class="card-thumb-placeholder">🃏</div>`;
-
         return `
             <tr data-id="${card.id}" onclick="openCardDrawer(${card.id})">
                 <td class="cell-card" data-label="">
                     <div class="card-cell">
-                        ${thumbHtml}
+                        ${getCardImageHtml(card)}
                         <div>
                             <div class="card-name">${esc(card.card_name)}</div>
                             ${card.card_number ? `<div class="card-number">${esc(card.card_number)}</div>` : ''}
@@ -286,7 +350,10 @@ function renderTable() {
                 <td data-label="Set"><span class="rarity-badge">${esc(card.card_set || '—')}</span></td>
                 <td data-label="Rarity"><span class="rarity-badge">${esc(card.rarity || '—')}</span></td>
                 <td data-label="Condition"><span class="condition-badge">${esc(card.condition || '—')}</span></td>
-                <td class="price-cell" data-label="Price">${formatCurrency(price)}</td>
+                <td class="price-cell" data-label="Price">
+                    ${formatCurrency(price)}
+                    ${getSourceBadge(card.price_source)}
+                </td>
                 <td data-label="Change">
                     <span class="change-cell ${changeDir}">
                         <span class="change-arrow">${changeArrow}</span>
@@ -303,6 +370,39 @@ function renderTable() {
 
     // Load sparklines asynchronously
     cards.forEach(card => loadSparkline(card.id));
+}
+
+function renderGrid(cards) {
+    DOM.cardGrid.innerHTML = cards.map(card => {
+        const price = card.current_price || 0;
+        const changePct = getChangePct(card);
+        const changeDir = changePct > 0 ? 'positive' : changePct < 0 ? 'negative' : 'neutral';
+        const changeArrow = changePct > 0 ? '↑' : changePct < 0 ? '↓' : '';
+        const changeText = changePct !== 0 ? `${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%` : '';
+
+        const imgUrl = card.image_url || card.image_data;
+        const imgHtml = imgUrl
+            ? `<img class="grid-card-image" src="${escapeAttr(imgUrl)}" alt="${esc(card.card_name)}" loading="lazy">`
+            : `<div class="grid-card-placeholder">🃏</div>`;
+
+        return `
+            <div class="grid-card" onclick="openCardDrawer(${card.id})">
+                <div class="grid-card-img-wrapper">
+                    ${imgHtml}
+                    <button class="grid-card-delete" onclick="event.stopPropagation(); deleteCard(${card.id})" title="Remove">✕</button>
+                </div>
+                <div class="grid-card-info">
+                    <div class="grid-card-name">${esc(card.card_name)}</div>
+                    <div class="grid-card-set">${esc(card.card_set || '')}</div>
+                    <div class="grid-card-price-row">
+                        <span class="grid-card-price">${formatCurrency(price)}</span>
+                        ${changeText ? `<span class="grid-card-change ${changeDir}">${changeArrow} ${changeText}</span>` : ''}
+                    </div>
+                    <div class="grid-card-source">${getSourceBadge(card.price_source)}</div>
+                </div>
+            </div>
+        `;
+    }).join('');
 }
 
 // ═══════════════════════════════════════════════════
@@ -367,16 +467,29 @@ function closeUploadModal() {
 }
 
 function handleFiles(fileList) {
-    const newFiles = [...fileList].filter(f => f.type.startsWith('image/'));
+    const newFiles = [...fileList].filter(f => f.type.startsWith('image/') || /\.(heic|heif|dng|cr2|nef|arw|raw)$/i.test(f.name));
     STATE.files = [...STATE.files, ...newFiles];
 
     DOM.filePreviews.innerHTML = '';
     STATE.files.forEach(file => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'file-preview-item';
+
         const reader = new FileReader();
         reader.onload = () => {
             const img = document.createElement('img');
             img.src = reader.result;
-            DOM.filePreviews.appendChild(img);
+            img.alt = file.name;
+            img.onerror = () => {
+                // Browser can't render this format — show a placeholder
+                wrapper.innerHTML = `<div class="file-preview-fallback">🃏<span>${file.name.split('.').pop().toUpperCase()}</span></div>`;
+            };
+            wrapper.appendChild(img);
+            DOM.filePreviews.appendChild(wrapper);
+        };
+        reader.onerror = () => {
+            wrapper.innerHTML = `<div class="file-preview-fallback">🃏<span>${file.name.split('.').pop().toUpperCase()}</span></div>`;
+            DOM.filePreviews.appendChild(wrapper);
         };
         reader.readAsDataURL(file);
     });
@@ -393,9 +506,10 @@ function handleFiles(fileList) {
 async function submitUpload() {
     if (STATE.files.length === 0) return;
 
+    STATE.uploadInProgress = true;
     DOM.btnUploadSubmit.disabled = true;
     DOM.btnUploadSubmit.innerHTML = '<span class="spinner"></span><span>Scanning cards...</span>';
-    DOM.uploadStatus.textContent = 'Analyzing with Vision AI — this may take a minute...';
+    DOM.uploadStatus.textContent = `Processing ${STATE.files.length} photos...`;
 
     const formData = new FormData();
     STATE.files.forEach(f => formData.append('photos', f));
@@ -405,19 +519,42 @@ async function submitUpload() {
             method: 'POST',
             body: formData,
         });
+
+        // Guard against non-JSON responses (e.g. HTML error pages)
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            await resp.text();
+            throw new Error(resp.ok ? 'Unexpected server response' : `Server error (${resp.status})`);
+        }
+
         const data = await resp.json();
         if (data.success) {
-            DOM.uploadStatus.textContent = 'Processing... cards will appear as they are identified.';
+            DOM.uploadStatus.textContent = data.message || 'AI is analyzing your cards...';
+            // Safety timeout: if SSE never fires portfolio_updated, reset after 60s
+            setTimeout(() => {
+                if (STATE.uploadInProgress) {
+                    STATE.uploadInProgress = false;
+                    closeUploadModal();
+                    resetUploadButton();
+                    fetchPortfolio();
+                    showToast('Cards processed — check your portfolio!');
+                }
+            }, 60000);
         } else {
+            STATE.uploadInProgress = false;
             DOM.uploadStatus.textContent = `Error: ${data.message}`;
-            DOM.btnUploadSubmit.disabled = false;
-            DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
+            resetUploadButton();
         }
     } catch (err) {
-        DOM.uploadStatus.textContent = `Connection error: ${err.message}`;
-        DOM.btnUploadSubmit.disabled = false;
-        DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
+        STATE.uploadInProgress = false;
+        DOM.uploadStatus.textContent = `Upload failed: ${err.message}`;
+        resetUploadButton();
     }
+}
+
+function resetUploadButton() {
+    DOM.btnUploadSubmit.disabled = false;
+    DOM.btnUploadSubmit.innerHTML = '<span>Scan & Add to Portfolio</span>';
 }
 
 // ═══════════════════════════════════════════════════

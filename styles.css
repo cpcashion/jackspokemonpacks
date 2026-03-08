@@ -407,6 +407,32 @@ body {
     border: 1px solid var(--border);
 }
 
+.file-preview-item {
+    width: 56px;
+    height: 56px;
+    flex-shrink: 0;
+}
+
+.file-preview-fallback {
+    width: 56px;
+    height: 56px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: linear-gradient(135deg, #e0e7ff, #f0f0f0);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.4rem;
+    gap: 2px;
+}
+.file-preview-fallback span {
+    font-size: 0.55rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+}
+
 .upload-note {
     text-align: center;
     font-size: 0.82rem;
@@ -488,6 +514,175 @@ body {
 .price-date { color: var(--text-muted); }
 .price-amount { font-weight: 600; font-variant-numeric: tabular-nums; }
 
+/* ── View Toggle ── */
+.view-controls {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 12px;
+}
+
+.view-toggle {
+    display: inline-flex;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+
+.view-btn {
+    background: transparent;
+    border: none;
+    padding: 7px 10px;
+    cursor: pointer;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+}
+.view-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+.view-btn.active { color: var(--accent); background: #eff6ff; }
+.view-btn + .view-btn { border-left: 1px solid var(--border); }
+
+/* ── Source Badges ── */
+.source-badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+.source-badge.source-verified {
+    color: #065f46;
+    background: #d1fae5;
+}
+.source-badge.source-estimate {
+    color: #92400e;
+    background: #fef3c7;
+}
+
+/* ── Grid View ── */
+.grid-wrapper {
+    padding-bottom: 20px;
+}
+
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+}
+
+.grid-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    position: relative;
+}
+.grid-card:hover {
+    border-color: var(--accent);
+    box-shadow: var(--shadow-lg);
+    transform: translateY(-2px);
+}
+
+.grid-card-img-wrapper {
+    position: relative;
+    background: linear-gradient(135deg, #e8ecf3, #f3f4f6);
+    aspect-ratio: 5/7;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.grid-card-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.grid-card-placeholder {
+    font-size: 3rem;
+    opacity: 0.3;
+}
+
+.grid-card-delete {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.5);
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    font-size: 0.7rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.grid-card:hover .grid-card-delete { opacity: 1; }
+.grid-card-delete:hover { background: var(--red); }
+
+.grid-card-info {
+    padding: 10px 12px 12px;
+}
+
+.grid-card-name {
+    font-weight: 600;
+    font-size: 0.87rem;
+    color: var(--text-primary);
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.grid-card-set {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.grid-card-price-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.grid-card-price {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.grid-card-change {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+}
+.grid-card-change.positive { color: var(--green); background: var(--green-bg); }
+.grid-card-change.negative { color: var(--red); background: var(--red-bg); }
+
+.grid-card-source {
+    margin-top: 4px;
+}
+
 /* ── Responsive ── */
 @media (max-width: 768px) {
     html { font-size: 14px; }
@@ -536,6 +731,8 @@ body {
     .portfolio-table td.cell-card::before { display: none; }
     .col-chart, .col-set { display: none; }
 
+    .card-grid { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+
     .drawer { width: 100vw; }
 }
 
@@ -543,6 +740,9 @@ body {
     .stats-bar {
         grid-template-columns: 1fr;
     }
+    .card-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .grid-card-name { font-size: 0.8rem; }
+    .grid-card-price { font-size: 0.87rem; }
 }
 
 /* ── Loading Spinner ── */

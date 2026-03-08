@@ -19,6 +19,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import puppeteer from 'puppeteer';
 import multer from 'multer';
+import sharp from 'sharp';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -116,6 +117,7 @@ db.exec(`
     is_first_edition INTEGER DEFAULT 0,
     confidence REAL DEFAULT 0,
     image_data TEXT DEFAULT '',
+    image_url TEXT DEFAULT '',
     notes TEXT DEFAULT '',
     added_at TEXT DEFAULT (datetime('now'))
   );
@@ -132,14 +134,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
 `);
 
+// Add image_url column if it doesn't exist (migration for existing DBs)
+try {
+    db.exec(`ALTER TABLE portfolio_cards ADD COLUMN image_url TEXT DEFAULT ''`);
+    console.log('  [DB] Added image_url column.');
+} catch { /* column already exists */ }
+
 // ── Portfolio DB helpers ──
 function insertPortfolioCard(card) {
-    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, notes)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
         card.condition || 'Unknown', card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
-        card.confidence || 0, card.image_data || '', card.notes || ''
+        card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || ''
     );
+}
+
+function updateCardImageUrl(cardId, imageUrl) {
+    db.prepare(`UPDATE portfolio_cards SET image_url = ? WHERE id = ?`).run(imageUrl, cardId);
 }
 
 function insertPricePoint(cardId, price, source) {
@@ -151,7 +163,8 @@ function getAllPortfolioCards() {
     return db.prepare(`
         SELECT pc.*,
             (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) as current_price,
-            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1 OFFSET 1) as previous_price
+            (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1 OFFSET 1) as previous_price,
+            (SELECT ph.source FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) as price_source
         FROM portfolio_cards pc
         ORDER BY (SELECT ph.price FROM price_history ph WHERE ph.card_id = pc.id ORDER BY ph.recorded_at DESC LIMIT 1) DESC
     `).all();
@@ -190,6 +203,58 @@ function getCachedPrice(name, set) {
     const r = db.prepare(`SELECT market_price FROM identified_cards WHERE card_name=? AND card_set=?
     AND market_price IS NOT NULL AND created_at>datetime('now','-24 hours') ORDER BY created_at DESC LIMIT 1`).get(name, set || '');
     return r ? r.market_price : null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TCGDEX IMAGE LOOKUP (free, no API key)
+// ═══════════════════════════════════════════════════════════════
+
+async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
+    try {
+        const searchName = encodeURIComponent(cardName.trim());
+        const resp = await axios.get(`https://api.tcgdex.net/v2/en/cards?name=${searchName}`, {
+            timeout: 10000,
+            headers: { 'Accept': 'application/json' }
+        });
+        const results = resp.data;
+        if (!Array.isArray(results) || results.length === 0) return null;
+
+        // Try to match by card number first (most specific)
+        if (cardNumber) {
+            const numClean = cardNumber.replace(/^0+/, '').split('/')[0];
+            const byNumber = results.find(r => {
+                const localClean = (r.localId || '').replace(/^0+/, '');
+                return localClean === numClean;
+            });
+            if (byNumber) return byNumber.image + '/high.webp';
+        }
+
+        // Try to match by set name
+        if (cardSet) {
+            // Need to fetch full card details to check set name
+            for (const candidate of results.slice(0, 5)) {
+                try {
+                    const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
+                        timeout: 8000,
+                        headers: { 'Accept': 'application/json' }
+                    });
+                    if (detail.data.set && detail.data.set.name) {
+                        const setNameLower = detail.data.set.name.toLowerCase();
+                        const targetSetLower = cardSet.toLowerCase();
+                        if (setNameLower.includes(targetSetLower) || targetSetLower.includes(setNameLower)) {
+                            return candidate.image + '/high.webp';
+                        }
+                    }
+                } catch { /* skip */ }
+            }
+        }
+
+        // Fallback: use first result
+        return results[0].image + '/high.webp';
+    } catch (err) {
+        console.error(`  [TCGdex] Error looking up "${cardName}":`, err.message);
+        return null;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -237,13 +302,45 @@ function parseAiJson(text) {
     }
 }
 
+// MIME types that Gemini accepts directly
+const GEMINI_SUPPORTED_TYPES = new Set([
+    'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif'
+]);
+
+async function convertToJpeg(buffer) {
+    try {
+        const converted = await sharp(buffer)
+            .jpeg({ quality: 90 })
+            .toBuffer();
+        return converted;
+    } catch (err) {
+        console.error('  [Sharp] Conversion failed:', err.message);
+        return null;
+    }
+}
+
 async function analyzeImageBuffer(buffer, mimeType) {
     if (!geminiModel) return null;
     try {
-        const base64Data = buffer.toString('base64');
+        let sendBuffer = buffer;
+        let sendMime = mimeType;
+
+        // Convert unsupported formats (DNG, CR2, NEF, ARW, etc.) to JPEG
+        if (!GEMINI_SUPPORTED_TYPES.has(mimeType)) {
+            console.log(`  [Vision] Converting ${mimeType} → JPEG for Gemini...`);
+            const converted = await convertToJpeg(buffer);
+            if (!converted) {
+                console.error(`  [Vision] Could not convert ${mimeType} — skipping`);
+                return null;
+            }
+            sendBuffer = converted;
+            sendMime = 'image/jpeg';
+        }
+
+        const base64Data = sendBuffer.toString('base64');
         const result = await geminiModel.generateContent([
             CARD_ID_PROMPT,
-            { inlineData: { data: base64Data, mimeType } }
+            { inlineData: { data: base64Data, mimeType: sendMime } }
         ]);
         const text = result.response.text();
         return parseAiJson(text);
@@ -261,7 +358,10 @@ const priceCache = new Map();
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 }
+    limits: {
+        fileSize: 100 * 1024 * 1024, // 100MB per file
+        files: 50                     // up to 50 files at once
+    }
 });
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -299,48 +399,55 @@ function makeHeaders(extra = {}) {
 
 async function lookupMarketPrice(cardName, cardSet, cardNumber) {
     if (!cardName) return null;
-    const key = `${cardName}|${cardSet || ''}`.toLowerCase();
-
-    const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
-    const sourceUrl = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
+    const key = `${cardName}|${cardSet || ''}|${cardNumber || ''}`.toLowerCase();
 
     const cached = priceCache.get(key);
-    if (cached && Date.now() - cached.ts < 86400000) return { price: cached.price, sourceUrl };
-
-    const dbCached = getCachedPrice(cardName, cardSet || '');
-    if (dbCached) {
-        priceCache.set(key, { price: dbCached, ts: Date.now() });
-        return { price: dbCached, sourceUrl };
-    }
+    if (cached && Date.now() - cached.ts < 86400000) return { price: cached.price, source: cached.source };
 
     const known = checkKnownCards(cardName, cardSet);
     if (known) {
-        priceCache.set(key, { price: known, ts: Date.now() });
-        return { price: known, sourceUrl };
+        priceCache.set(key, { price: known, source: 'known_value', ts: Date.now() });
+        return { price: known, source: 'known_value' };
     }
 
-    // Try eBay scrape for a live price
-    try {
-        const listings = await scrapeEbayRSS(`${cardName} ${cardSet || ''} pokemon card`);
-        if (listings.length > 0) {
-            // Filter out lots and graded, get median price
-            const filtered = listings.filter(l => {
-                const t = l.title.toLowerCase();
-                return !['lot', 'psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'orica', 'replica'].some(kw => t.includes(kw));
-            });
-            if (filtered.length > 0) {
-                filtered.sort((a, b) => a.price - b.price);
-                const medianPrice = filtered[Math.floor(filtered.length / 2)].price;
-                priceCache.set(key, { price: medianPrice, ts: Date.now() });
-                return { price: medianPrice, sourceUrl };
+    // Strategy 1: Specific eBay search with card number
+    const searchQueries = [
+        cardNumber ? `"${cardName}" ${cardNumber} pokemon card` : null,
+        `"${cardName}" ${cardSet || ''} pokemon card`,
+        `"${cardName}" pokemon card`,
+    ].filter(Boolean);
+
+    for (const query of searchQueries) {
+        try {
+            const listings = await scrapeEbayRSS(query);
+            if (listings.length > 0) {
+                const filtered = listings.filter(l => {
+                    const t = l.title.toLowerCase();
+                    return !['lot', 'bundle', 'psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'orica', 'replica', 'fake', 'repack'].some(kw => t.includes(kw));
+                });
+                if (filtered.length >= 2) {
+                    filtered.sort((a, b) => a.price - b.price);
+                    const medianPrice = filtered[Math.floor(filtered.length / 2)].price;
+                    console.log(`  [Pricing] eBay median for "${cardName}": $${medianPrice.toFixed(2)} (${filtered.length} listings)`);
+                    priceCache.set(key, { price: medianPrice, source: 'ebay', ts: Date.now() });
+                    return { price: medianPrice, source: 'ebay' };
+                } else if (filtered.length === 1) {
+                    const price = filtered[0].price;
+                    console.log(`  [Pricing] eBay single listing for "${cardName}": $${price.toFixed(2)}`);
+                    priceCache.set(key, { price, source: 'ebay', ts: Date.now() });
+                    return { price, source: 'ebay' };
+                }
             }
+            await sleep(RATE_LIMITS.ebay);
+        } catch (err) {
+            console.error(`  [Pricing] eBay scrape failed for "${cardName}":`, err.message);
         }
-    } catch (err) {
-        console.error(`  [Pricing] eBay scrape failed for ${cardName}:`, err.message);
     }
 
-    // Try TCGPlayer scrape
+    // Strategy 2: TCGPlayer scrape
     try {
+        const q = [cardName, cardSet, cardNumber].filter(Boolean).join(' ');
+        const sourceUrl = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
         await sleep(RATE_LIMITS.priceCheck);
         const resp = await axios.get(sourceUrl, { headers: makeHeaders(), timeout: 20000 });
         const { load } = await import('cheerio');
@@ -353,13 +460,15 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
             if (m) price = parseFloat(m[1].replace(',', ''));
         });
         if (price) {
-            priceCache.set(key, { price, ts: Date.now() });
-            return { price, sourceUrl };
+            console.log(`  [Pricing] TCGPlayer for "${cardName}": $${price.toFixed(2)}`);
+            priceCache.set(key, { price, source: 'tcgplayer', ts: Date.now() });
+            return { price, source: 'tcgplayer' };
         }
     } catch (err) {
         console.error(`  [Pricing] TCGPlayer scrape failed for ${cardName}:`, err.message);
     }
 
+    console.log(`  [Pricing] No market price found for "${cardName}"`);
     return null;
 }
 
@@ -440,17 +549,20 @@ async function refreshAllPrices() {
 
     for (const card of cards) {
         try {
+            // Also back-fill missing TCGdex images
+            if (!card.image_url) {
+                const imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
+                if (imageUrl) {
+                    updateCardImageUrl(card.id, imageUrl);
+                    console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
+                }
+            }
+
             const result = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
             if (result && result.price > 0) {
-                insertPricePoint(card.id, result.price, 'market');
+                insertPricePoint(card.id, result.price, result.source || 'market');
                 updated++;
-            } else if (card.id) {
-                // If no live price found, check if we have any price at all — if not, use AI estimate
-                const hasPrice = db.prepare('SELECT 1 FROM price_history WHERE card_id = ? LIMIT 1').get(card.id);
-                if (!hasPrice) {
-                    // No price exists at all, can't do much
-                    console.log(`  [PriceRefresh] No price found for ${card.card_name}`);
-                }
+                broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
             }
             await sleep(1500); // Rate limit between cards
         } catch (err) {
@@ -531,91 +643,125 @@ app.post('/api/portfolio/refresh-prices', async (req, res) => {
 });
 
 // Upload photos → AI identifies → saves to portfolio
-app.post('/api/portfolio/upload', upload.array('photos'), async (req, res) => {
-    try {
-        const files = req.files;
-        if (!files || files.length === 0) {
-            return res.status(400).json({ success: false, message: 'No photos provided.' });
+app.post('/api/portfolio/upload', (req, res) => {
+    const uploader = upload.array('photos');
+    uploader(req, res, (err) => {
+        if (err) {
+            // Multer errors (file too large, too many files, etc.) → return JSON
+            const message = err.code === 'LIMIT_FILE_SIZE'
+                ? `File too large. Max 100 MB per image.`
+                : err.code === 'LIMIT_FILE_COUNT'
+                    ? `Too many files. Max 50 images per upload.`
+                    : err.message || 'Upload failed.';
+            console.error('Upload error:', err.message);
+            return res.status(400).json({ success: false, message });
         }
 
-        broadcastActivity('upload_start', `Analyzing ${files.length} photos...`);
+        try {
+            const files = req.files;
+            if (!files || files.length === 0) {
+                return res.status(400).json({ success: false, message: 'No photos provided.' });
+            }
 
-        // Process asynchronously
-        processPortfolioUpload(files).catch(err => {
-            console.error('Portfolio upload error:', err);
-            broadcastActivity('error', `Upload error: ${err.message}`);
-        });
+            broadcastActivity('upload_start', `Analyzing ${files.length} photos...`);
 
-        res.json({ success: true, message: 'Processing started.' });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
+            // Process asynchronously
+            processPortfolioUpload(files).catch(err => {
+                console.error('Portfolio upload error:', err);
+                broadcastActivity('error', `Upload error: ${err.message}`);
+            });
+
+            res.json({ success: true, message: `Processing ${files.length} photos...` });
+        } catch (err) {
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
 });
 
 async function processPortfolioUpload(files) {
     let totalAdded = 0;
 
-    for (const [index, file] of files.entries()) {
-        try {
-            broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
+    broadcastActivity('analyzing', `Scanning ${files.length} photos with AI (parallel)...`);
 
-            const analysis = await analyzeImageBuffer(file.buffer, file.mimetype);
-            if (!analysis || !analysis.cards || analysis.cards.length === 0) {
-                broadcastActivity('info', `No cards found in photo ${index + 1}.`);
-                continue;
-            }
-
-            broadcastActivity('found', `Found ${analysis.cards.length} cards in photo ${index + 1}`);
-
-            // Create a small thumbnail from the uploaded image
-            const thumbBase64 = file.buffer.toString('base64');
-            const thumbDataUrl = `data:${file.mimetype};base64,${thumbBase64}`;
-
-            for (const card of analysis.cards) {
-                // Insert card into portfolio
-                const result = insertPortfolioCard({
-                    card_name: card.card_name,
-                    card_set: card.card_set || '',
-                    card_number: card.card_number || '',
-                    rarity: card.rarity || 'Unknown',
-                    condition: card.condition_estimate || 'Unknown',
-                    is_holo: card.is_holographic || false,
-                    is_first_edition: card.is_first_edition || false,
-                    confidence: card.confidence || 0,
-                    image_data: analysis.cards.length === 1 ? thumbDataUrl : '',
-                    notes: card.notes || ''
-                });
-
-                const cardId = result.lastInsertRowid;
-
-                // Get initial market price
-                let price = card.estimated_value_usd || 0;
+    // 1. Analyze ALL images in parallel with Gemini — this is the big speedup
+    const analysisResults = await Promise.all(
+        files.map(async (file, index) => {
+            try {
+                const analysis = await analyzeImageBuffer(file.buffer, file.mimetype);
+                // Always create a JPEG thumbnail using sharp
+                let thumbDataUrl = '';
                 try {
-                    const marketResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
-                    if (marketResult && marketResult.price > 0) {
-                        price = marketResult.price;
-                    }
-                } catch (err) {
-                    console.error(`  Price lookup failed for ${card.card_name}:`, err.message);
+                    const thumbBuffer = await sharp(file.buffer)
+                        .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
+                        .jpeg({ quality: 80 })
+                        .toBuffer();
+                    thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
+                } catch (thumbErr) {
+                    console.error(`  [Thumb] Failed for photo ${index + 1}:`, thumbErr.message);
                 }
-
-                // Record initial price
-                if (price > 0) {
-                    insertPricePoint(cardId, price, 'initial');
-                }
-
-                totalAdded++;
-                broadcastActivity('card_added', `Added ${card.card_name} — $${price.toFixed(2)}`);
-                await sleep(500); // Small delay between price lookups
+                return { index, file, analysis, thumbDataUrl };
+            } catch (err) {
+                console.error(`Photo ${index + 1} AI error:`, err.message);
+                return { index, file, analysis: null, thumbDataUrl: '' };
             }
-        } catch (err) {
-            console.error(`Photo ${index + 1} error:`, err.message);
-            broadcastActivity('error', `Error on photo ${index + 1}: ${err.message}`);
+        })
+    );
+
+    // 2. Insert all identified cards and look up TCGdex images
+    const cardIds = [];
+    for (const { index, file, analysis, thumbDataUrl } of analysisResults) {
+        if (!analysis || !analysis.cards || analysis.cards.length === 0) {
+            broadcastActivity('info', `No cards found in photo ${index + 1}.`);
+            continue;
+        }
+
+        broadcastActivity('found', `Found ${analysis.cards.length} card(s) in photo ${index + 1}`);
+
+        for (const card of analysis.cards) {
+            // Look up official card image from TCGdex
+            let imageUrl = '';
+            try {
+                imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
+            } catch { /* continue without image */ }
+
+            const result = insertPortfolioCard({
+                card_name: card.card_name,
+                card_set: card.card_set || '',
+                card_number: card.card_number || '',
+                rarity: card.rarity || 'Unknown',
+                condition: card.condition_estimate || 'Unknown',
+                is_holo: card.is_holographic || false,
+                is_first_edition: card.is_first_edition || false,
+                confidence: card.confidence || 0,
+                image_data: thumbDataUrl,
+                image_url: imageUrl,
+                notes: card.notes || ''
+            });
+
+            const cardId = result.lastInsertRowid;
+            cardIds.push(cardId);
+
+            // Use AI estimated price immediately — no slow marketplace scraping
+            const price = card.estimated_value_usd || 0;
+            if (price > 0) {
+                insertPricePoint(cardId, price, 'ai_estimate');
+            }
+
+            totalAdded++;
+            const imgStatus = imageUrl ? '🖼️' : '';
+            broadcastActivity('card_added', `Added ${card.card_name} ${imgStatus} — $${price.toFixed(2)} (AI est.)`);
         }
     }
 
     broadcastActivity('upload_complete', `Added ${totalAdded} cards to your portfolio!`);
     broadcast({ type: 'portfolio_updated' });
+
+    // 3. Kick off a background price refresh to get real market prices
+    //    This runs AFTER the user already sees their cards
+    if (totalAdded > 0) {
+        broadcastActivity('info', 'Fetching live market prices in background...');
+        refreshAllPrices().catch(err => console.error('[Post-upload refresh] Error:', err.message));
+    }
 }
 
 // SSE endpoint

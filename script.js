@@ -563,7 +563,8 @@ function openDrawer(card) {
     drawerChange.textContent = `${delta >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(2)}% (${sign}${fmt(delta)})`;
     drawerChange.className = `drawer-change ${pct >= 0 ? 'badge-positive' : 'badge-negative'}`;
   } else {
-    drawerChange.textContent = '';
+    drawerChange.textContent = 'New Tracking';
+    drawerChange.className = 'drawer-change badge-neutral';
   }
 
   const imgSrc = card.image_url || card.image_data || '';
@@ -594,6 +595,11 @@ function openDrawer(card) {
   priceChartDays = 7;
   document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
   document.querySelector('.chart-tab[data-days="7"]').classList.add('active');
+  
+  // Hide empty state initially
+  const emptyState = document.getElementById('chartEmptyState');
+  if (emptyState) emptyState.style.display = 'none';
+  
   fetchAndDrawChart(card.id, 7);
 }
 
@@ -642,9 +648,27 @@ async function fetchAndDrawChart(cardId, days) {
 
 function drawChart(pts) {
   const canvas = document.getElementById('priceChart');
-  if (!canvas) return;
+  let emptyState = document.getElementById('chartEmptyState');
+  
+  if (!emptyState && canvas) {
+    emptyState = document.createElement('div');
+    emptyState.id = 'chartEmptyState';
+    emptyState.className = 'chart-empty-state';
+    emptyState.innerHTML = '<span class="empty-icon">📈</span><br><strong>Tracking Began Today</strong><p>Historical charts will populate tomorrow as daily market checks are recorded.</p>';
+    canvas.parentElement.appendChild(emptyState);
+  }
 
+  if (!canvas) return;
   if (chartInstance) chartInstance.destroy();
+
+  if (pts.length <= 1) {
+    canvas.style.display = 'none';
+    if (emptyState) emptyState.style.display = 'flex';
+    return;
+  } else {
+    canvas.style.display = 'block';
+    if (emptyState) emptyState.style.display = 'none';
+  }
 
   const labels = pts.map(p => {
     const d = new Date(p.recorded_at);

@@ -261,8 +261,8 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
 let geminiModel = null;
 if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash)');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.5 Flash)');
 } else {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }

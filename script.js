@@ -513,9 +513,13 @@ async function processFiles(files) {
       const cards = data.cards || data.results || [];
       if (cards.length > 0) {
         const c = cards[0];
-        statusEl.textContent = `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
+        if (cards.length > 1) {
+            statusEl.textContent = `✅ Found ${cards.length} cards (incl. ${c.card_name || 'Unknown'})`;
+        } else {
+            statusEl.textContent = `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
+        }
         icon.textContent = '✅';
-        success++;
+        success += cards.length;
       } else {
         statusEl.textContent = '⚠️ No card detected in image';
         icon.textContent = '⚠️';

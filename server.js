@@ -648,8 +648,8 @@ function broadcast(event) {
     }
 }
 
-function broadcastActivity(type, message) {
-    broadcast({ type: 'activity', activityType: type, message, timestamp: new Date().toISOString() });
+function broadcastActivity(type, message, data = null) {
+    broadcast({ type: 'activity', activityType: type, message, data, timestamp: new Date().toISOString() });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -859,6 +859,19 @@ async function processPortfolioUpload(files) {
                 imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
             } catch { /* continue without image */ }
 
+            // Inline synchronous market price fetch
+            let finalPrice = card.estimated_value_usd || 0;
+            let finalSource = 'ai_estimate';
+            try {
+                const priceResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
+                if (priceResult && priceResult.price > 0) {
+                    finalPrice = priceResult.price;
+                    finalSource = priceResult.source;
+                }
+            } catch (err) {
+                console.error(`  [Pricing] Error fetching inline price for ${card.card_name}:`, err.message);
+            }
+
             const dbResult = insertPortfolioCard({
                 card_name: card.card_name,
                 card_set: card.card_set || '',
@@ -875,14 +888,13 @@ async function processPortfolioUpload(files) {
 
             const cardId = dbResult.lastInsertRowid;
 
-            // Use AI estimate as initial price — background refresh will add real prices
-            const aiPrice = card.estimated_value_usd || 0;
-            if (aiPrice > 0) {
-                insertPricePoint(cardId, aiPrice, 'ai_estimate');
+            if (finalPrice > 0) {
+                insertPricePoint(cardId, finalPrice, finalSource);
             }
 
             totalAdded++;
-            addedCards.push({
+
+            const finalCardData = {
                 id: cardId,
                 card_name: card.card_name,
                 card_set: card.card_set || '',
@@ -894,24 +906,21 @@ async function processPortfolioUpload(files) {
                 confidence: card.confidence || 0,
                 image_url: imageUrl || '',
                 image_data: thumbDataUrl ? thumbDataUrl.substring(0, 100) + '...' : '',  // truncate for response
-                current_price: aiPrice,
-                estimated_value: aiPrice,
-                price_source: 'ai_estimate',
-            });
+                current_price: finalPrice,
+                estimated_value: finalPrice,
+                price_source: finalSource,
+            };
 
-            broadcastActivity('card_added', `✅ ${card.card_name} — $${aiPrice.toFixed(2)} (AI estimate)${imageUrl ? ' 🖼️' : ''}`);
+            addedCards.push(finalCardData);
+
+            // Stream the newly found card to the frontend immediately!
+            broadcastActivity('card_added_detail', `✅ ${card.card_name}`, finalCardData);
+            broadcast({ type: 'card_added' });
         }
     }
 
     broadcastActivity('upload_complete', `Added ${totalAdded} card${totalAdded !== 1 ? 's' : ''} to your portfolio!`);
-    broadcast({ type: 'card_added' });
 
-    // Fire-and-forget: get real market prices after user sees cards
-    if (totalAdded > 0) {
-        setTimeout(() => {
-            refreshAllPrices().catch(err => console.error('[Post-upload refresh] Error:', err.message));
-        }, 2000);
-    }
 
     return { totalAdded, cards: addedCards };
 }

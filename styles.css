@@ -675,6 +675,67 @@ body {
   flex-shrink: 0;
 }
 
+.queue-card-detail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #fdfdfd;
+  border: 1px solid var(--color-border);
+  padding: 8px 12px;
+  border-radius: 8px;
+  margin-top: 8px;
+  animation: fadeUp 0.3s ease-out;
+}
+
+.queue-mini-img {
+  width: 32px;
+  height: 45px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.queue-mini-placeholder {
+  width: 32px;
+  height: 45px;
+  background: #f3f4f6;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+}
+
+.queue-mini-info {
+  flex: 1;
+}
+
+.queue-mini-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--color-text);
+}
+
+.queue-mini-set {
+  font-weight: 400;
+  color: var(--color-text-muted);
+  margin-left: 6px;
+}
+
+.queue-mini-price {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-positive);
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 /* ── CARD DETAIL DRAWER ──────────────────────────────────────── */
 .drawer-overlay {
   display: none;

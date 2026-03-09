@@ -720,6 +720,28 @@ function connectSSE() {
       if (msg.type === 'card_added' || msg.type === 'prices_refreshed') {
         await fetchPortfolio();
       }
+      
+      // Real-time upload UI stream
+      if (msg.type === 'activity' && document.getElementById('uploadModal').classList.contains('open')) {
+        if (msg.activityType === 'card_added_detail' && msg.data) {
+          const c = msg.data;
+          const qItems = document.getElementById('queueItems');
+          if (qItems) {
+            const div = document.createElement('div');
+            div.className = 'queue-card-detail';
+            const imgSrc = c.image_url || c.image_data || '';
+            div.innerHTML = `
+              ${imgSrc ? `<img src="${imgSrc}" class="queue-mini-img" onerror="this.outerHTML='<div class=\\'queue-mini-placeholder\\'>🃏</div>'">` : `<div class="queue-mini-placeholder">🃏</div>`}
+              <div class="queue-mini-info">
+                <div class="queue-mini-name">${c.card_name || 'Unknown'} <span class="queue-mini-set">${c.card_set || ''}</span></div>
+                <div class="queue-mini-price">${fmt(c.current_price)} <span class="source-badge" style="font-size:0.65rem;">${c.price_source || 'market'}</span></div>
+              </div>
+            `;
+            qItems.appendChild(div);
+            qItems.scrollTop = qItems.scrollHeight;
+          }
+        }
+      }
     } catch {}
   };
   evtSource.onerror = () => {

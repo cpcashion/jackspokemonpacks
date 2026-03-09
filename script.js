@@ -440,7 +440,7 @@ dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.name.match(/\.(heic|heif)$/i));
+  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.name.match(/\.(heic|heif|dng|cr2|nef|arw|raw)$/i));
   if (files.length) processFiles(files);
 });
 fileInput.addEventListener('change', () => {

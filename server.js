@@ -20,6 +20,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import multer from 'multer';
 import sharp from 'sharp';
+import { execSync } from 'child_process';
+import * as cheerio from 'cheerio';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -304,37 +306,42 @@ const GEMINI_SUPPORTED_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif'
 ]);
 
-async function convertToJpeg(buffer) {
+async function convertToJpeg(buffer, filePath) {
     try {
         const converted = await sharp(buffer)
+            .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
             .jpeg({ quality: 90 })
             .toBuffer();
         return converted;
     } catch (err) {
-        console.error('  [Sharp] Conversion failed:', err.message);
-        return null;
+        if (!filePath) {
+            console.error('  [Sharp] Conversion failed and no file path available for fallback:', err.message);
+            return null;
+        }
+        console.log('  [Sharp] Decoding failed. Attempting OS-level RAW fallback (sips/convert)...');
+        try {
+            const outPath = filePath + '_converted.jpg';
+            try {
+                // Try macOS native sips
+                execSync(`sips -s format jpeg -Z 2048 "${filePath}" --out "${outPath}"`, { stdio: 'ignore' });
+            } catch (sipsErr) {
+                // Try Linux ImageMagick
+                execSync(`convert "${filePath}" -resize 2048x2048\\> "${outPath}"`, { stdio: 'ignore' });
+            }
+            const converted = readFileSync(outPath);
+            try { rmSync(outPath, { force: true }); } catch {}
+            return converted;
+        } catch (fallbackErr) {
+            console.error('  [Fallback Conversion] Failed:', fallbackErr.message);
+            return null;
+        }
     }
 }
 
 async function analyzeImageBuffer(buffer, mimeType) {
     if (!geminiModel) return null;
     try {
-        let sendBuffer = buffer;
-        let sendMime = mimeType;
-
-        // Convert unsupported formats (DNG, CR2, NEF, ARW, etc.) to JPEG
-        if (!GEMINI_SUPPORTED_TYPES.has(mimeType)) {
-            console.log(`  [Vision] Converting ${mimeType} → JPEG for Gemini...`);
-            const converted = await convertToJpeg(buffer);
-            if (!converted) {
-                console.error(`  [Vision] Could not convert ${mimeType} — skipping`);
-                return null;
-            }
-            sendBuffer = converted;
-            sendMime = 'image/jpeg';
-        }
-
-        const base64Data = sendBuffer.toString('base64');
+        const base64Data = buffer.toString('base64');
         const result = await geminiModel.generateContent({
             contents: [{
                 role: 'user',
@@ -511,15 +518,16 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
         if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
 
         // Build query — try card number + name, or just name
-        let searchUrl;
+        const params = { pageSize: 10 };
         if (cardNumber) {
             const num = cardNumber.split('/')[0].replace(/^0+/, '');
-            searchUrl = `https://api.pokemontcg.io/v2/cards?q=name:"${encodeURIComponent(cardName)}" number:${num}&pageSize=10`;
+            params.q = `name:"${cardName}" number:"${num}"`;
         } else {
-            searchUrl = `https://api.pokemontcg.io/v2/cards?q=name:"${encodeURIComponent(cardName)}"&orderBy=-tcgplayer.prices.holofoil.market&pageSize=10`;
+            params.q = `name:"${cardName}"`;
+            params.orderBy = '-tcgplayer.prices.holofoil.market';
         }
 
-        const resp = await axios.get(searchUrl, { headers, timeout: 15000 });
+        const resp = await axios.get('https://api.pokemontcg.io/v2/cards', { params, headers, timeout: 15000 });
         const results = resp.data?.data || [];
 
         // Try to match set if we have one
@@ -557,7 +565,7 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
         console.error(`  [Pricing] Pokemon TCG API failed for "${cardName}":`, err.message);
     }
 
-    // ── Strategy 2: eBay RSS (multiple query variants) ──
+    // ── Strategy 2: eBay HTML Scraper (sold listings fallback) ──
     const searchQueries = [
         cardNumber ? `"${cardName}" ${cardNumber} pokemon card` : null,
         `"${cardName}" ${cardSet || ''} pokemon card`,
@@ -566,7 +574,7 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
 
     for (const query of searchQueries) {
         try {
-            const listings = await scrapeEbayRSS(query);
+            const listings = await scrapeEbayHTML(query);
             if (listings.length > 0) {
                 const filtered = listings.filter(l => {
                     const t = l.title.toLowerCase();
@@ -596,43 +604,39 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  SCRAPERS (eBay RSS only for price lookups — fast and reliable)
+//  SCRAPERS (eBay HTML only for price lookups — reliable fallback)
 // ═══════════════════════════════════════════════════════════════
 
-async function scrapeEbayRSS(searchTerm) {
+async function scrapeEbayHTML(searchTerm) {
     const listings = [];
     try {
         const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&_sacat=183454&_sop=10&LH_BIN=1&_rss=1`;
+        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&LH_Sold=1&LH_Complete=1&_sop=13`;
         const resp = await axios.get(url, {
-            headers: { 'User-Agent': randomUA(), 'Accept': 'application/rss+xml,application/xml,text/xml' },
+            headers: { 
+                'User-Agent': randomUA(), 
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
             timeout: 20000,
         });
-        const { load } = await import('cheerio');
-        const $ = load(resp.data, { xmlMode: true });
-        $('item').each((i, el) => {
-            if (i >= 40) return false;
+        const $ = cheerio.load(resp.data);
+        $('.s-item__item').each((i, el) => {
+            if (listings.length >= 10) return false;
             const $el = $(el);
-            const title = $el.find('title').text().trim();
-            const link = $el.find('link').text().trim();
-            const itemId = link.match(/\/itm\/(\d+)/)?.[1];
-            const desc = $el.find('description').text();
-            const priceMatch = desc.match(/Price:\s*US\s*\$([\d,.]+)/i) || desc.match(/\$([\d,.]+)/);
-            const price = priceMatch ? parsePrice(priceMatch[1]) : 0;
-            const imgMatch = desc.match(/src="([^"]*ebayimg[^"]*)"/i);
-            const imgSrc = imgMatch ? imgMatch[1].replace(/s-l\d+/, 's-l500') : '';
-            if (title && itemId && price > 0) {
-                listings.push({
-                    id: `ebay_${itemId}`, marketplace: 'ebay', title, price,
-                    imageUrls: imgSrc ? [imgSrc] : [], listingUrl: link.split('?')[0],
-                    postedAt: new Date().toISOString()
-                });
+            const title = $el.find('.s-item__title').text().trim();
+            const text = $el.find('.s-item__price').text();
+            const match = text.match(/\$([\d,.]+)/);
+            if (title && match && !title.includes('Shop on eBay')) {
+                const price = parsePrice(match[1]);
+                if (price > 0.5) listings.push({ title, price });
             }
         });
+        return listings;
     } catch (err) {
-        console.error(`  [eBay-RSS] Error: ${err.message}`);
+        console.error(`  [eBay-HTML] Error: ${err.message}`);
+        return [];
     }
-    return listings;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -827,7 +831,19 @@ async function processPortfolioUpload(files) {
         let buffer, analysis, thumbDataUrl = '';
         try {
             buffer = readFileSync(file.path);
-            analysis = await analyzeImageBuffer(buffer, file.mimetype);
+            let sendMime = file.mimetype;
+
+            // Immediately convert raw/unsupported formats to JPEG so resizing/AI both work
+            if (!GEMINI_SUPPORTED_TYPES.has(sendMime)) {
+                console.log(`  [Vision] Converting ${sendMime} → JPEG for Gemini & Sharp...`);
+                const converted = await convertToJpeg(buffer, file.path);
+                if (converted) {
+                    buffer = converted;
+                    sendMime = 'image/jpeg';
+                }
+            }
+
+            analysis = await analyzeImageBuffer(buffer, sendMime);
 
             // Create thumbnail
             try {

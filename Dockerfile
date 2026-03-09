@@ -3,6 +3,7 @@ FROM node:20-slim
 # Install libvips for sharp image processing (used for DNG/HEIC conversion)
 RUN apt-get update && apt-get install -y \
     libvips-dev \
+    imagemagick \
     --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

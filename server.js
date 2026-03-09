@@ -25,6 +25,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const POKEMON_TCG_KEY = process.env.POKEMON_TCG_API_KEY || '';
+const SCRYDEX_API_KEY = process.env.SCRYDEX_API_KEY || '';
+const SCRYDEX_TEAM_ID = process.env.SCRYDEX_TEAM_ID || '';
 
 // ═══════════════════════════════════════════════════════════════
 //  CONFIG
@@ -259,8 +261,8 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
 let geminiModel = null;
 if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     const genAI = new GoogleGenerativeAI(GEMINI_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
-    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash Exp)');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    console.log('🤖 Vision AI: ✅ Enabled (Gemini 2.0 Flash)');
 } else {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
@@ -333,10 +335,18 @@ async function analyzeImageBuffer(buffer, mimeType) {
         }
 
         const base64Data = sendBuffer.toString('base64');
-        const result = await geminiModel.generateContent([
-            CARD_ID_PROMPT,
-            { inlineData: { data: base64Data, mimeType: sendMime } }
-        ]);
+        const result = await geminiModel.generateContent({
+            contents: [{
+                role: 'user',
+                parts: [
+                    { text: CARD_ID_PROMPT },
+                    { inlineData: { data: base64Data, mimeType: sendMime } }
+                ]
+            }],
+            generationConfig: {
+                responseMimeType: "application/json",
+            }
+        });
         const text = result.response.text();
         return parseAiJson(text);
     } catch (err) {
@@ -373,6 +383,78 @@ function checkKnownCards(name, set) {
     return null;
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  SCRYDEX API (primary price + image source)
+// ═══════════════════════════════════════════════════════════════
+
+function scrydexHeaders() {
+    const h = { 'Accept': 'application/json' };
+    if (SCRYDEX_API_KEY) h['X-Api-Key'] = SCRYDEX_API_KEY;
+    if (SCRYDEX_TEAM_ID) h['X-Team-ID'] = SCRYDEX_TEAM_ID;
+    return h;
+}
+
+async function fetchScrydexCard(cardName, cardSet, cardNumber) {
+    try {
+        // Build Lucene-style query
+        let q = `name:"${cardName}"`;
+        if (cardNumber) {
+            const num = cardNumber.split('/')[0].replace(/^0+/, '');
+            q += ` number:${num}`;
+        }
+        if (cardSet) {
+            // Try matching set name (partial)
+            q += ` expansion.name:"${cardSet}"`;
+        }
+
+        const url = `https://api.scrydex.com/pokemon/v1/cards?q=${encodeURIComponent(q)}&pageSize=5`;
+        const resp = await axios.get(url, { headers: scrydexHeaders(), timeout: 12000 });
+        const cards = resp.data?.data || [];
+        return cards[0] || null;
+    } catch (err) {
+        // Try a simpler query if the complex one fails
+        try {
+            const url = `https://api.scrydex.com/pokemon/v1/cards?q=${encodeURIComponent(`name:"${cardName}"`)}&pageSize=5`;
+            const resp = await axios.get(url, { headers: scrydexHeaders(), timeout: 12000 });
+            const cards = resp.data?.data || [];
+            return cards[0] || null;
+        } catch (err2) {
+            console.error(`  [Scrydex] Error for "${cardName}":`, err2.message);
+            return null;
+        }
+    }
+}
+
+function extractScrydexPrice(card) {
+    if (!card) return null;
+    // Scrydex card objects have tcgplayer and/or cardmarket price data embedded
+    const p = card.tcgplayer?.prices;
+    if (p) {
+        const price = p.holofoil?.market
+            || p.reverseHolofoil?.market
+            || p.normal?.market
+            || p['1stEditionHolofoil']?.market
+            || p.unlimited?.market
+            || p.holofoil?.mid
+            || p.normal?.mid
+            || null;
+        if (price && price > 0) return { price, source: 'scrydex_tcgplayer' };
+    }
+    const cm = card.cardmarket?.prices;
+    if (cm) {
+        const price = cm.averageSellPrice || cm.trendPrice || cm.avg7 || null;
+        if (price && price > 0) return { price, source: 'scrydex_cardmarket' };
+    }
+    return null;
+}
+
+function extractScrydexImage(card) {
+    if (!card) return null;
+    // Scrydex cards have images.large or images.small
+    return card.images?.large || card.images?.small || null;
+}
+
+
 // Rotating user agents
 const USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -406,6 +488,21 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
     if (known) {
         priceCache.set(key, { price: known, source: 'reference', ts: Date.now() });
         return { price: known, source: 'reference' };
+    }
+
+    // ── Strategy 0: Scrydex API (best source — has TCGPlayer + CardMarket embedded prices) ──
+    if (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) {
+        try {
+            const scrydexCard = await fetchScrydexCard(cardName, cardSet, cardNumber);
+            const result = extractScrydexPrice(scrydexCard);
+            if (result) {
+                console.log(`  [Pricing] Scrydex for "${cardName}": $${result.price.toFixed(2)} (${result.source})`);
+                priceCache.set(key, { ...result, ts: Date.now() });
+                return result;
+            }
+        } catch (err) {
+            console.error(`  [Pricing] Scrydex failed for "${cardName}":`, err.message);
+        }
     }
 
     // ── Strategy 1: Pokemon TCG API (free tier — 1000 req/day, has TCGPlayer market prices) ──
@@ -840,7 +937,8 @@ console.log(`
 ║  AI Vision + Live Market Prices                  ║
 ╚══════════════════════════════════════════════════╝
 `);
-console.log('💰 Pokemon TCG API:', POKEMON_TCG_KEY ? '✅ Key loaded' : '⚠️  No key (rate-limited)');
+console.log('🕑 Scrydex API:    ', (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) ? '✅ Enabled (primary price source)' : '⚠️  No credentials — add SCRYDEX_API_KEY + SCRYDEX_TEAM_ID');
+console.log('💰 Pokemon TCG API:', POKEMON_TCG_KEY ? '✅ Key loaded (fallback)' : '⚠️  No key (rate-limited fallback)');
 
 app.listen(PORT, () => {
     console.log(`🌐 Dashboard running at http://localhost:${PORT}`);

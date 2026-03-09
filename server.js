@@ -100,6 +100,9 @@ db.exec(`
     image_data TEXT DEFAULT '',
     image_url TEXT DEFAULT '',
     notes TEXT DEFAULT '',
+    year INTEGER DEFAULT 0,
+    language TEXT DEFAULT 'English',
+    holo_type TEXT DEFAULT 'Unknown',
     added_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -115,19 +118,28 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
 `);
 
-// Add image_url column if it doesn't exist (migration for existing DBs)
-try {
-    db.exec(`ALTER TABLE portfolio_cards ADD COLUMN image_url TEXT DEFAULT ''`);
-    console.log('  [DB] Added image_url column.');
-} catch { /* column already exists */ }
+// Add new columns if they don't exist (migration for existing DBs)
+const newCols = [
+    { name: 'image_url', type: "TEXT DEFAULT ''" },
+    { name: 'year', type: "INTEGER DEFAULT 0" },
+    { name: 'language', type: "TEXT DEFAULT 'English'" },
+    { name: 'holo_type', type: "TEXT DEFAULT 'Unknown'" }
+];
+for (const col of newCols) {
+    try {
+        db.exec(`ALTER TABLE portfolio_cards ADD COLUMN ${col.name} ${col.type}`);
+        console.log(`  [DB] Added ${col.name} column.`);
+    } catch { /* column already exists */ }
+}
 
 // ── Portfolio DB helpers ──
 function insertPortfolioCard(card) {
-    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
-        card.condition || 'Unknown', card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
-        card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || ''
+        card.condition_estimate || card.condition || 'Unknown', card.is_holographic || card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
+        card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
+        card.year || 0, card.language || 'English', card.holo_type || 'Unknown'
     );
 }
 
@@ -270,7 +282,7 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
 }
 
 const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
-Look closely at the card name, set symbol, card number, rarity, holographic patterns, 1st edition stamps, and condition.
+Look closely at the card name, set symbol, card number, rarity, holographic patterns, 1st edition stamps, language, copyright year, and condition.
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -281,6 +293,9 @@ Return ONLY valid JSON (no markdown fences):
     "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Illustration Rare|Unknown",
     "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
     "is_holographic": true/false,
+    "holo_type": "Holofoil|Reverse Holo|Non-Holo|Cosmos Holo|Unknown",
+    "year": 1999,
+    "language": "English|Japanese|Spanish|etc",
     "is_first_edition": true/false,
     "estimated_value_usd": number,
     "confidence": 0.0 to 1.0,
@@ -347,7 +362,7 @@ async function analyzeImageBuffer(buffer, mimeType) {
                 role: 'user',
                 parts: [
                     { text: CARD_ID_PROMPT },
-                    { inlineData: { data: base64Data, mimeType: sendMime } }
+                    { inlineData: { data: base64Data, mimeType: mimeType } }
                 ]
             }],
             generationConfig: {
@@ -484,7 +499,7 @@ function makeHeaders(extra = {}) {
     };
 }
 
-async function lookupMarketPrice(cardName, cardSet, cardNumber) {
+async function lookupMarketPrice(cardName, cardSet, cardNumber, year, language, holoType) {
     if (!cardName) return null;
     const key = `${cardName}|${cardSet || ''}|${cardNumber || ''}`.toLowerCase();
 
@@ -539,16 +554,31 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber) {
         if (!match) match = results[0];
 
         if (match) {
-            // Extract market price from TCGPlayer data (prefer holofoil > normal > 1st edition)
+            // Extract market price from TCGPlayer data using the exact holoType if possible
             const prices = match.tcgplayer?.prices;
             let price = null;
             if (prices) {
-                price = prices.holofoil?.market
-                    || prices.reverseHolofoil?.market
-                    || prices.normal?.market
-                    || prices['1stEditionHolofoil']?.market
-                    || prices.unlimited?.market
-                    || null;
+                const htLower = (holoType || '').toLowerCase();
+                // Exact matching attempts
+                if (htLower.includes('reverse') && prices.reverseHolofoil?.market) {
+                    price = prices.reverseHolofoil.market;
+                } else if (htLower.includes('1st edition') && prices['1stEditionHolofoil']?.market) {
+                    price = prices['1stEditionHolofoil'].market;
+                } else if (htLower === 'holofoil' && prices.holofoil?.market) {
+                    price = prices.holofoil.market;
+                } else if (htLower === 'non-holo' && prices.normal?.market) {
+                    price = prices.normal.market;
+                }
+                
+                // Fallbacks
+                if (!price) {
+                    price = prices.holofoil?.market
+                        || prices.reverseHolofoil?.market
+                        || prices.normal?.market
+                        || prices['1stEditionHolofoil']?.market
+                        || prices.unlimited?.market
+                        || null;
+                }
             }
             // Fallback to cardmarket
             if (!price && match.cardmarket?.prices) {
@@ -685,7 +715,7 @@ async function refreshAllPrices() {
                 }
             }
 
-            const result = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
+            const result = await lookupMarketPrice(card.card_name, card.card_set, card.card_number, card.year, card.language, card.holo_type);
             if (result && result.price > 0) {
                 insertPricePoint(card.id, result.price, result.source || 'market');
                 updated++;
@@ -879,7 +909,7 @@ async function processPortfolioUpload(files) {
             let finalPrice = card.estimated_value_usd || 0;
             let finalSource = 'ai_estimate';
             try {
-                const priceResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number);
+                const priceResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number, card.year, card.language, card.holo_type);
                 if (priceResult && priceResult.price > 0) {
                     finalPrice = priceResult.price;
                     finalSource = priceResult.source;

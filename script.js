@@ -579,7 +579,10 @@ function openDrawer(card) {
   setDetail('drawerNumber', card.card_number);
   setDetail('drawerRarity', card.rarity);
   setDetail('drawerCondition', card.condition);
+  setDetail('drawerYear', card.year > 0 ? card.year : '—');
+  setDetail('drawerLanguage', card.language);
   setDetail('drawerHolo', card.is_holo ? '✓ Yes' : 'No');
+  setDetail('drawerHoloType', card.holo_type);
   setDetail('drawer1stEd', card.is_first_edition ? '✓ Yes' : 'No');
   setDetail('drawerConfidence', card.confidence != null ? `${Math.round(card.confidence * 100)}%` : '—');
   setDetail('drawerPriceSource', card.price_source || '—');

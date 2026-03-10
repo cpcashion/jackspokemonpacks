@@ -103,6 +103,10 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
     `);
+
+    // Add missing columns if they don't exist
+    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN price_source_url TEXT DEFAULT \'\''); } catch {}
+    try { await pool.query('ALTER TABLE price_history ADD COLUMN source_url TEXT DEFAULT \'\''); } catch {}
 }
 initDB().catch(err => console.error("DB Init Error:", err));
 
@@ -125,8 +129,8 @@ async function updateCardImageUrl(cardId, imageUrl) {
     await pool.query(`UPDATE portfolio_cards SET image_url = $1 WHERE id = $2`, [imageUrl, cardId]);
 }
 
-async function insertPricePoint(cardId, price, source) {
-    await pool.query(`INSERT INTO price_history (card_id, price, source) VALUES ($1, $2, $3)`, [cardId, price, source || 'market']);
+async function insertPricePoint(cardId, price, source, sourceUrl = '') {
+    await pool.query(`INSERT INTO price_history (card_id, price, source, source_url) VALUES ($1, $2, $3, $4)`, [cardId, price, source || 'market', sourceUrl]);
 }
 
 async function getAllPortfolioCards(userId) {
@@ -137,12 +141,13 @@ async function getAllPortfolioCards(userId) {
                 card_id,
                 price,
                 source,
+                source_url,
                 recorded_at,
                 ROW_NUMBER() OVER (PARTITION BY card_id ORDER BY recorded_at DESC) as rn
             FROM price_history
         ),
         latest AS (
-            SELECT card_id, price as current_price, source as price_source FROM ranked_prices WHERE rn = 1
+            SELECT card_id, price as current_price, source as price_source, source_url as price_source_url FROM ranked_prices WHERE rn = 1
         ),
         prev AS (
             SELECT card_id, price as previous_price FROM ranked_prices WHERE rn = 2
@@ -150,7 +155,8 @@ async function getAllPortfolioCards(userId) {
         SELECT pc.*,
             COALESCE(l.current_price, NULL) as current_price,
             COALESCE(p.previous_price, NULL) as previous_price,
-            COALESCE(l.price_source, NULL) as price_source
+            COALESCE(l.price_source, NULL) as price_source,
+            COALESCE(l.price_source_url, NULL) as price_source_url
         FROM portfolio_cards pc
         LEFT JOIN latest l ON l.card_id = pc.id
         LEFT JOIN prev   p ON p.card_id  = pc.id

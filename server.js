@@ -230,7 +230,7 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
             const numClean = cardNumber.replace(/^0+/, '').split('/')[0];
             const byNumber = results.find(r => {
                 const localClean = (r.localId || '').replace(/^0+/, '');
-                return localClean === numClean;
+                return localClean === numClean && r.image;
             });
             if (byNumber) return byNumber.image + '/high.webp';
         }
@@ -238,7 +238,8 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
         // Try to match by set name
         if (cardSet) {
             // Need to fetch full card details to check set name
-            for (const candidate of results.slice(0, 5)) {
+            const withImage = results.filter(r => r.image).slice(0, 5);
+            for (const candidate of withImage) {
                 try {
                     const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
                         timeout: 8000,
@@ -255,12 +256,42 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
             }
         }
 
-        // Fallback: use first result
-        return results[0].image + '/high.webp';
+        // Fallback: use first result with image
+        const firstWithImage = results.find(r => r.image);
+        if (firstWithImage) return firstWithImage.image + '/high.webp';
+        
+        return null;
     } catch (err) {
         console.error(`  [TCGdex] Error looking up "${cardName}":`, err.message);
         return null;
     }
+}
+
+// Look up official high-res image from Pokemon TCG API (fallback)
+async function fetchCardImageFromPokemonTCG(cardName, cardSet, cardNumber) {
+    if (!cardName) return null;
+    try {
+        const headers = { 'Accept': 'application/json' };
+        if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
+
+        const params = { pageSize: 5 };
+        if (cardNumber) {
+            const num = cardNumber.split('/')[0].replace(/^0+/, '');
+            params.q = `name:"${cardName}" number:"${num}"`;
+        } else if (cardSet) {
+             params.q = `name:"${cardName}" set.name:"*${cardSet}*"`;
+        } else {
+            params.q = `name:"${cardName}"`;
+        }
+        const resp = await axios.get('https://api.pokemontcg.io/v2/cards', { params, headers, timeout: 8000 });
+        const results = resp.data?.data || [];
+        if (results.length > 0) {
+           return results[0].images?.large || results[0].images?.small || null;
+        }
+    } catch (err) {
+        console.error(`  [ImageScrape] Pokemon TCG API Failed for "${cardName}":`, err.message);
+    }
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -708,8 +739,11 @@ async function refreshAllPrices() {
     for (const card of cards) {
         try {
             // Also back-fill missing TCGdex images
-            if (!card.image_url) {
-                const imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
+            if (!card.image_url || card.image_url.includes('undefined')) {
+                let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
+                if (!imageUrl) {
+                    imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
+                }
                 if (imageUrl) {
                     await updateCardImageUrl(card.id, imageUrl);
                     console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
@@ -963,10 +997,13 @@ async function processPortfolioUpload(files, userId) {
         broadcastActivity('found', `Found ${analysis.cards.length} card(s) in photo ${index + 1}`);
 
         for (const card of analysis.cards) {
-            // Look up official card image from TCGdex
+            // Look up official card image from TCGdex, fallback to Pokemon TCG API
             let imageUrl = '';
             try {
                 imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
+                if (!imageUrl) {
+                    imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number) || '';
+                }
             } catch { /* continue without image */ }
 
             // Inline synchronous market price fetch

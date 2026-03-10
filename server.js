@@ -1059,8 +1059,8 @@ console.log(`
 console.log('🕑 Scrydex API:    ', (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) ? '✅ Enabled (primary price source)' : '⚠️  No credentials — add SCRYDEX_API_KEY + SCRYDEX_TEAM_ID');
 console.log('💰 Pokemon TCG API:', POKEMON_TCG_KEY ? '✅ Key loaded (fallback)' : '⚠️  No key (rate-limited fallback)');
 
-app.listen(PORT, () => {
-    console.log(`🌐 Dashboard running at http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🌐 Dashboard running at http://0.0.0.0:${PORT}`);
 });
 
 // Graceful shutdown

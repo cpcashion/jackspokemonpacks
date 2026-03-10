@@ -15,7 +15,11 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdirSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import Database from 'better-sqlite3';
+import pkg from 'pg';
+const { Pool } = pkg;
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import cookieParser from 'cookie-parser';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import multer from 'multer';
@@ -55,106 +59,79 @@ const RATE_LIMITS = { ebay: 1000, mercari: 2000, offerup: 2000, facebook: 2000, 
 //  DATABASE
 // ═══════════════════════════════════════════════════════════════
 
-mkdirSync(join(__dirname, 'data'), { recursive: true });
-const db = new Database(join(__dirname, 'data', 'pokesniper.db'));
-db.pragma('journal_mode = WAL');
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-please-change-in-prod';
+const DB_URL = process.env.DATABASE_URL || 'postgres://localhost:5432/pokesniper';
 
-// Legacy tables (kept for backward compat)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS listings (
-    id TEXT PRIMARY KEY, marketplace TEXT, title TEXT, price REAL,
-    image_urls TEXT, listing_url TEXT, posted_at TEXT, seller TEXT,
-    location TEXT, first_seen_at TEXT DEFAULT (datetime('now')),
-    watchers INTEGER DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS identified_cards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id TEXT,
-    card_name TEXT, card_set TEXT, card_number TEXT, rarity TEXT,
-    condition_est TEXT, is_holo INTEGER DEFAULT 0, is_1st_ed INTEGER DEFAULT 0,
-    confidence REAL DEFAULT 0, market_price REAL,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (listing_id) REFERENCES listings(id)
-  );
-  CREATE TABLE IF NOT EXISTS deals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, listing_id TEXT, card_id INTEGER,
-    listing_price REAL, market_price REAL, discount_pct REAL,
-    deal_tier TEXT, deal_score REAL, created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (listing_id) REFERENCES listings(id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_deals_score ON deals(deal_score DESC);
-  CREATE INDEX IF NOT EXISTS idx_listings_seen ON listings(first_seen_at);
-`);
+const pool = new Pool({
+    connectionString: DB_URL,
+    ssl: DB_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
-// ── NEW: Portfolio tables ──
-db.exec(`
-  CREATE TABLE IF NOT EXISTS portfolio_cards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_name TEXT NOT NULL,
-    card_set TEXT DEFAULT '',
-    card_number TEXT DEFAULT '',
-    rarity TEXT DEFAULT 'Unknown',
-    condition TEXT DEFAULT 'Unknown',
-    is_holo INTEGER DEFAULT 0,
-    is_first_edition INTEGER DEFAULT 0,
-    confidence REAL DEFAULT 0,
-    image_data TEXT DEFAULT '',
-    image_url TEXT DEFAULT '',
-    notes TEXT DEFAULT '',
-    year INTEGER DEFAULT 0,
-    language TEXT DEFAULT 'English',
-    holo_type TEXT DEFAULT 'Unknown',
-    added_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS price_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_id INTEGER NOT NULL,
-    price REAL NOT NULL,
-    source TEXT DEFAULT 'market',
-    recorded_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (card_id) REFERENCES portfolio_cards(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
-`);
-
-// Add new columns if they don't exist (migration for existing DBs)
-const newCols = [
-    { name: 'image_url', type: "TEXT DEFAULT ''" },
-    { name: 'year', type: "INTEGER DEFAULT 0" },
-    { name: 'language', type: "TEXT DEFAULT 'English'" },
-    { name: 'holo_type', type: "TEXT DEFAULT 'Unknown'" }
-];
-for (const col of newCols) {
-    try {
-        db.exec(`ALTER TABLE portfolio_cards ADD COLUMN ${col.name} ${col.type}`);
-        console.log(`  [DB] Added ${col.name} column.`);
-    } catch { /* column already exists */ }
+async function initDB() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_cards (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            card_name TEXT NOT NULL,
+            card_set TEXT DEFAULT '',
+            card_number TEXT DEFAULT '',
+            rarity TEXT DEFAULT 'Unknown',
+            condition TEXT DEFAULT 'Unknown',
+            is_holo INTEGER DEFAULT 0,
+            is_first_edition INTEGER DEFAULT 0,
+            confidence REAL DEFAULT 0,
+            image_data TEXT DEFAULT '',
+            image_url TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            year INTEGER DEFAULT 0,
+            language TEXT DEFAULT 'English',
+            holo_type TEXT DEFAULT 'Unknown',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS price_history (
+            id SERIAL PRIMARY KEY,
+            card_id INTEGER REFERENCES portfolio_cards(id) ON DELETE CASCADE,
+            price REAL NOT NULL,
+            source TEXT DEFAULT 'market',
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
+    `);
 }
+initDB().catch(err => console.error("DB Init Error:", err));
 
 // ── Portfolio DB helpers ──
-function insertPortfolioCard(card) {
-    return db.prepare(`INSERT INTO portfolio_cards (card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
+async function insertPortfolioCard(card, userId) {
+    const res = await pool.query(`
+        INSERT INTO portfolio_cards (user_id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING id
+    `, [
+        userId, card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
         card.condition_estimate || card.condition || 'Unknown', card.is_holographic || card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
         card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
         card.year || 0, card.language || 'English', card.holo_type || 'Unknown'
-    );
+    ]);
+    return { lastInsertRowid: res.rows[0].id };
 }
 
-function updateCardImageUrl(cardId, imageUrl) {
-    db.prepare(`UPDATE portfolio_cards SET image_url = ? WHERE id = ?`).run(imageUrl, cardId);
+async function updateCardImageUrl(cardId, imageUrl) {
+    await pool.query(`UPDATE portfolio_cards SET image_url = $1 WHERE id = $2`, [imageUrl, cardId]);
 }
 
-function insertPricePoint(cardId, price, source) {
-    return db.prepare(`INSERT INTO price_history (card_id, price, source) VALUES (?, ?, ?)`)
-        .run(cardId, price, source || 'market');
+async function insertPricePoint(cardId, price, source) {
+    await pool.query(`INSERT INTO price_history (card_id, price, source) VALUES ($1, $2, $3)`, [cardId, price, source || 'market']);
 }
 
-function getAllPortfolioCards() {
-    // Use a CTE to get current and previous prices reliably (avoids OFFSET on subquery bug)
-    return db.prepare(`
+async function getAllPortfolioCards(userId) {
+    // Determine the user's cards with current and previous prices safely
+    const res = await pool.query(`
         WITH ranked_prices AS (
             SELECT
                 card_id,
@@ -177,43 +154,55 @@ function getAllPortfolioCards() {
         FROM portfolio_cards pc
         LEFT JOIN latest l ON l.card_id = pc.id
         LEFT JOIN prev   p ON p.card_id  = pc.id
+        WHERE pc.user_id = $1
         ORDER BY COALESCE(l.current_price, 0) DESC
-    `).all();
+    `, [userId]);
+    return res.rows;
 }
 
-function getCardPriceHistory(cardId) {
-    return db.prepare(`SELECT price, source, recorded_at FROM price_history WHERE card_id = ? ORDER BY recorded_at ASC`).all(cardId);
+async function getCardPriceHistory(cardId, userId) {
+    // Only return history if the card belongs to the user
+    const check = await pool.query('SELECT user_id FROM portfolio_cards WHERE id = $1', [cardId]);
+    if (check.rows.length === 0 || check.rows[0].user_id !== userId) return [];
+    
+    const res = await pool.query(`SELECT price, source, recorded_at FROM price_history WHERE card_id = $1 ORDER BY recorded_at ASC`, [cardId]);
+    return res.rows;
 }
 
-function deletePortfolioCard(cardId) {
-    db.prepare(`DELETE FROM price_history WHERE card_id = ?`).run(cardId);
-    db.prepare(`DELETE FROM portfolio_cards WHERE id = ?`).run(cardId);
+async function deletePortfolioCard(cardId, userId) {
+    // Secure delete
+    await pool.query(`DELETE FROM portfolio_cards WHERE id = $1 AND user_id = $2`, [cardId, userId]);
 }
 
-function getPortfolioStats() {
-    const totalCards = db.prepare('SELECT COUNT(*) as c FROM portfolio_cards').get().c;
-    const totalValue = db.prepare(`
+async function getPortfolioStats(userId) {
+    const cRes = await pool.query('SELECT COUNT(*) as c FROM portfolio_cards WHERE user_id = $1', [userId]);
+    const totalCards = parseInt(cRes.rows[0].c, 10);
+    
+    // Total value based on latest prices for the user
+    const totalRes = await pool.query(`
         SELECT COALESCE(SUM(latest.price), 0) as total FROM (
             SELECT ph.price FROM portfolio_cards pc
             JOIN price_history ph ON ph.card_id = pc.id
-            WHERE ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1)
+            WHERE pc.user_id = $1 AND ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1)
         ) latest
-    `).get().total;
-    const prevValue = db.prepare(`
+    `, [userId]);
+    const totalValue = parseFloat(totalRes.rows[0].total) || 0;
+
+    const prevRes = await pool.query(`
         SELECT COALESCE(SUM(prev.price), 0) as total FROM (
             SELECT ph.price FROM portfolio_cards pc
             JOIN price_history ph ON ph.card_id = pc.id
-            WHERE ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1 OFFSET 1)
+            WHERE pc.user_id = $1 AND ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1 OFFSET 1)
         ) prev
-    `).get().total;
+    `, [userId]);
+    const prevValue = parseFloat(prevRes.rows[0].total) || 0;
+
     return { totalCards, totalValue, prevValue };
 }
 
 // Legacy helpers
-function getCachedPrice(name, set) {
-    const r = db.prepare(`SELECT market_price FROM identified_cards WHERE card_name=? AND card_set=?
-    AND market_price IS NOT NULL AND created_at>datetime('now','-24 hours') ORDER BY created_at DESC LIMIT 1`).get(name, set || '');
-    return r ? r.market_price : null;
+async function getCachedPrice(name, set) {
+    return null; // DB-less fallback or removed entirely to keep things clean.
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -460,12 +449,12 @@ function extractScrydexPrice(card) {
             || p.holofoil?.mid
             || p.normal?.mid
             || null;
-        if (price && price > 0) return { price, source: 'scrydex_tcgplayer' };
+        if (price && price > 0) return { price, source: 'scrydex_tcgplayer', url: p.url || card.tcgplayer?.url };
     }
     const cm = card.cardmarket?.prices;
     if (cm) {
         const price = cm.averageSellPrice || cm.trendPrice || cm.avg7 || null;
-        if (price && price > 0) return { price, source: 'scrydex_cardmarket' };
+        if (price && price > 0) return { price, source: 'scrydex_cardmarket', url: card.cardmarket?.url };
     }
     return null;
 }
@@ -587,8 +576,9 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber, year, language, 
 
             if (price && price > 0) {
                 console.log(`  [Pricing] Pokemon TCG API for "${cardName}": $${price.toFixed(2)} (${match.set?.name})`);
-                priceCache.set(key, { price, source: 'pokemon_tcg_api', ts: Date.now() });
-                return { price, source: 'pokemon_tcg_api' };
+                const url = match.tcgplayer?.url || match.cardmarket?.url || null;
+                priceCache.set(key, { price, source: 'pokemon_tcg_api', url, ts: Date.now() });
+                return { price, source: 'pokemon_tcg_api', url };
             }
         }
     } catch (err) {
@@ -615,12 +605,14 @@ async function lookupMarketPrice(cardName, cardSet, cardNumber, year, language, 
                     const medianIdx = Math.floor(filtered.length / 2);
                     const medianPrice = filtered[medianIdx].price;
                     console.log(`  [Pricing] eBay median for "${cardName}": $${medianPrice.toFixed(2)} (${filtered.length} listings)`);
-                    priceCache.set(key, { price: medianPrice, source: 'ebay', ts: Date.now() });
-                    return { price: medianPrice, source: 'ebay' };
+                    const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_sop=13`;
+                    priceCache.set(key, { price: medianPrice, source: 'ebay', url, ts: Date.now() });
+                    return { price: medianPrice, source: 'ebay', url };
                 } else if (filtered.length === 1) {
                     const price = filtered[0].price;
-                    priceCache.set(key, { price, source: 'ebay', ts: Date.now() });
-                    return { price, source: 'ebay' };
+                    const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_sop=13`;
+                    priceCache.set(key, { price, source: 'ebay', url, ts: Date.now() });
+                    return { price, source: 'ebay', url };
                 }
             }
             await sleep(RATE_LIMITS.ebay);
@@ -690,6 +682,8 @@ function broadcastActivity(type, message, data = null) {
 //  BACKGROUND PRICE REFRESH
 // ═══════════════════════════════════════════════════════════════
 
+
+
 let priceRefreshRunning = false;
 
 async function refreshAllPrices() {
@@ -701,7 +695,8 @@ async function refreshAllPrices() {
     console.log('  [PriceRefresh] Starting price refresh for all portfolio cards...');
     broadcastActivity('refresh_start', 'Refreshing market prices...');
 
-    const cards = db.prepare('SELECT * FROM portfolio_cards').all();
+    const res = await pool.query('SELECT * FROM portfolio_cards');
+    const cards = res.rows;
     let updated = 0;
 
     for (const card of cards) {
@@ -710,14 +705,16 @@ async function refreshAllPrices() {
             if (!card.image_url) {
                 const imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
                 if (imageUrl) {
-                    updateCardImageUrl(card.id, imageUrl);
+                    await updateCardImageUrl(card.id, imageUrl);
                     console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
                 }
             }
 
             const result = await lookupMarketPrice(card.card_name, card.card_set, card.card_number, card.year, card.language, card.holo_type);
             if (result && result.price > 0) {
-                insertPricePoint(card.id, result.price, result.source || 'market');
+                await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
+                // Also update the main card record with the latest info
+                await pool.query('UPDATE portfolio_cards SET current_price = $1, price_source = $2, price_source_url = $3 WHERE id = $4', [result.price, result.source || 'market', result.url || '', card.id]);
                 updated++;
                 broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
             }
@@ -751,6 +748,7 @@ setTimeout(() => {
 
 const app = express();
 app.use(express.json());
+app.use(cookieParser());
 
 // CORS — allow local dev
 app.use((req, res, next) => {
@@ -764,13 +762,71 @@ app.use((req, res, next) => {
 // Serve static files
 app.use(express.static(__dirname));
 
+// ── Auth API ──
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+        
+        const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+        if (existing.rows.length > 0) return res.status(400).json({ error: 'Username taken' });
+
+        const hash = await bcrypt.hash(password, 10);
+        const result = await pool.query('INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id', [username, hash]);
+        
+        const token = jwt.sign({ id: result.rows[0].id, username }, JWT_SECRET, { expiresIn: '7d' });
+        res.cookie('auth_token', token, { httpOnly: true, secure: !DB_URL.includes('localhost'), maxAge: 7*24*60*60*1000 });
+        res.json({ success: true, username });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+        
+        const user = result.rows[0];
+        const match = await bcrypt.compare(password, user.password_hash);
+        if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+        res.cookie('auth_token', token, { httpOnly: true, secure: !DB_URL.includes('localhost'), maxAge: 7*24*60*60*1000 });
+        res.json({ success: true, username: user.username });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    res.clearCookie('auth_token');
+    res.json({ success: true });
+});
+
+const requireAuth = (req, res, next) => {
+    const token = req.cookies.auth_token;
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        req.user = jwt.verify(token, JWT_SECRET);
+        next();
+    } catch {
+        res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+    res.json({ username: req.user.username });
+});
+
 // ── Portfolio API ──
 
 // Get all portfolio cards with latest + previous prices
-app.get('/api/portfolio', (req, res) => {
+app.get('/api/portfolio', requireAuth, async (req, res) => {
     try {
-        const cards = getAllPortfolioCards();
-        const stats = getPortfolioStats();
+        const cards = await getAllPortfolioCards(req.user.id);
+        const stats = await getPortfolioStats(req.user.id);
         res.json({ cards, stats });
     } catch (err) {
         console.error('Portfolio fetch error:', err);
@@ -779,9 +835,9 @@ app.get('/api/portfolio', (req, res) => {
 });
 
 // Get price history for a single card
-app.get('/api/portfolio/:id/history', (req, res) => {
+app.get('/api/portfolio/:id/history', requireAuth, async (req, res) => {
     try {
-        const history = getCardPriceHistory(parseInt(req.params.id));
+        const history = await getCardPriceHistory(parseInt(req.params.id), req.user.id);
         res.json({ history });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -789,9 +845,9 @@ app.get('/api/portfolio/:id/history', (req, res) => {
 });
 
 // Delete a card from portfolio
-app.delete('/api/portfolio/:id', (req, res) => {
+app.delete('/api/portfolio/:id', requireAuth, async (req, res) => {
     try {
-        deletePortfolioCard(parseInt(req.params.id));
+        await deletePortfolioCard(parseInt(req.params.id), req.user.id);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -799,7 +855,7 @@ app.delete('/api/portfolio/:id', (req, res) => {
 });
 
 // Manually trigger price refresh
-app.post('/api/portfolio/refresh-prices', async (req, res) => {
+app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
     try {
         res.json({ success: true, message: 'Price refresh started.' });
         refreshAllPrices().catch(err => console.error('Manual refresh error:', err));
@@ -810,7 +866,7 @@ app.post('/api/portfolio/refresh-prices', async (req, res) => {
 
 // Upload photos → AI identifies → saves to portfolio
 // Accepts field name 'cards' (from the frontend drop-zone) OR 'photos' (legacy)
-app.post('/api/portfolio/upload', (req, res) => {
+app.post('/api/portfolio/upload', requireAuth, (req, res) => {
     const uploader = upload.fields([
         { name: 'cards', maxCount: 20 },
         { name: 'photos', maxCount: 20 },
@@ -838,7 +894,7 @@ app.post('/api/portfolio/upload', (req, res) => {
             broadcastActivity('upload_start', `Analyzing ${files.length} photo${files.length > 1 ? 's' : ''}...`);
 
             // Process synchronously so we can return the results
-            const result = await processPortfolioUpload(files);
+            const result = await processPortfolioUpload(files, req.user.id);
             res.json({ success: true, cards: result.cards, message: `Added ${result.totalAdded} card(s)` });
         } catch (err) {
             console.error('Portfolio upload error:', err);
@@ -847,7 +903,9 @@ app.post('/api/portfolio/upload', (req, res) => {
     });
 });
 
-async function processPortfolioUpload(files) {
+
+// Ensure the `lastInsertRowid` is mapped correctly (sqlite vs pg)
+async function processPortfolioUpload(files, userId) {
     let totalAdded = 0;
     const addedCards = [];
 
@@ -908,17 +966,19 @@ async function processPortfolioUpload(files) {
             // Inline synchronous market price fetch
             let finalPrice = card.estimated_value_usd || 0;
             let finalSource = 'ai_estimate';
+            let finalUrl = '';
             try {
                 const priceResult = await lookupMarketPrice(card.card_name, card.card_set, card.card_number, card.year, card.language, card.holo_type);
                 if (priceResult && priceResult.price > 0) {
                     finalPrice = priceResult.price;
                     finalSource = priceResult.source;
+                    finalUrl = priceResult.url || '';
                 }
             } catch (err) {
                 console.error(`  [Pricing] Error fetching inline price for ${card.card_name}:`, err.message);
             }
 
-            const dbResult = insertPortfolioCard({
+            const dbResult = await insertPortfolioCard({
                 card_name: card.card_name,
                 card_set: card.card_set || '',
                 card_number: card.card_number || '',
@@ -930,12 +990,13 @@ async function processPortfolioUpload(files) {
                 image_data: thumbDataUrl,
                 image_url: imageUrl,
                 notes: card.notes || ''
-            });
+            }, userId);
 
-            const cardId = dbResult.lastInsertRowid;
+            // PostgreSQL returns the id in rows[0].id
+            const cardId = dbResult.rows[0].id;
 
             if (finalPrice > 0) {
-                insertPricePoint(cardId, finalPrice, finalSource);
+                await insertPricePoint(cardId, finalPrice, finalSource, finalUrl);
             }
 
             totalAdded++;
@@ -955,6 +1016,7 @@ async function processPortfolioUpload(files) {
                 current_price: finalPrice,
                 estimated_value: finalPrice,
                 price_source: finalSource,
+                price_source_url: finalUrl,
             };
 
             addedCards.push(finalCardData);
@@ -970,6 +1032,8 @@ async function processPortfolioUpload(files) {
 
     return { totalAdded, cards: addedCards };
 }
+
+
 
 // SSE endpoint
 app.get('/api/events', (req, res) => {
@@ -1002,6 +1066,6 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down...');
-    db.close();
+    await pool.end();
     process.exit(0);
 });

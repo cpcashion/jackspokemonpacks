@@ -1,0 +1,37 @@
+╔═══════════════════════ Variables for jackspokemonpacks ══════════════════════╗
+║ DATABASE_URL                          │ postgresql://                        ║
+║                                       │ postgres:VOmrgzfcAilYKvHFKBOrvmEvKHO ║
+║                                       │ iRoiX@postgres.railway.internal:5432 ║
+║                                       │ /railway                             ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ GEMINI_API_KEY                        │ AIzaSyCIsWC-                         ║
+║                                       │ 2ZS24vLvo864DFLSDvlMAe6M3mc          ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ JWT_SECRET                            │ kickstartmyheart-secret-token        ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_ENVIRONMENT                   │ production                           ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_ENVIRONMENT_ID                │ ce1f95da-65e8-4ddc-95ab-34e7aac4a478 ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_ENVIRONMENT_NAME              │ production                           ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_PRIVATE_DOMAIN                │ jackspokemonpacks.railway.internal   ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_PROJECT_ID                    │ c96ee18e-bb1e-4914-b86e-493feee301f0 ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_PROJECT_NAME                  │ jackspokemonpacks                    ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_PUBLIC_DOMAIN                 │ jackspokemon.com                     ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_SERVICE_ID                    │ 0dbaded3-d858-4cdb-b478-d59116e5c82e ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_SERVICE_JACKSPOKEMONPACKS_URL │ jackspokemon.com                     ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_SERVICE_NAME                  │ jackspokemonpacks                    ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_SERVICE_POSTGRES_URL          │ postgres-production-                 ║
+║                                       │ a16c9.up.railway.app                 ║
+║──────────────────────────────────────────────────────────────────────────────║
+║ RAILWAY_STATIC_URL                    │ jackspokemon.com                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+

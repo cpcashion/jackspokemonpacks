@@ -12,6 +12,28 @@
 </head>
 <body>
 
+  <!-- ── AUTHENTICATION GATEWAY ─────────────────────────────── -->
+  <div class="auth-gateway" id="authGateway">
+    <div class="auth-card">
+      <div class="auth-header">
+        <div class="auth-logo">⚡</div>
+        <h2>Welcome to Jack's Pokémon Portfolio</h2>
+        <p>A persistent stock-market tracker for your collection.</p>
+      </div>
+      <form id="authForm" class="auth-form">
+        <input type="text" id="authUsername" placeholder="Username" required autocomplete="username" />
+        <input type="password" id="authPassword" placeholder="Password" required autocomplete="current-password" />
+        <div class="auth-actions">
+          <button type="button" class="btn-secondary" id="registerBtn">Create Account</button>
+          <button type="submit" class="btn-primary" id="loginBtn">Login</button>
+        </div>
+        <p class="auth-error" id="authError"></p>
+      </form>
+    </div>
+  </div>
+
+  <div class="app-container" id="appContainer" style="display: none;">
+
   <!-- ── TOP NAVIGATION BAR ─────────────────────────────────── -->
   <header class="topbar">
     <div class="topbar-brand">
@@ -22,10 +44,18 @@
       <span class="portfolio-total" id="portfolioTotal">$0.00</span>
       <span class="portfolio-change neutral" id="portfolioChange">—</span>
     </div>
-    <button class="btn-primary" id="openUploadBtn">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      Add Cards
-    </button>
+    <div class="topbar-actions">
+      <button class="btn-primary" id="openUploadBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add Cards
+      </button>
+      <div class="user-menu" style="display: flex; align-items: center; gap: 0.5rem; margin-left: 1rem; color: #4b5563; font-weight: 500;">
+        <span id="navUsername">User</span>
+        <button class="btn-ghost" id="logoutBtn" title="Log Out" style="padding: 0.5rem;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </div>
+    </div>
   </header>
 
   <!-- ── SUMMARY STATS ROW ──────────────────────────────────── -->
@@ -239,6 +269,8 @@
         </div>
       </div>
     </div>
+  </div>
+
   </div>
 
   <!-- Chart.js CDN -->

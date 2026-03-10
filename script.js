@@ -54,6 +54,17 @@ const gridViewBtn       = document.getElementById('gridViewBtn');
 const searchInput       = document.getElementById('searchInput');
 const refreshBtn        = document.getElementById('refreshPricesBtn');
 
+const authGateway       = document.getElementById('authGateway');
+const appContainer      = document.getElementById('appContainer');
+const authForm          = document.getElementById('authForm');
+const authUsername      = document.getElementById('authUsername');
+const authPassword      = document.getElementById('authPassword');
+const authError         = document.getElementById('authError');
+const registerBtn       = document.getElementById('registerBtn');
+const loginBtn          = document.getElementById('loginBtn');
+const logoutBtn         = document.getElementById('logoutBtn');
+const navUsername       = document.getElementById('navUsername');
+
 // ── HELPERS ──────────────────────────────────────────────────────
 function fmt(n) {
   if (n === null || n === undefined || isNaN(n)) return '—';
@@ -177,7 +188,10 @@ function renderTable(cards) {
       ? `<img class="card-thumb" src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
       : `<div class="card-thumb-placeholder">🃏</div>`;
 
-    const sourceLabel = card.price_source || 'market';
+    let sourceLabel = `<span class="source-badge">${card.price_source || 'market'}</span>`;
+    if (card.price_source_url) {
+      sourceLabel = `<a href="${card.price_source_url}" target="_blank" class="source-badge-link" onclick="event.stopPropagation()">${sourceLabel}</a>`;
+    }
 
     const tr = document.createElement('tr');
     tr.dataset.id = card.id;
@@ -198,7 +212,7 @@ function renderTable(cards) {
       <td class="col-price">${fmt(card.current_price)}</td>
       <td class="col-change">${changeBadge(pct, false)}</td>
       <td class="col-sparkline">${renderSparkline(prices, isPos)}</td>
-      <td class="col-source"><span class="source-badge">${sourceLabel}</span></td>
+      <td class="col-source">${sourceLabel}</td>
       <td class="col-actions">
         <button class="delete-row-btn" data-id="${card.id}" title="Remove card" onclick="event.stopPropagation();confirmDelete(${card.id})">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
@@ -586,7 +600,11 @@ function openDrawer(card) {
   setDetail('drawerHoloType', card.holo_type);
   setDetail('drawer1stEd', card.is_first_edition ? '✓ Yes' : 'No');
   setDetail('drawerConfidence', card.confidence != null ? `${Math.round(card.confidence * 100)}%` : '—');
-  setDetail('drawerPriceSource', card.price_source || '—');
+  const sourceBadgeHtml = card.price_source_url 
+    ? `<a href="${card.price_source_url}" target="_blank" style="color:#3b82f6;text-decoration:none;">${card.price_source || 'market'} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg></a>`
+    : (card.price_source || '—');
+  const priceSourceEl = document.getElementById('drawerPriceSource');
+  if (priceSourceEl) priceSourceEl.innerHTML = sourceBadgeHtml;
 
   drawerOverlay.classList.add('open');
   document.body.style.overflow = 'hidden';
@@ -778,8 +796,82 @@ function connectSSE() {
   };
 }
 
+// ── AUTHENTICATION ────────────────────────────────────────────────
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/auth/me');
+    if (res.ok) {
+      const data = await res.json();
+      navUsername.textContent = data.username;
+      authGateway.style.display = 'none';
+      appContainer.style.display = 'block';
+      await fetchPortfolio();
+      connectSSE();
+      return true;
+    }
+  } catch (err) {}
+  
+  // Not authenticated
+  authGateway.style.display = 'flex';
+  appContainer.style.display = 'none';
+  return false;
+}
+
+authForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  authError.textContent = '';
+  loginBtn.disabled = true;
+  loginBtn.textContent = 'Logging in...';
+  
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: authUsername.value, password: authPassword.value })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Login failed');
+    await checkAuth();
+  } catch (err) {
+    authError.textContent = err.message;
+  } finally {
+    loginBtn.disabled = false;
+    loginBtn.textContent = 'Login';
+  }
+});
+
+registerBtn.addEventListener('click', async () => {
+  if (!authUsername.value || !authPassword.value) {
+    authError.textContent = 'Username and password required';
+    return;
+  }
+  authError.textContent = '';
+  registerBtn.disabled = true;
+  registerBtn.textContent = 'Creating...';
+  
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: authUsername.value, password: authPassword.value })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Registration failed');
+    await checkAuth();
+  } catch (err) {
+    authError.textContent = err.message;
+  } finally {
+    registerBtn.disabled = false;
+    registerBtn.textContent = 'Create Account';
+  }
+});
+
+logoutBtn.addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  location.reload();
+});
+
 // ── INIT ──────────────────────────────────────────────────────────
 (async function init() {
-  await fetchPortfolio();
-  connectSSE();
+  await checkAuth();
 })();

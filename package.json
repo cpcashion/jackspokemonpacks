@@ -11,12 +11,16 @@
     "dependencies": {
         "@google/generative-ai": "^0.21.0",
         "axios": "^1.7.0",
+        "bcrypt": "^6.0.0",
         "better-sqlite3": "^11.0.0",
         "cheerio": "^1.0.0",
+        "cookie-parser": "^1.4.7",
         "dotenv": "^16.4.0",
         "express": "^4.21.0",
+        "jsonwebtoken": "^9.0.3",
         "multer": "^2.1.1",
         "node-cron": "^3.0.3",
+        "pg": "^8.20.0",
         "sharp": "^0.34.5"
     }
 }

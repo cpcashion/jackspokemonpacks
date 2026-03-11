@@ -983,19 +983,33 @@ body {
   .portfolio-total { font-size: 18px; }
 
   .stats-row {
-    grid-template-columns: repeat(2, 1fr);
+    display: flex;
     overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    gap: 0;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+  }
+  
+  .stats-row::-webkit-scrollbar {
+    display: none;
+  }
+
+  .stat-card {
+    min-width: 140px;
+    scroll-snap-align: start;
+    border-right: 1px solid var(--color-border);
+    border-top: none !important;
   }
 
   .main-content { padding: 14px 16px 40px; }
 
-  /* On mobile: hide table, show grid */
-  #tableView  { display: none !important; }
-  #gridView   { display: grid !important; }
+  /* On mobile: View controls are hidden but let JS handle visibility naturally */
   .view-toggle { display: none; }
   .controls-bar { gap: 8px; }
-  .search-box { max-width: unset; flex: 1; }
-  .refresh-section { display: none; }
+  .search-box { max-width: unset; flex: 1; margin-bottom: 8px; }
+  .refresh-section { width: 100%; justify-content: space-between; margin-left: 0; }
+  .last-updated { margin-left: auto; }
 
   .drawer { width: 100vw; }
 
@@ -1005,12 +1019,17 @@ body {
 }
 
 @media (max-width: 480px) {
-  .stats-row {
-    grid-template-columns: 1fr 1fr;
-    font-size: 14px;
-  }
   .stat-value { font-size: 16px; }
-  .cards-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .cards-grid { 
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); 
+    gap: 12px; 
+  }
+  .grid-card-name { font-size: 13px; }
+  .grid-card-set { font-size: 11px; }
+  .grid-card-price { font-size: 15px; }
+  
+  .empty-icon { font-size: 40px; }
+  .empty-title { font-size: 18px; }
 }
 
 /* ── AUTH GATEWAY ─────────────────────────────────────────── */

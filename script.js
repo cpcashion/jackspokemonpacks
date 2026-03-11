@@ -253,7 +253,11 @@ function renderPortfolio() {
 
   emptyState.style.display = hasCards || searchQuery ? 'none' : 'block';
 
-  if (currentView === 'table') {
+  // Force grid on mobile regardless of button state
+  const isMobile = window.innerWidth <= 700;
+  const activeView = isMobile ? 'grid' : currentView;
+
+  if (activeView === 'table') {
     tableView.style.display  = hasCards ? 'block' : 'none';
     gridView.style.display   = 'none';
     if (hasCards) renderTable(cards);
@@ -378,6 +382,7 @@ document.querySelectorAll('th.sortable').forEach(th => {
 
 // ── VIEW TOGGLE ───────────────────────────────────────────────────
 tableViewBtn.addEventListener('click', () => {
+  if (window.innerWidth <= 700) return; // Disabled on mobile
   currentView = 'table';
   tableViewBtn.classList.add('active');
   gridViewBtn.classList.remove('active');
@@ -387,6 +392,12 @@ gridViewBtn.addEventListener('click', () => {
   currentView = 'grid';
   gridViewBtn.classList.add('active');
   tableViewBtn.classList.remove('active');
+  renderPortfolio();
+});
+
+// Auto-switch view on resize
+window.addEventListener('resize', () => {
+  // Debounce render if needed, but it's fast enough for now
   renderPortfolio();
 });
 

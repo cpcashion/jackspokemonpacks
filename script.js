@@ -77,10 +77,30 @@ function fmtChange(current, previous) {
   return pct;
 }
 
+function getPeriodChange(card, key) {
+  return fmtChange(card.current_price, card[key]);
+}
+
+function getPeriodDelta(card, key) {
+  if (!card.current_price || !card[key]) return null;
+  return card.current_price - card[key];
+}
+
+function formatTrendText(card, key) {
+  const pct = getPeriodChange(card, key);
+  const delta = getPeriodDelta(card, key);
+  if (pct === null || delta === null) return '—';
+  const sign = delta >= 0 ? '+' : '-';
+  return `${delta >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(2)}% (${sign}${fmt(Math.abs(delta))})`;
+}
+
 function changeBadge(pct, includePrice, deltaPrice) {
   if (pct === null || pct === undefined) return `<span class="badge-neutral">—</span>`;
-  const dir = pct >= 0 ? 'positive' : 'negative';
-  const arrow = pct >= 0 ? '↑' : '↓';
+  if (Math.abs(pct) < 0.01) {
+    return `<span class="badge-neutral">0.0%</span>`;
+  }
+  const dir = pct > 0 ? 'positive' : 'negative';
+  const arrow = pct > 0 ? '↑' : '↓';
   const formatted = `${arrow} ${Math.abs(pct).toFixed(1)}%`;
   if (includePrice && deltaPrice !== undefined) {
     const sign = deltaPrice >= 0 ? '+' : '-';
@@ -167,8 +187,8 @@ function getFilteredSorted() {
       bv = b.current_price || 0;
     }
     if (currentSort.key === 'change') {
-      av = fmtChange(a.current_price, a.previous_price) || 0;
-      bv = fmtChange(b.current_price, b.previous_price) || 0;
+      av = getPeriodChange(a, 'prev_day_price') || 0;
+      bv = getPeriodChange(b, 'prev_day_price') || 0;
     }
     return currentSort.dir === 'asc' ? av - bv : bv - av;
   });
@@ -178,15 +198,17 @@ function getFilteredSorted() {
 function renderTable(cards) {
   tableBody.innerHTML = '';
   cards.forEach(card => {
-    const pct = fmtChange(card.current_price, card.previous_price);
-    const delta = card.current_price && card.previous_price ? card.current_price - card.previous_price : null;
+    const pct = getPeriodChange(card, 'prev_day_price');
+    const delta = getPeriodDelta(card, 'prev_day_price');
     const prices = card.price_history || [];
     const isPos = pct !== null && pct >= 0;
 
-    const imgSrc = card.image_url || card.image_data || '';
+    const imgSrc = card.image_url || '';
     const thumbHtml = imgSrc
       ? `<img class="card-thumb" src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
-      : `<div class="card-thumb-placeholder">🃏</div>`;
+      : (card.has_local_image
+        ? `<img class="card-thumb" data-card-id="${card.id}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
+        : `<div class="card-thumb-placeholder">🃏</div>`);
 
     let sourceLabel = `<span class="source-badge">${card.price_source || 'market'}</span>`;
     if (card.price_source_url) {
@@ -221,13 +243,25 @@ function renderTable(cards) {
     tr.addEventListener('click', () => openDrawer(card));
     tableBody.appendChild(tr);
   });
+  // Lazy-load base64 thumbnails for cards that only have local images
+  lazyLoadLocalImages();
+}
+
+function lazyLoadLocalImages() {
+  document.querySelectorAll('img[data-card-id]').forEach(img => {
+    if (img.src) return; // already loaded
+    const cardId = img.dataset.cardId;
+    fetch(`/api/portfolio/${cardId}/image`).then(r => r.json()).then(d => {
+      if (d.image_data) img.src = d.image_data;
+    }).catch(() => {});
+  });
 }
 
 function renderGrid(cards) {
   gridView.innerHTML = '';
   cards.forEach(card => {
-    const pct = fmtChange(card.current_price, card.previous_price);
-    const imgSrc = card.image_url || card.image_data || '';
+    const pct = getPeriodChange(card, 'prev_day_price');
+    const imgSrc = card.image_url || '';
     const div = document.createElement('div');
     div.className = 'grid-card';
     div.innerHTML = `
@@ -281,7 +315,7 @@ function updateStats() {
 
   portfolio.forEach(c => {
     const price = c.current_price || 0;
-    const prev  = c.previous_price || 0;
+    const prev  = c.prev_day_price || 0;
     totalValue += price;
     prevValue  += prev;
     const pct = fmtChange(price, prev);
@@ -356,6 +390,7 @@ async function fetchSparklineData() {
       if (res.ok) {
         const data = await res.json();
         card.price_history = data.history || [];
+        card.history_summary = data.summary || null;
       }
     } catch { /* skip — sparkline will show flat line */ }
   });
@@ -428,36 +463,371 @@ refreshBtn.addEventListener('click', async () => {
   }
 });
 
-// ── UPLOAD MODAL ──────────────────────────────────────────────────
+// ── SCANNER MODAL ─────────────────────────────────────────────────
+const scannerCameraTab = document.getElementById('scannerCameraTab');
+const scannerUploadTab = document.getElementById('scannerUploadTab');
+const scanResults = document.getElementById('scanResults');
+const tabCamera = document.getElementById('tabCamera');
+const tabUpload = document.getElementById('tabUpload');
+const cameraVideo = document.getElementById('cameraVideo');
+const viewfinderContainer = document.getElementById('viewfinderContainer');
+const cameraPermission = document.getElementById('cameraPermission');
+const cameraErrorEl = document.getElementById('cameraError');
+const captureBtn = document.getElementById('captureBtn');
+const captureFlash = document.getElementById('captureFlash');
+const captureCanvas = document.getElementById('captureCanvas');
+const scanStrip = document.getElementById('scanStrip');
+const scanStripCards = document.getElementById('scanStripCards');
+const scanCounter = document.getElementById('scanCounter');
+const scanCountNum = document.getElementById('scanCountNum');
+const flashBtn = document.getElementById('flashBtn');
+const switchCameraBtn = document.getElementById('switchCameraBtn');
+const galleryBtn = document.getElementById('galleryBtn');
+const galleryInput = document.getElementById('galleryInput');
+const guideHint = document.getElementById('guideHint');
+
+let cameraStream = null;
+let isCapturing = false;
+let scanSessionCards = [];
+let scanCount = 0;
+let currentFacingMode = 'environment';
+let torchEnabled = false;
+
 function openModal() {
   uploadModal.classList.add('open');
   document.body.style.overflow = 'hidden';
+  switchTab('camera');
 }
+
 function closeModal() {
   uploadModal.classList.remove('open');
   document.body.style.overflow = '';
-  // Reset state if not uploading
-  if (!document.querySelector('.queue-item')) {
-    dropZone.style.display = 'block';
-    uploadQueue.style.display = 'none';
-    queueItems.innerHTML = '';
+  stopCamera();
+  resetScanSession();
+}
+
+function resetScanSession() {
+  scanSessionCards = [];
+  scanCount = 0;
+  scanStripCards.innerHTML = '';
+  scanStrip.style.display = 'none';
+  scanCounter.style.display = 'none';
+  scanCountNum.textContent = '0';
+  scanResults.style.display = 'none';
+}
+
+function switchTab(tab) {
+  scannerCameraTab.style.display = 'none';
+  scannerUploadTab.style.display = 'none';
+  scanResults.style.display = 'none';
+  tabCamera.classList.remove('active');
+  tabUpload.classList.remove('active');
+  if (tab === 'camera') {
+    tabCamera.classList.add('active');
+    scannerCameraTab.style.display = 'flex';
+    initCamera();
+  } else {
+    tabUpload.classList.add('active');
+    scannerUploadTab.style.display = 'flex';
+    stopCamera();
   }
 }
+
+tabCamera.addEventListener('click', () => switchTab('camera'));
+tabUpload.addEventListener('click', () => switchTab('upload'));
 
 openUploadBtn.addEventListener('click', openModal);
 emptyUploadBtn.addEventListener('click', openModal);
 closeUploadBtn.addEventListener('click', closeModal);
-uploadModal.addEventListener('click', e => { if (e.target === uploadModal) closeModal(); });
+uploadModal.addEventListener('click', e => {
+  if (e.target === uploadModal) closeModal();
+});
 
-// File input trigger
-dropZone.addEventListener('click', () => fileInput.click());
+document.getElementById('switchToUploadBtn')?.addEventListener('click', () => switchTab('upload'));
+document.getElementById('switchToUploadBtn2')?.addEventListener('click', () => switchTab('upload'));
+document.getElementById('grantCameraBtn')?.addEventListener('click', () => initCamera(true));
+document.getElementById('retryCameraBtn')?.addEventListener('click', () => initCamera(true));
 
-// Drag and drop
-['dragenter','dragover'].forEach(evt => {
-  dropZone.addEventListener(evt, e => {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
+// ── CAMERA MANAGEMENT ─────────────────────────────────────────────
+async function initCamera(forceRequest = false) {
+  cameraPermission.style.display = 'none';
+  cameraErrorEl.style.display = 'none';
+  viewfinderContainer.style.display = 'none';
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showCameraError('Camera Not Supported', 'Your browser doesn\'t support camera access. Try Chrome or Safari.');
+    return;
+  }
+
+  if (!forceRequest) {
+    try {
+      const permResult = await navigator.permissions?.query({ name: 'camera' });
+      if (permResult && permResult.state === 'prompt') {
+        cameraPermission.style.display = 'flex';
+        return;
+      }
+    } catch {}
+  }
+
+  try {
+    stopCamera();
+    const constraints = {
+      video: { facingMode: currentFacingMode, width: { ideal: 2048 }, height: { ideal: 2048 } },
+      audio: false
+    };
+    cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+    cameraVideo.srcObject = cameraStream;
+    await new Promise(resolve => {
+      cameraVideo.onloadedmetadata = () => { cameraVideo.play(); resolve(); };
+    });
+
+    viewfinderContainer.style.display = 'flex';
+    cameraPermission.style.display = 'none';
+    cameraErrorEl.style.display = 'none';
+
+    const track = cameraStream.getVideoTracks()[0];
+    const capabilities = track.getCapabilities?.();
+    flashBtn.style.display = capabilities?.torch ? 'flex' : 'none';
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter(d => d.kind === 'videoinput');
+      switchCameraBtn.style.display = cameras.length > 1 ? 'flex' : 'none';
+    } catch {}
+
+    setTimeout(() => { if (guideHint) guideHint.style.opacity = '0.4'; }, 4000);
+  } catch (err) {
+    console.error('Camera init error:', err);
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      showCameraError('Camera Access Denied', 'Please allow camera access in your browser settings, or use the Upload tab.');
+    } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+      showCameraError('No Camera Found', 'No camera was detected. Use the Upload tab instead.');
+    } else {
+      showCameraError('Camera Error', 'Could not access camera: ' + err.message);
+    }
+  }
+}
+
+function stopCamera() {
+  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
+  if (cameraVideo) cameraVideo.srcObject = null;
+  torchEnabled = false;
+  flashBtn.classList.remove('active');
+}
+
+function showCameraError(title, text) {
+  cameraErrorEl.style.display = 'flex';
+  viewfinderContainer.style.display = 'none';
+  cameraPermission.style.display = 'none';
+  document.getElementById('cameraErrorTitle').textContent = title;
+  document.getElementById('cameraErrorText').textContent = text;
+}
+
+flashBtn.addEventListener('click', async () => {
+  if (!cameraStream) return;
+  const track = cameraStream.getVideoTracks()[0];
+  try {
+    torchEnabled = !torchEnabled;
+    await track.applyConstraints({ advanced: [{ torch: torchEnabled }] });
+    flashBtn.classList.toggle('active', torchEnabled);
+  } catch { torchEnabled = false; flashBtn.classList.remove('active'); }
+});
+
+switchCameraBtn.addEventListener('click', () => {
+  currentFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
+  initCamera(true);
+});
+
+// ── CAPTURE ───────────────────────────────────────────────────────
+captureBtn.addEventListener('click', captureCard);
+
+async function captureCard() {
+  if (isCapturing || !cameraStream) return;
+  isCapturing = true;
+  captureBtn.classList.add('capturing');
+
+  captureFlash.classList.add('flash');
+  setTimeout(() => captureFlash.classList.remove('flash'), 300);
+  if (navigator.vibrate) navigator.vibrate(50);
+
+  try {
+    const video = cameraVideo;
+    const canvas = captureCanvas;
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    const scale = Math.min(2048 / w, 2048 / h, 1);
+    canvas.width = Math.round(w * scale);
+    canvas.height = Math.round(h * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+    if (!blob) { showToast('Failed to capture image', 'error'); isCapturing = false; captureBtn.classList.remove('capturing'); return; }
+
+    const scanId = Date.now();
+    const thumbUrl = canvas.toDataURL('image/jpeg', 0.5);
+    addScanStripItem(scanId, thumbUrl, 'Analyzing…', 'processing');
+    scanStrip.style.display = 'block';
+    scanCounter.style.display = 'flex';
+
+    captureBtn.classList.remove('capturing');
+    isCapturing = false;
+    processCapturedImage(blob, scanId, thumbUrl);
+  } catch (err) {
+    console.error('Capture error:', err);
+    showToast('Failed to capture: ' + err.message, 'error');
+    isCapturing = false;
+    captureBtn.classList.remove('capturing');
+  }
+}
+
+async function processCapturedImage(blob, scanId, thumbUrl) {
+  try {
+    const formData = new FormData();
+    formData.append('cards', blob, `scan_${scanId}.jpg`);
+    const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
+    if (!res.ok) {
+      let errMsg = `Upload failed (${res.status})`;
+      try { const d = await res.json(); errMsg = d.error || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+    const data = await res.json();
+    const cards = data.cards || [];
+    if (cards.length > 0) {
+      cards.forEach(card => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(card); });
+      const c = cards[0];
+      updateScanStripItem(scanId, { name: c.card_name || 'Unknown', price: c.current_price || c.estimated_value || 0, imageUrl: c.image_url || c.image_data || thumbUrl, status: 'success' });
+      showToast(cards.length === 1 ? `✅ ${c.card_name} — ${fmt(c.current_price || c.estimated_value)}` : `✅ ${cards.length} cards found!`, 'success');
+    } else {
+      updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
+      showToast('No card detected — try adjusting angle or lighting', 'info');
+    }
+    await fetchPortfolio();
+  } catch (err) {
+    console.error('Process error:', err);
+    updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
+    showToast('Scan failed: ' + err.message, 'error');
+  }
+}
+
+function addScanStripItem(id, thumbUrl, text, status) {
+  const item = document.createElement('div');
+  item.className = `scan-card-item ${status}`;
+  item.id = `scan-item-${id}`;
+  item.innerHTML = `
+    <img class="scan-card-item-img" src="${thumbUrl}" alt="Scanning…" />
+    <div class="scan-card-item-info">
+      <div class="scan-card-item-name">${text}</div>
+      <div class="scan-card-item-status">🔍 Identifying…</div>
+    </div>`;
+  scanStripCards.appendChild(item);
+  scanStripCards.scrollLeft = scanStripCards.scrollWidth;
+}
+
+function updateScanStripItem(id, data) {
+  const item = document.getElementById(`scan-item-${id}`);
+  if (!item) return;
+  item.className = `scan-card-item ${data.status}`;
+  if (data.imageUrl && data.status === 'success') {
+    const img = item.querySelector('.scan-card-item-img');
+    if (img) img.src = data.imageUrl;
+  }
+  const nameEl = item.querySelector('.scan-card-item-name');
+  const statusEl = item.querySelector('.scan-card-item-status');
+  if (nameEl) nameEl.textContent = data.name;
+  if (data.status === 'success') {
+    if (statusEl) { statusEl.className = 'scan-card-item-price'; statusEl.textContent = data.price > 0 ? fmt(data.price) : 'Unpriced'; }
+  } else if (data.status === 'error') {
+    if (statusEl) { statusEl.className = 'scan-card-item-status'; statusEl.textContent = '⚠️ Try again'; }
+  }
+}
+
+// ── SCAN DONE → SHOW RESULTS ──────────────────────────────────────
+document.getElementById('scanDoneBtn')?.addEventListener('click', showScanResults);
+
+function showScanResults() {
+  stopCamera();
+  scannerCameraTab.style.display = 'none';
+  scannerUploadTab.style.display = 'none';
+  scanResults.style.display = 'flex';
+
+  const totalCards = scanSessionCards.length;
+  const resultsTitle = document.getElementById('resultsTitle');
+  const resultsSubtitle = document.getElementById('resultsSubtitle');
+  const resultsCardsEl = document.getElementById('resultsCards');
+
+  if (totalCards === 0) {
+    resultsTitle.textContent = 'No Cards Added';
+    resultsSubtitle.textContent = 'No cards were identified. Try again with better lighting.';
+    document.querySelector('.results-icon').textContent = '📸';
+  } else {
+    resultsTitle.textContent = totalCards === 1 ? 'Card Added!' : `${totalCards} Cards Added!`;
+    const totalValue = scanSessionCards.reduce((sum, c) => sum + (c.current_price || c.estimated_value || 0), 0);
+    resultsSubtitle.textContent = totalValue > 0 ? `Total value: ${fmt(totalValue)}` : `${totalCards} card${totalCards !== 1 ? 's' : ''} added to your portfolio`;
+    document.querySelector('.results-icon').textContent = '🎉';
+  }
+
+  resultsCardsEl.innerHTML = '';
+  scanSessionCards.forEach(card => {
+    const imgSrc = card.image_url || card.image_data || '';
+    const div = document.createElement('div');
+    div.className = 'result-card';
+    div.innerHTML = `
+      ${imgSrc ? `<img class="result-card-img" src="${imgSrc}" alt="${card.card_name}" onerror="this.outerHTML='<div class=\\'result-card-img-placeholder\\'>🃏</div>'">`
+        : '<div class="result-card-img-placeholder">🃏</div>'}
+      <div class="result-card-info">
+        <div class="result-card-name">${card.card_name || 'Unknown'}</div>
+        <div class="result-card-set">${card.card_set || '—'} ${card.rarity ? '• ' + card.rarity : ''}</div>
+      </div>
+      <div class="result-card-price">${fmt(card.current_price || card.estimated_value)}</div>`;
+    resultsCardsEl.appendChild(div);
   });
+}
+
+document.getElementById('resultsScanMoreBtn')?.addEventListener('click', () => {
+  resetScanSession();
+  scanResults.style.display = 'none';
+  switchTab('camera');
+});
+document.getElementById('resultsDoneBtn')?.addEventListener('click', closeModal);
+
+// ── GALLERY BUTTON (from camera tab) ──────────────────────────────
+galleryBtn.addEventListener('click', () => galleryInput.click());
+galleryInput.addEventListener('change', () => {
+  const files = Array.from(galleryInput.files);
+  if (files.length) {
+    files.forEach(file => {
+      const scanId = Date.now() + Math.random();
+      const thumbUrl = URL.createObjectURL(file);
+      addScanStripItem(scanId, thumbUrl, file.name, 'processing');
+      scanStrip.style.display = 'block';
+      scanCounter.style.display = 'flex';
+      const formData = new FormData();
+      formData.append('cards', file);
+      fetch('/api/portfolio/upload', { method: 'POST', body: formData })
+        .then(res => res.json())
+        .then(data => {
+          const cards = data.cards || [];
+          if (cards.length > 0) {
+            cards.forEach(c => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(c); });
+            updateScanStripItem(scanId, { name: cards[0].card_name || 'Unknown', price: cards[0].current_price || 0, imageUrl: cards[0].image_url || thumbUrl, status: 'success' });
+          } else {
+            updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
+          }
+          fetchPortfolio();
+        })
+        .catch(err => {
+          updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
+        });
+    });
+  }
+  galleryInput.value = '';
+});
+
+// ── UPLOAD TAB FILE HANDLING ──────────────────────────────────────
+dropZone.addEventListener('click', () => fileInput.click());
+['dragenter','dragover'].forEach(evt => {
+  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
 });
 ['dragleave','dragend'].forEach(evt => {
   dropZone.addEventListener(evt, () => dropZone.classList.remove('drag-over'));
@@ -474,7 +844,7 @@ fileInput.addEventListener('change', () => {
   fileInput.value = '';
 });
 
-// ── FILE PROCESSING ───────────────────────────────────────────────
+// ── FILE PROCESSING (Upload Tab) ──────────────────────────────────
 async function processFiles(files) {
   dropZone.style.display = 'none';
   uploadQueue.style.display = 'block';
@@ -500,49 +870,29 @@ async function processFiles(files) {
   });
 
   let success = 0, fail = 0;
-
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     const el = itemEls[i];
     const statusEl = el.querySelector('.queue-item-status');
     const progress = el.querySelector('.queue-item-progress-bar');
     const icon = el.querySelector('.queue-item-status-icon');
-
     statusEl.textContent = 'Analyzing with AI…';
     progress.style.width = '30%';
     icon.textContent = '🔍';
-
     try {
       const formData = new FormData();
       formData.append('cards', file);
-
       progress.style.width = '60%';
       statusEl.textContent = 'Fetching market price…';
-
-      const res = await fetch('/api/portfolio/upload', {
-        method: 'POST',
-        body: formData
-      });
-
+      const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
       progress.style.width = '90%';
-
-      if (!res.ok) {
-        let errMsg = `Upload failed (${res.status})`;
-        try { const d = await res.json(); errMsg = d.error || errMsg; } catch {}
-        throw new Error(errMsg);
-      }
-
+      if (!res.ok) { let errMsg = `Upload failed (${res.status})`; try { const d = await res.json(); errMsg = d.error || errMsg; } catch {} throw new Error(errMsg); }
       const data = await res.json();
       progress.style.width = '100%';
-
       const cards = data.cards || data.results || [];
       if (cards.length > 0) {
         const c = cards[0];
-        if (cards.length > 1) {
-            statusEl.textContent = `✅ Found ${cards.length} cards (incl. ${c.card_name || 'Unknown'})`;
-        } else {
-            statusEl.textContent = `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
-        }
+        statusEl.textContent = cards.length > 1 ? `✅ Found ${cards.length} cards (incl. ${c.card_name || 'Unknown'})` : `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
         icon.textContent = '✅';
         success += cards.length;
       } else {
@@ -561,11 +911,7 @@ async function processFiles(files) {
   queueTitle.textContent = `Done! ${success} card${success !== 1 ? 's' : ''} added`;
   queueStatus.textContent = fail > 0 ? `${fail} failed` : '✓ All successful';
   queueStatus.style.color = fail > 0 ? '#dc2626' : '#16a34a';
-
-  // Refresh portfolio
   await fetchPortfolio();
-
-  // Reset upload form for next upload
   setTimeout(() => {
     dropZone.style.display = 'block';
     uploadQueue.style.display = 'none';
@@ -573,11 +919,14 @@ async function processFiles(files) {
   }, 5000);
 }
 
+
+
 // ── CARD DETAIL DRAWER ─────────────────────────────────────────────
 function openDrawer(card) {
   activeDrawerCard = card;
-  const pct = fmtChange(card.current_price, card.previous_price);
-  const delta = card.current_price && card.previous_price ? card.current_price - card.previous_price : null;
+  const pct = getPeriodChange(card, 'prev_day_price');
+  const delta = getPeriodDelta(card, 'prev_day_price');
+  const summary = card.history_summary || {};
 
   drawerCardName.textContent = card.card_name || 'Unknown Card';
   drawerCardMeta.textContent = [card.card_set, card.rarity, card.condition].filter(Boolean).join(' • ') || '—';
@@ -592,10 +941,16 @@ function openDrawer(card) {
     drawerChange.className = 'drawer-change badge-neutral';
   }
 
-  const imgSrc = card.image_url || card.image_data || '';
+  const imgSrc = card.image_url || '';
   if (imgSrc) {
     drawerCardImg.src = imgSrc;
     drawerCardImg.style.display = 'block';
+  } else if (card.has_local_image) {
+    drawerCardImg.style.display = 'block';
+    drawerCardImg.src = '';
+    fetch(`/api/portfolio/${card.id}/image`).then(r => r.json()).then(d => {
+      if (d.image_data) drawerCardImg.src = d.image_data;
+    }).catch(() => { drawerCardImg.style.display = 'none'; });
   } else {
     drawerCardImg.style.display = 'none';
   }
@@ -611,6 +966,12 @@ function openDrawer(card) {
   setDetail('drawerHoloType', card.holo_type);
   setDetail('drawer1stEd', card.is_first_edition ? '✓ Yes' : 'No');
   setDetail('drawerConfidence', card.confidence != null ? `${Math.round(card.confidence * 100)}%` : '—');
+  setDetail('drawerHighestSale', fmt(card.highest_recent_sale));
+  setDetail('drawer24hTrend', formatTrendText(card, 'prev_day_price'));
+  setDetail('drawer7dTrend', formatTrendText(card, 'prev_7d_price'));
+  setDetail('drawer30dTrend', formatTrendText(card, 'prev_30d_price'));
+  setDetail('drawerAllTimeHigh', fmt(summary.all_time_high));
+  setDetail('drawerAllTimeLow', fmt(summary.all_time_low));
   const sourceBadgeHtml = card.price_source_url 
     ? `<a href="${card.price_source_url}" target="_blank" style="color:#3b82f6;text-decoration:none;">${card.price_source || 'market'} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg></a>`
     : (card.price_source || '—');
@@ -630,6 +991,76 @@ function openDrawer(card) {
   if (emptyState) emptyState.style.display = 'none';
   
   fetchAndDrawChart(card.id, 7);
+
+  // Load price comparison data
+  renderPriceComparison(card);
+}
+
+const SOURCE_LABELS = {
+  'tcgdex_tcgplayer': 'TCGdex → TCGplayer',
+  'tcgdex_cardmarket': 'TCGdex → Cardmarket',
+  'pokemon_tcg_api': 'Pokemon TCG API',
+  'justtcg_tcgplayer': 'JustTCG → TCGplayer',
+  'scrydex_tcgplayer': 'Scrydex → TCGplayer',
+  'scrydex_cardmarket': 'Scrydex → Cardmarket',
+  'ebay_sold': 'eBay Sold Listings',
+  'tcgplayer_direct': 'TCGplayer (Direct)',
+  'cardmarket_direct': 'Cardmarket (Direct)',
+  'cardmarket': 'Cardmarket',
+  'trollandtoad': 'Troll and Toad',
+  'tcgfish': 'TCGFish',
+  'cardmavin': 'Card Mavin',
+  'coolstuffinc': 'CoolStuffInc',
+  'pricecharting': 'PriceCharting',
+  'aggregated_market': 'Aggregated',
+  'reference': 'Reference',
+  'ai_estimate': 'AI Estimate',
+  'market': 'Market'
+};
+
+function renderPriceComparison(card) {
+  const tableEl = document.getElementById('priceComparisonTable');
+  const badgeEl = document.getElementById('sourcesCheckedBadge');
+  if (!tableEl) return;
+
+  const sources = card.price_sources || {};
+  const entries = Object.entries(sources).filter(([, v]) => v && v.price > 0);
+
+  if (entries.length === 0) {
+    tableEl.innerHTML = '<div style="color:#9ca3af;text-align:center;padding:0.75rem;font-size:0.75rem;">Click "Refresh Prices" to check 12 sources</div>';
+    if (badgeEl) badgeEl.textContent = '';
+    return;
+  }
+
+  // Sort by price descending (highest first = best sold price)
+  entries.sort((a, b) => b[1].price - a[1].price);
+
+  const bestPrice = entries[0][1].price;
+  if (badgeEl) badgeEl.textContent = `${entries.length} sources found`;
+
+  let html = '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">';
+  html += '<table style="width:100%;border-collapse:collapse;">';
+  html += '<thead><tr style="background:#f9fafb;"><th style="text-align:left;padding:6px 10px;font-weight:500;color:#6b7280;font-size:0.75rem;">Source</th><th style="text-align:right;padding:6px 10px;font-weight:500;color:#6b7280;font-size:0.75rem;">Price</th></tr></thead>';
+  html += '<tbody>';
+
+  for (const [source, data] of entries) {
+    const label = SOURCE_LABELS[source] || source;
+    const isBest = data.price === bestPrice;
+    const priceColor = isBest ? '#10b981' : '#111827';
+    const bestBadge = isBest ? ' <span style="background:#10b981;color:white;padding:1px 5px;border-radius:4px;font-size:0.65rem;font-weight:600;">BEST</span>' : '';
+
+    const link = data.url
+      ? `<a href="${data.url}" target="_blank" style="color:#3b82f6;text-decoration:none;">${label} <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg></a>`
+      : `<span style="color:#374151;">${label}</span>`;
+
+    html += `<tr style="border-top:1px solid #f3f4f6;">`;
+    html += `<td style="padding:6px 10px;">${link}${bestBadge}</td>`;
+    html += `<td style="padding:6px 10px;text-align:right;font-weight:${isBest ? '700' : '500'};color:${priceColor};font-variant-numeric:tabular-nums;">$${data.price.toFixed(2)}</td>`;
+    html += `</tr>`;
+  }
+
+  html += '</tbody></table></div>';
+  tableEl.innerHTML = html;
 }
 
 function setDetail(id, val) {
@@ -663,11 +1094,15 @@ async function fetchAndDrawChart(cardId, days) {
     if (!res.ok) return;
     const data = await res.json();
     const history = (data.history || []);
+    const card = portfolio.find(c => c.id === cardId);
+    if (card) card.history_summary = data.summary || null;
 
-    // Filter to `days` window
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const filtered = history.filter(h => new Date(h.recorded_at) >= cutoff);
-    const pts = filtered.length >= 2 ? filtered : history.slice(-2);
+    let pts = history;
+    if (days > 0) {
+      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const filtered = history.filter(h => new Date(h.recorded_at) >= cutoff);
+      pts = filtered.length >= 2 ? filtered : history.slice(-2);
+    }
 
     drawChart(pts);
   } catch (err) {
@@ -768,12 +1203,37 @@ deleteCardBtn.addEventListener('click', () => {
 window.confirmDelete = confirmDelete;
 
 // ── SSE (Server-Sent Events) live updates ─────────────────────────
+// Falls back to polling on serverless platforms (Vercel) where SSE isn't supported
+let _ssePollingMode = false;
+
 function connectSSE() {
+  // First, probe the endpoint to see if we're in polling mode
+  fetch('/api/events').then(r => {
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      // Serverless mode — use polling instead of SSE
+      _ssePollingMode = true;
+      console.log('[SSE] Serverless detected, switching to polling');
+      startPolling();
+      return;
+    }
+    // Close this fetch (it was a probe) and open a real EventSource
+    r.body?.cancel();
+    openEventSource();
+  }).catch(() => openEventSource());
+}
+
+function startPolling() {
+  // Polling disabled in favor of Server-Sent Events (SSE)
+  // which will trigger fetchPortfolio() automatically when the server broadcasts an update.
+}
+
+function openEventSource() {
   const evtSource = new EventSource('/api/events');
   evtSource.onmessage = async (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'card_added' || msg.type === 'prices_refreshed') {
+      if (msg.type === 'card_added' || msg.type === 'prices_refreshed' || msg.type === 'portfolio_updated') {
         await fetchPortfolio();
       }
       
@@ -801,86 +1261,20 @@ function connectSSE() {
     } catch {}
   };
   evtSource.onerror = () => {
-    // SSE disconnected — retry after 10 seconds
     evtSource.close();
     setTimeout(connectSSE, 10000);
   };
 }
 
-// ── AUTHENTICATION ────────────────────────────────────────────────
+// ── NO AUTH — single-user mode ────────────────────────────────────
 async function checkAuth() {
-  try {
-    const res = await fetch('/api/auth/me');
-    if (res.ok) {
-      const data = await res.json();
-      navUsername.textContent = data.username;
-      authGateway.style.display = 'none';
-      appContainer.style.display = 'block';
-      await fetchPortfolio();
-      connectSSE();
-      return true;
-    }
-  } catch (err) {}
-  
-  // Not authenticated
-  authGateway.style.display = 'flex';
-  appContainer.style.display = 'none';
-  return false;
+  if (authGateway) authGateway.style.display = 'none';
+  if (appContainer) appContainer.style.display = 'block';
+  if (navUsername) navUsername.textContent = 'Jack';
+  await fetchPortfolio();
+  connectSSE();
+  return true;
 }
-
-authForm.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  authError.textContent = '';
-  loginBtn.disabled = true;
-  loginBtn.textContent = 'Logging in...';
-  
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: authUsername.value, password: authPassword.value })
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Login failed');
-    await checkAuth();
-  } catch (err) {
-    authError.textContent = err.message;
-  } finally {
-    loginBtn.disabled = false;
-    loginBtn.textContent = 'Login';
-  }
-});
-
-registerBtn.addEventListener('click', async () => {
-  if (!authUsername.value || !authPassword.value) {
-    authError.textContent = 'Username and password required';
-    return;
-  }
-  authError.textContent = '';
-  registerBtn.disabled = true;
-  registerBtn.textContent = 'Creating...';
-  
-  try {
-    const res = await fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: authUsername.value, password: authPassword.value })
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Registration failed');
-    await checkAuth();
-  } catch (err) {
-    authError.textContent = err.message;
-  } finally {
-    registerBtn.disabled = false;
-    registerBtn.textContent = 'Create Account';
-  }
-});
-
-logoutBtn.addEventListener('click', async () => {
-  await fetch('/api/auth/logout', { method: 'POST' });
-  location.reload();
-});
 
 // ── INIT ──────────────────────────────────────────────────────────
 (async function init() {

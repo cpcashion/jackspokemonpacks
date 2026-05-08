@@ -12,27 +12,15 @@
 </head>
 <body>
 
-  <!-- ── AUTHENTICATION GATEWAY ─────────────────────────────── -->
-  <div class="auth-gateway" id="authGateway">
-    <div class="auth-card">
-      <div class="auth-header">
-        <div class="auth-logo">⚡</div>
-        <h2>Welcome to Jack's Pokémon Portfolio</h2>
-        <p>A persistent stock-market tracker for your collection.</p>
-      </div>
-      <form id="authForm" class="auth-form">
-        <input type="text" id="authUsername" placeholder="Username" required autocomplete="username" />
-        <input type="password" id="authPassword" placeholder="Password" required autocomplete="current-password" />
-        <div class="auth-actions">
-          <button type="button" class="btn-secondary" id="registerBtn">Create Account</button>
-          <button type="submit" class="btn-primary" id="loginBtn">Login</button>
-        </div>
-        <p class="auth-error" id="authError"></p>
-      </form>
-    </div>
-  </div>
+  <!-- Hidden auth elements (kept for JS compatibility) -->
+  <div id="authGateway" style="display:none;"></div>
+  <div id="authForm" style="display:none;"></div>
+  <input id="authUsername" type="hidden"><input id="authPassword" type="hidden">
+  <span id="authError" style="display:none;"></span>
+  <button id="registerBtn" style="display:none;"></button>
+  <button id="loginBtn" style="display:none;"></button>
 
-  <div class="app-container" id="appContainer" style="display: none;">
+  <div class="app-container" id="appContainer">
 
   <!-- ── TOP NAVIGATION BAR ─────────────────────────────────── -->
   <header class="topbar">
@@ -50,10 +38,8 @@
         Add Cards
       </button>
       <div class="user-menu" style="display: flex; align-items: center; gap: 0.5rem; margin-left: 1rem; color: #4b5563; font-weight: 500;">
-        <span id="navUsername">User</span>
-        <button class="btn-ghost" id="logoutBtn" title="Log Out" style="padding: 0.5rem;">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-        </button>
+        <span id="navUsername">Jack</span>
+        <button id="logoutBtn" style="display:none;"></button>
       </div>
     </div>
   </header>
@@ -155,23 +141,108 @@
 
   </main>
 
-  <!-- ── UPLOAD MODAL ───────────────────────────────────────── -->
-  <div class="modal-overlay" id="uploadModal">
-    <div class="modal">
-      <div class="modal-header">
-        <h2 class="modal-title">Add Pokemon Cards</h2>
-        <button class="modal-close" id="closeUploadBtn" aria-label="Close">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  <!-- ── SCANNER MODAL ───────────────────────────────────────── -->
+  <div class="scanner-overlay" id="uploadModal">
+    <div class="scanner-modal">
+      <!-- Scanner Header -->
+      <div class="scanner-header">
+        <h2 class="scanner-title">Add Cards</h2>
+        <div class="scanner-tabs">
+          <button class="scanner-tab active" id="tabCamera" data-tab="camera">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Camera
+          </button>
+          <button class="scanner-tab" id="tabUpload" data-tab="upload">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            Upload
+          </button>
+        </div>
+        <button class="scanner-close" id="closeUploadBtn" aria-label="Close">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
-      <div class="modal-body">
+
+      <!-- ── CAMERA TAB ── -->
+      <div class="scanner-body" id="scannerCameraTab">
+        <!-- Permission / Error States -->
+        <div class="camera-permission" id="cameraPermission" style="display:none;">
+          <div class="permission-icon">📸</div>
+          <h3>Camera Access Needed</h3>
+          <p>Allow camera access to scan your Pokémon cards directly.</p>
+          <button class="btn-primary" id="grantCameraBtn">Enable Camera</button>
+          <button class="btn-ghost" id="switchToUploadBtn" style="margin-top:12px;">Use File Upload Instead</button>
+        </div>
+
+        <div class="camera-error" id="cameraError" style="display:none;">
+          <div class="permission-icon">⚠️</div>
+          <h3 id="cameraErrorTitle">Camera Not Available</h3>
+          <p id="cameraErrorText">Your browser doesn't support camera access or permission was denied.</p>
+          <button class="btn-primary" id="retryCameraBtn">Try Again</button>
+          <button class="btn-ghost" id="switchToUploadBtn2" style="margin-top:12px;">Use File Upload Instead</button>
+        </div>
+
+        <!-- Live Viewfinder -->
+        <div class="viewfinder-container" id="viewfinderContainer" style="display:none;">
+          <video id="cameraVideo" autoplay playsinline muted></video>
+          
+          <!-- Card alignment guide overlay -->
+          <div class="card-guide-overlay">
+            <div class="card-guide">
+              <div class="guide-corner guide-tl"></div>
+              <div class="guide-corner guide-tr"></div>
+              <div class="guide-corner guide-bl"></div>
+              <div class="guide-corner guide-br"></div>
+            </div>
+            <div class="guide-hint" id="guideHint">Center card in frame</div>
+          </div>
+
+          <!-- Capture flash effect -->
+          <div class="capture-flash" id="captureFlash"></div>
+
+          <!-- Camera controls -->
+          <div class="camera-controls">
+            <button class="camera-btn camera-btn-gallery" id="galleryBtn" title="Choose from gallery">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            </button>
+            <input type="file" id="galleryInput" accept="image/*,.heic,.heif" multiple hidden />
+            
+            <button class="camera-btn camera-btn-capture" id="captureBtn" title="Capture card">
+              <div class="capture-ring"></div>
+            </button>
+            
+            <button class="camera-btn camera-btn-flash" id="flashBtn" title="Toggle flash" style="display:none;">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </button>
+            <button class="camera-btn camera-btn-switch" id="switchCameraBtn" title="Switch camera" style="display:none;">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            </button>
+          </div>
+
+          <!-- Scan counter badge -->
+          <div class="scan-counter" id="scanCounter" style="display:none;">
+            <span id="scanCountNum">0</span> scanned
+          </div>
+        </div>
+
+        <!-- Scanned cards strip (shows at bottom during scanning) -->
+        <div class="scan-strip" id="scanStrip" style="display:none;">
+          <div class="scan-strip-header">
+            <span class="scan-strip-title" id="scanStripTitle">Scanned Cards</span>
+            <button class="btn-ghost btn-sm" id="scanDoneBtn">Done</button>
+          </div>
+          <div class="scan-strip-cards" id="scanStripCards"></div>
+        </div>
+      </div>
+
+      <!-- ── UPLOAD TAB ── -->
+      <div class="scanner-body" id="scannerUploadTab" style="display:none;">
         <div class="drop-zone" id="dropZone">
-          <div class="drop-icon">📸</div>
+          <div class="drop-icon">📁</div>
           <p class="drop-text">Drag &amp; drop card photos here</p>
           <p class="drop-subtext">or</p>
           <label class="btn-secondary" for="fileInput">Browse Files</label>
           <input type="file" id="fileInput" accept="image/*,.heic,.heif,.dng,.cr2,.nef,.arw,.raw" multiple hidden />
-          <p class="drop-hint">Supports JPG, PNG, HEIC, WEBP, RAW — up to 10 photos at once<br>AI will identify each card and fetch live market prices</p>
+          <p class="drop-hint">Supports JPG, PNG, HEIC, WEBP, RAW — up to 20 photos at once<br>AI will identify each card and fetch live market prices</p>
         </div>
 
         <div class="upload-queue" id="uploadQueue" style="display:none;">
@@ -182,8 +253,28 @@
           <div class="queue-items" id="queueItems"></div>
         </div>
       </div>
+
+      <!-- ── SCAN RESULTS (shown after scanning session) ── -->
+      <div class="scanner-body scan-results" id="scanResults" style="display:none;">
+        <div class="results-header">
+          <div class="results-icon">🎉</div>
+          <h3 class="results-title" id="resultsTitle">Cards Added!</h3>
+          <p class="results-subtitle" id="resultsSubtitle">3 cards identified and added to your portfolio</p>
+        </div>
+        <div class="results-cards" id="resultsCards"></div>
+        <div class="results-actions">
+          <button class="btn-primary" id="resultsScanMoreBtn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Scan More Cards
+          </button>
+          <button class="btn-ghost" id="resultsDoneBtn">Done</button>
+        </div>
+      </div>
     </div>
   </div>
+
+  <!-- Hidden canvas for camera capture -->
+  <canvas id="captureCanvas" style="display:none;"></canvas>
 
   <!-- ── CARD DETAIL DRAWER ─────────────────────────────────── -->
   <div class="drawer-overlay" id="drawerOverlay">
@@ -209,9 +300,10 @@
         </div>
         <div class="chart-container">
           <div class="chart-tabs">
+            <button class="chart-tab" data-days="1">1D</button>
             <button class="chart-tab active" data-days="7">7D</button>
-            <button class="chart-tab" data-days="30">1M</button>
-            <button class="chart-tab" data-days="90">3M</button>
+            <button class="chart-tab" data-days="30">30D</button>
+            <button class="chart-tab" data-days="0">All</button>
           </div>
           <canvas id="priceChart" height="200"></canvas>
         </div>
@@ -261,7 +353,43 @@
               <span class="detail-label">Price Source</span>
               <span class="detail-value" id="drawerPriceSource">—</span>
             </div>
+            <div class="detail-item">
+              <span class="detail-label">Highest Sale (30D)</span>
+              <span class="detail-value" id="drawerHighestSale">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">24H Change</span>
+              <span class="detail-value" id="drawer24hTrend">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">7D Change</span>
+              <span class="detail-value" id="drawer7dTrend">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">30D Change</span>
+              <span class="detail-value" id="drawer30dTrend">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">All-Time High</span>
+              <span class="detail-value" id="drawerAllTimeHigh">—</span>
+            </div>
+            <div class="detail-item">
+              <span class="detail-label">All-Time Low</span>
+              <span class="detail-value" id="drawerAllTimeLow">—</span>
+            </div>
           </div>
+
+          <!-- Price Comparison Section -->
+          <div class="price-comparison-section" id="priceComparisonSection" style="margin-top:1rem;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+              <h4 style="margin:0;font-size:0.85rem;font-weight:600;color:#6b7280;">📊 Price Comparison</h4>
+              <span id="sourcesCheckedBadge" style="font-size:0.7rem;color:#9ca3af;"></span>
+            </div>
+            <div id="priceComparisonTable" style="font-size:0.8rem;">
+              <div style="color:#9ca3af;text-align:center;padding:1rem;">Prices load after first refresh</div>
+            </div>
+          </div>
+
           <button class="btn-danger-outline" id="deleteCardBtn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
             Remove from Portfolio

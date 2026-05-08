@@ -1386,33 +1386,14 @@ async function lookupMarketPrice(card) {
         } catch { return null; }
     })());
 
-    // 6-12. Web scrapers (run with timeouts, non-critical)
-    const scraperPromises = [
-        (async () => { try { return await scrapeTCGplayerPrice(cardName, cardSet, cardNumber); } catch { return null; } })(),
-        (async () => { try { return await scrapeCardmarketPrice(cardName, cardSet); } catch { return null; } })(),
-        (async () => { try { return await scrapeTrollAndToad(cardName, cardSet); } catch { return null; } })(),
-        (async () => { try { return await scrapeTCGFish(cardName, cardSet); } catch { return null; } })(),
-        (async () => { try { return await scrapeCardMavin(cardName, cardSet, cardNumber); } catch { return null; } })(),
-        (async () => { try { return await scrapeCoolStuffInc(cardName, cardSet); } catch { return null; } })(),
-        (async () => { try { return await scrapePriceCharting(cardName, cardSet); } catch { return null; } })(),
-    ];
-
-    // Race scrapers with a 8-second overall timeout
-    const scraperRace = Promise.allSettled(scraperPromises.map(p =>
-        Promise.race([p, new Promise(resolve => setTimeout(() => resolve(null), 8000))])
-    ));
-
-    // Wait for primary sources + scrapers in parallel
-    const [primaryResults, scraperResults] = await Promise.all([
-        Promise.allSettled(sourcePromises),
-        scraperRace
-    ]);
+    // Wait for primary API sources
+    const primaryResults = await Promise.allSettled(sourcePromises);
 
     // ── Collect all valid prices ────────────────────────────────
     let validPrices = [];
     const allSourcePrices = {}; // Per-source price breakdown for the UI
 
-    for (const res of [...primaryResults, ...scraperResults]) {
+    for (const res of primaryResults) {
         if (res.status === 'fulfilled' && res.value && res.value.price > 0) {
             validPrices.push(res.value);
             allSourcePrices[res.value.source] = {
@@ -1423,7 +1404,7 @@ async function lookupMarketPrice(card) {
         }
     }
 
-    const sourcesChecked = primaryResults.length + scraperResults.length;
+    const sourcesChecked = primaryResults.length;
 
     if (validPrices.length > 0) {
         validPrices.sort((a, b) => a.price - b.price);

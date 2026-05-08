@@ -182,6 +182,21 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
 }
 
 async function insertPricePoint(cardId, price, source, sourceUrl = '') {
+    try {
+        const latest = await pool.query(`SELECT price, recorded_at FROM price_history WHERE card_id = $1 ORDER BY recorded_at DESC LIMIT 1`, [cardId]);
+        if (latest.rows.length > 0) {
+            const lastPrice = Number(latest.rows[0].price);
+            const lastRecordedAt = new Date(latest.rows[0].recorded_at).getTime();
+            const ageHours = (Date.now() - lastRecordedAt) / (1000 * 60 * 60);
+            
+            // Skip inserting if the price is exactly the same AND the last point was recorded less than 24 hours ago
+            if (lastPrice === price && ageHours < 24) {
+                return;
+            }
+        }
+    } catch (err) {
+        console.error('Error checking latest price point:', err);
+    }
     await pool.query(`INSERT INTO price_history (card_id, price, source, source_url) VALUES ($1, $2, $3, $4)`, [cardId, price, source || 'market', sourceUrl]);
 }
 
@@ -661,22 +676,22 @@ function extractMarketPriceFromPokemonCandidate(candidate, card) {
         const htLower = normalizeText(holoType);
         if (htLower.includes('reverse') && prices.reverseHolofoil?.market) {
             price = prices.reverseHolofoil.market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_reverse_holo';
         } else if (isFirstEd && prices['1stEditionHolofoil']?.market) {
             price = prices['1stEditionHolofoil'].market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_1st_edition';
         } else if (!isFirstEd && prices.unlimitedHolofoil?.market) {
             price = prices.unlimitedHolofoil.market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_unlimited_holo';
         } else if (!isFirstEd && prices.unlimited?.market) {
             price = prices.unlimited.market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_unlimited';
         } else if ((htLower === 'holofoil' || htLower === 'cosmos holo') && prices.holofoil?.market) {
             price = prices.holofoil.market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_holo';
         } else if ((htLower === 'non holo' || htLower === 'non-holo') && prices.normal?.market) {
             price = prices.normal.market;
-            source = 'pokemon_tcg_api';
+            source = 'tcgplayer_normal';
         }
 
         if (!price) {
@@ -692,7 +707,7 @@ function extractMarketPriceFromPokemonCandidate(candidate, card) {
             if (!price) {
                 price = prices.holofoil?.mid || prices.normal?.mid || null;
             }
-            if (price) source = 'pokemon_tcg_api';
+            if (price) source = 'pokemon_tcg_api_fallback';
         }
     }
     if (!price && candidate.cardmarket?.prices) {

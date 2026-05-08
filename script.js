@@ -995,11 +995,17 @@ function openDrawer(card) {
   // Load price comparison data
   renderPriceComparison(card);
 }
-
 const SOURCE_LABELS = {
   'tcgdex_tcgplayer': 'TCGdex → TCGplayer',
   'tcgdex_cardmarket': 'TCGdex → Cardmarket',
   'pokemon_tcg_api': 'Pokemon TCG API',
+  'pokemon_tcg_api_fallback': 'Pokemon TCG API (Fallback)',
+  'tcgplayer_reverse_holo': 'TCGplayer (Reverse Holo)',
+  'tcgplayer_1st_edition': 'TCGplayer (1st Edition)',
+  'tcgplayer_unlimited_holo': 'TCGplayer (Unlimited Holo)',
+  'tcgplayer_unlimited': 'TCGplayer (Unlimited)',
+  'tcgplayer_holo': 'TCGplayer (Holo)',
+  'tcgplayer_normal': 'TCGplayer (Normal)',
   'justtcg_tcgplayer': 'JustTCG → TCGplayer',
   'scrydex_tcgplayer': 'Scrydex → TCGplayer',
   'scrydex_cardmarket': 'Scrydex → Cardmarket',

@@ -1306,11 +1306,6 @@ async function lookupMarketPrice(card) {
     const cached = priceCache.get(key);
     if (cached && Date.now() - cached.ts < 86400000) return { ...cached };
 
-    const known = checkKnownCards(cardName, cardSet);
-    if (known) {
-        priceCache.set(key, { price: known, source: 'reference', ts: Date.now() });
-        return { price: known, source: 'reference' };
-    }
 
     // ── Query ALL sources in parallel ────────────────────────────
     const sourcePromises = [];
@@ -1323,26 +1318,20 @@ async function lookupMarketPrice(card) {
         } catch { return null; }
     })());
 
-    // 2. PokemonTCG API
+    // 2. PokemonTCG API (always run — most accurate source for TCGplayer market price)
     if (POKEMON_TCG_KEY) {
-        if (!hasDistinctVariantEvidence({ card_set: cardSet, card_number: cardNumber })) {
-            sourcePromises.push(Promise.resolve(null));
-        } else {
-            sourcePromises.push((async () => {
-                try {
-                    const candidates = await fetchPokemonTcgCandidates({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year });
-                    if (candidates.length) {
-                        const { bestCandidate, bestScore } = pickBestPokemonCardCandidate({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year }, candidates);
-                        if (bestCandidate && isLikelyVerifiedMatch(bestScore, bestCandidate, {
-                            card_name: cardName, card_set: cardSet, card_number: cardNumber, year, confidence: 0.95
-                        })) {
-                            return extractMarketPriceFromPokemonCandidate(bestCandidate, card);
-                        }
+        sourcePromises.push((async () => {
+            try {
+                const candidates = await fetchPokemonTcgCandidates({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year });
+                if (candidates.length) {
+                    const { bestCandidate, bestScore } = pickBestPokemonCardCandidate({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year }, candidates);
+                    if (bestCandidate) {
+                        return extractMarketPriceFromPokemonCandidate(bestCandidate, card);
                     }
-                    return null;
-                } catch { return null; }
-            })());
-        }
+                }
+                return null;
+            } catch { return null; }
+        })());
     } else {
         sourcePromises.push(Promise.resolve(null));
     }
@@ -1367,24 +1356,8 @@ async function lookupMarketPrice(card) {
         catch { return null; }
     })());
 
-    // 5. eBay Sold Listings
-    sourcePromises.push((async () => {
-        try {
-            const query = cardNumber
-                ? `"${cardName}" ${cardNumber} pokemon card`
-                : `"${cardName}" ${cardSet || ''} pokemon card`;
-            const listings = await scrapeEbayHTML(query);
-            if (listings.length > 0) {
-                const filtered = filterComparableListings(listings, cardName, cardSet, cardNumber);
-                const summary = summarizeComparableSales(filtered);
-                if (summary) {
-                    const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_sop=13`;
-                    return { price: summary.marketPrice, source: 'ebay_sold', url, highestRecentSale: summary.highestRecentSale, highestRecentSaleSource: 'ebay_sold', highestRecentSaleUrl: url };
-                }
-            }
-            return null;
-        } catch { return null; }
-    })());
+    // NOTE: All HTML scrapers removed — they returned hallucinated prices.
+    // Price authority order: PokemonTCG API > TCGdex > Scrydex > JustTCG
 
     // Wait for primary API sources
     const primaryResults = await Promise.allSettled(sourcePromises);

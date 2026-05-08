@@ -1285,4 +1285,56 @@ async function checkAuth() {
 // ── INIT ──────────────────────────────────────────────────────────
 (async function init() {
   await checkAuth();
+
+  // Edit Card Modal Logic
+  const editBtn = document.getElementById('editCardBtn');
+  const editModal = document.getElementById('editCardModal');
+  const cancelEditBtn = document.getElementById('cancelEditBtn');
+  const saveEditBtn = document.getElementById('saveEditBtn');
+  const editName = document.getElementById('editCardNameInput');
+  const editSet = document.getElementById('editCardSetInput');
+  const editNumber = document.getElementById('editCardNumberInput');
+
+  if (editBtn && editModal) {
+    editBtn.addEventListener('click', () => {
+      if (!activeDrawerCard) return;
+      editName.value = activeDrawerCard.card_name || '';
+      editSet.value = activeDrawerCard.card_set || '';
+      editNumber.value = activeDrawerCard.card_number || '';
+      editModal.style.display = 'flex';
+    });
+
+    cancelEditBtn.addEventListener('click', () => {
+      editModal.style.display = 'none';
+    });
+
+    saveEditBtn.addEventListener('click', async () => {
+      if (!activeDrawerCard) return;
+      saveEditBtn.disabled = true;
+      saveEditBtn.textContent = 'Saving...';
+      try {
+        const res = await fetch(`/api/portfolio/${activeDrawerCard.id}/edit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            card_name: editName.value.trim(),
+            card_set: editSet.value.trim(),
+            card_number: editNumber.value.trim()
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('Card updated! Re-fetching price in background...');
+          editModal.style.display = 'none';
+          setTimeout(fetchPortfolio, 1500); // refresh after a moment to let the background job start
+        } else {
+          showToast('Error: ' + data.error);
+        }
+      } catch (err) {
+        showToast('Network error updating card.');
+      }
+      saveEditBtn.disabled = false;
+      saveEditBtn.textContent = 'Save & Refresh';
+    });
+  }
 })();

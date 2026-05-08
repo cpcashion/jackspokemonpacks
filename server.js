@@ -1750,6 +1750,25 @@ app.delete('/api/portfolio/:id', requireAuth, async (req, res) => {
     }
 });
 
+// Edit card details (set, number, etc)
+app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res) => {
+    try {
+        const { card_name, card_set, card_number } = req.body;
+        await pool.query(
+            `UPDATE portfolio_cards SET card_name = $1, card_set = $2, card_number = $3, last_price_check = NULL WHERE id = $4 AND user_id = $5`,
+            [card_name, card_set, card_number, parseInt(req.params.id), req.user.id]
+        );
+        // Delete history so we start fresh with the new card variant
+        await pool.query(`DELETE FROM price_history WHERE card_id = $1`, [parseInt(req.params.id)]);
+        // Trigger a background refresh for this specific card
+        updatePortfolioCardMarketData(parseInt(req.params.id), {}).catch(err => console.error("Edit Refresh Error:", err));
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Edit error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Manually trigger price refresh
 app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
     try {
@@ -1991,9 +2010,9 @@ app.get('/api/cron/refresh-prices', async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     try {
-        const batchSize = parseInt(req.query.batch) || 5;
-        const result = await refreshBatchPrices(Math.min(batchSize, 10)); // Cap at 10
-        res.json({ success: true, ...result });
+        // Kick off the refresh asynchronously so we don't timeout the HTTP response
+        refreshAllPrices().catch(err => console.error('[Cron] Refresh error:', err.message));
+        res.json({ success: true, message: "Background refresh started" });
     } catch (err) {
         console.error('[Cron] Refresh error:', err.message);
         res.status(500).json({ error: err.message });

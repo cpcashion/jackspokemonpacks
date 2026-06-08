@@ -136,6 +136,32 @@ function showToast(msg, type = 'info', duration = 4000) {
   setTimeout(() => t.remove(), duration);
 }
 
+// ── HEIC CONVERSION ────────────────────────────────────────────────
+async function ensureJpeg(file) {
+  const isHeic = file.name.match(/\.(heic|heif)$/i) || file.type === 'image/heic' || file.type === 'image/heif';
+  if (!isHeic) return file;
+  
+  try {
+    if (typeof heic2any === 'undefined') {
+      console.warn('heic2any not loaded, attempting to upload raw HEIC');
+      return file;
+    }
+    showToast('Converting HEIC photo...', 'info', 2000);
+    const blob = await heic2any({
+      blob: file,
+      toType: 'image/jpeg',
+      quality: 0.8
+    });
+    // handle heic2any returning array of blobs for multi-frame images
+    const resultBlob = Array.isArray(blob) ? blob[0] : blob;
+    return new File([resultBlob], file.name.replace(/\.(heic|heif)$/i, '.jpg'), { type: 'image/jpeg' });
+  } catch (err) {
+    console.error('HEIC conversion failed:', err);
+    showToast('Could not convert HEIC, trying original...', 'info', 2000);
+    return file;
+  }
+}
+
 // ── SPARKLINE SVG ─────────────────────────────────────────────────
 function renderSparkline(priceHistory, positive) {
   const prices = (priceHistory || []).slice(-14).map(p => Number(p.price || 0));
@@ -793,33 +819,34 @@ document.getElementById('resultsDoneBtn')?.addEventListener('click', closeModal)
 
 // ── GALLERY BUTTON (from camera tab) ──────────────────────────────
 galleryBtn.addEventListener('click', () => galleryInput.click());
-galleryInput.addEventListener('change', () => {
+galleryInput.addEventListener('change', async () => {
   const files = Array.from(galleryInput.files);
   if (files.length) {
-    files.forEach(file => {
+    for (const file of files) {
       const scanId = Date.now() + Math.random();
       const thumbUrl = URL.createObjectURL(file);
       addScanStripItem(scanId, thumbUrl, file.name, 'processing');
       scanStrip.style.display = 'block';
       scanCounter.style.display = 'flex';
-      const formData = new FormData();
-      formData.append('cards', file);
-      fetch('/api/portfolio/upload', { method: 'POST', body: formData })
-        .then(res => res.json())
-        .then(data => {
-          const cards = data.cards || [];
-          if (cards.length > 0) {
-            cards.forEach(c => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(c); });
-            updateScanStripItem(scanId, { name: cards[0].card_name || 'Unknown', price: cards[0].current_price || 0, imageUrl: cards[0].image_url || thumbUrl, status: 'success' });
-          } else {
-            updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
-          }
-          fetchPortfolio();
-        })
-        .catch(err => {
-          updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
-        });
-    });
+      
+      try {
+        const jpegFile = await ensureJpeg(file);
+        const formData = new FormData();
+        formData.append('cards', jpegFile);
+        const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
+        const data = await res.json();
+        const cards = data.cards || [];
+        if (cards.length > 0) {
+          cards.forEach(c => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(c); });
+          updateScanStripItem(scanId, { name: cards[0].card_name || 'Unknown', price: cards[0].current_price || 0, imageUrl: cards[0].image_url || thumbUrl, status: 'success' });
+        } else {
+          updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
+        }
+        await fetchPortfolio();
+      } catch (err) {
+        updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
+      }
+    }
   }
   galleryInput.value = '';
 });
@@ -876,12 +903,15 @@ async function processFiles(files) {
     const statusEl = el.querySelector('.queue-item-status');
     const progress = el.querySelector('.queue-item-progress-bar');
     const icon = el.querySelector('.queue-item-status-icon');
-    statusEl.textContent = 'Analyzing with AI…';
-    progress.style.width = '30%';
-    icon.textContent = '🔍';
+    
     try {
+      const jpegFile = await ensureJpeg(file);
+      statusEl.textContent = 'Analyzing with AI…';
+      progress.style.width = '30%';
+      icon.textContent = '🔍';
+      
       const formData = new FormData();
-      formData.append('cards', file);
+      formData.append('cards', jpegFile);
       progress.style.width = '60%';
       statusEl.textContent = 'Fetching market price…';
       const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });

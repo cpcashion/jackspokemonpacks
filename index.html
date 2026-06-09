@@ -186,6 +186,21 @@
         <!-- Live Viewfinder -->
         <div class="viewfinder-container" id="viewfinderContainer" style="display:none;">
           <video id="cameraVideo" autoplay playsinline muted></video>
+
+          <!-- Quick Verification Overlay -->
+          <div id="quickVerifyOverlay" class="quick-verify-overlay">
+            <div class="verify-img-container">
+              <img id="verifyImg" src="" alt="Verified Card" />
+            </div>
+            <div class="verify-info">
+              <div id="verifyName" class="verify-name">Card Name</div>
+              <div id="verifyMeta" class="verify-meta">Set • Rarity</div>
+              <div class="verify-price-row">
+                <div id="verifyPrice" class="verify-price">$0.00</div>
+                <div class="verify-badge">LIVE MARKET</div>
+              </div>
+            </div>
+          </div>
           
           <!-- Card alignment guide overlay -->
           <div class="card-guide-overlay">

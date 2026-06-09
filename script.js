@@ -668,6 +668,7 @@ switchCameraBtn.addEventListener('click', () => {
 captureBtn.addEventListener('click', captureCard);
 
 async function captureCard() {
+  hideVerifyOverlay();
   if (isCapturing || !cameraStream) return;
   isCapturing = true;
   captureBtn.classList.add('capturing');
@@ -720,7 +721,7 @@ async function processCapturedImage(blob, scanId, thumbUrl) {
     const data = await res.json();
     const cards = data.cards || [];
     if (cards.length > 0) {
-      cards.forEach(card => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(card); });
+      cards.forEach(card => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(card); }); showScanSuccessOverlay(cards[0]);
       const c = cards[0];
       updateScanStripItem(scanId, { name: c.card_name || 'Unknown', price: c.current_price || c.estimated_value || 0, imageUrl: c.image_url || c.image_data || thumbUrl, status: 'success' });
       showToast(cards.length === 1 ? `✅ ${c.card_name} — ${fmt(c.current_price || c.estimated_value)}` : `✅ ${cards.length} cards found!`, 'success');
@@ -950,6 +951,43 @@ async function processFiles(files) {
 }
 
 
+let verifyTimeout = null;
+
+function showScanSuccessOverlay(card) {
+  const overlay = document.getElementById("quickVerifyOverlay");
+  const img = document.getElementById("verifyImg");
+  const name = document.getElementById("verifyName");
+  const price = document.getElementById("verifyPrice");
+
+  if (!overlay || !card) return;
+
+  if (verifyTimeout) clearTimeout(verifyTimeout);
+
+  img.src = card.image_url || card.image_data || "";
+  name.textContent = card.card_name || "Unknown Card";
+  const metaEl = document.getElementById("verifyMeta");
+  if (metaEl) metaEl.textContent = `${card.card_set || "—"} • ${card.rarity || "—"}`;
+  price.textContent = fmt(card.current_price || card.estimated_value || 0);
+
+  overlay.className = "quick-verify-overlay";
+  const rarity = (card.rarity || "").toLowerCase();
+  if (rarity.includes("secret")) overlay.classList.add("verify-rarity-secret");
+  else if (rarity.includes("ultra") || rarity.includes("v max")) overlay.classList.add("verify-rarity-ultra");
+  else if (rarity.includes("holo")) overlay.classList.add("verify-rarity-holo");
+  else if (rarity.includes("rare")) overlay.classList.add("verify-rarity-rare");
+
+  overlay.classList.add("active");
+
+  verifyTimeout = setTimeout(() => {
+    overlay.classList.remove("active");
+  }, 3000);
+}
+
+function hideVerifyOverlay() {
+  const overlay = document.getElementById("quickVerifyOverlay");
+  if (overlay) overlay.classList.remove("active");
+  if (verifyTimeout) clearTimeout(verifyTimeout);
+}
 
 // ── CARD DETAIL DRAWER ─────────────────────────────────────────────
 function openDrawer(card) {

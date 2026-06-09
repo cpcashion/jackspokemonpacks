@@ -216,7 +216,14 @@ async function getAllPortfolioCards(userId) {
             week_ref.price AS prev_7d_price,
             month_ref.price AS prev_30d_price,
             latest.source AS price_source,
-            latest.source_url AS price_source_url
+            latest.source_url AS price_source_url,
+            (
+                SELECT json_agg(h) FROM (
+                    SELECT price, recorded_at FROM price_history 
+                    WHERE card_id = pc.id 
+                    ORDER BY recorded_at DESC LIMIT 15
+                ) h
+            ) as price_history
         FROM portfolio_cards pc
         LEFT JOIN LATERAL (
             SELECT ph.price, ph.source, ph.source_url, ph.recorded_at
@@ -344,7 +351,7 @@ async function getCachedPrice(name, set) {
 async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
     try {
         const searchName = encodeURIComponent(cardName.trim());
-        const resp = await axios.get(`https://api.tcgdex.net/v2/en/cards?name=${searchName}`, {
+        const resp = await axios.get(\`https://api.tcgdex.net/v2/en/cards?name=\${searchName}\`, {
             timeout: 10000,
             headers: { 'Accept': 'application/json' }
         });
@@ -367,7 +374,7 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
             const withImage = results.filter(r => r.image).slice(0, 5);
             for (const candidate of withImage) {
                 try {
-                    const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
+                    const detail = await axios.get(\`https://api.tcgdex.net/v2/en/cards/\${candidate.id}\`, {
                         timeout: 8000,
                         headers: { 'Accept': 'application/json' }
                     });
@@ -388,7 +395,7 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
         
         return null;
     } catch (err) {
-        console.error(`  [TCGdex] Error looking up "${cardName}":`, err.message);
+        console.error(\`  [TCGdex] Error looking up "\${cardName}":\`, err.message);
         return null;
     }
 }
@@ -397,7 +404,7 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
     if (!cardName) return null;
     try {
         const searchName = encodeURIComponent(cardName.trim());
-        const resp = await axios.get(`https://api.tcgdex.net/v2/en/cards?name=${searchName}`, {
+        const resp = await axios.get(\`https://api.tcgdex.net/v2/en/cards?name=\${searchName}\`, {
             timeout: 10000,
             headers: { 'Accept': 'application/json' }
         });
@@ -412,7 +419,7 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
             if (!candidate?.id) return null;
             if (detailCache.has(candidate.id)) return detailCache.get(candidate.id);
             try {
-                const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
+                const detail = await axios.get(\`https://api.tcgdex.net/v2/en/cards/\${candidate.id}\`, {
                     timeout: 10000,
                     headers: { 'Accept': 'application/json' }
                 });
@@ -447,7 +454,7 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
         const firstDetail = await loadDetail(results[0]);
         return firstDetail;
     } catch (err) {
-        console.error(`  [TCGdex] Error looking up market card "${cardName}":`, err.message);
+        console.error(\`  [TCGdex] Error looking up market card "\${cardName}":\`, err.message);
         return null;
     }
 }
@@ -524,11 +531,11 @@ async function fetchCardImageFromPokemonTCG(cardName, cardSet, cardNumber) {
         const params = { pageSize: 5 };
         if (cardNumber) {
             const num = cardNumber.split('/')[0].replace(/^0+/, '');
-            params.q = `name:"${cardName}" number:"${num}"`;
+            params.q = \`name:"\${cardName}" number:"\${num}"\`;
         } else if (cardSet) {
-             params.q = `name:"${cardName}" set.name:"*${cardSet}*"`;
+             params.q = \`name:"\${cardName}" set.name:"*\${cardSet}*"\`;
         } else {
-            params.q = `name:"${cardName}"`;
+            params.q = \`name:"\${cardName}"\`;
         }
         const resp = await axios.get('https://api.pokemontcg.io/v2/cards', { params, headers, timeout: 8000 });
         const results = resp.data?.data || [];
@@ -536,7 +543,7 @@ async function fetchCardImageFromPokemonTCG(cardName, cardSet, cardNumber) {
            return results[0].images?.large || results[0].images?.small || null;
         }
     } catch (err) {
-        console.error(`  [ImageScrape] Pokemon TCG API Failed for "${cardName}":`, err.message);
+        console.error(\`  [ImageScrape] Pokemon TCG API Failed for "\${cardName}":\`, err.message);
     }
     return null;
 }
@@ -554,7 +561,7 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
 
-const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
+const CARD_ID_PROMPT = \`You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
 Look closely at the card name, set symbol, card number, rarity, holographic patterns, 1st edition stamps, language, copyright year, and condition.
 Be conservative. Do not guess, infer, or invent card names, sets, numbers, or values. Only include a card when the physical printed card details are actually visible in the image.
 Ignore binder pages, pack art, sleeves, background objects, partial text that is not clearly readable, and any artwork that is not a physical Pokemon card.
@@ -578,16 +585,16 @@ Return ONLY valid JSON (no markdown fences):
     "notes": "Any identifying features or damage"
   }],
   "is_pokemon_card": true/false
-}`;
+}\`;
 
 function parseAiJson(text) {
     try {
-        const cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+        const cleaned = text.replace(/\`\`\`json\s*/gi, '').replace(/\`\`\`\s*/g, '').trim();
         return JSON.parse(cleaned);
     } catch {
         const m = text.match(/\{[\s\S]*\}/);
         if (m) try { return JSON.parse(m[0]); } catch { }
-        console.error(`  [parseAiJson] Failed to parse: ${text.substring(0, 100)}...`);
+        console.error(\`  [parseAiJson] Failed to parse: \${text.substring(0, 100)}...\`);
         return null;
     }
 }
@@ -606,9 +613,9 @@ function normalizeCardNumber(value) {
     if (!raw) return '';
     const firstPart = raw.split('/')[0].trim();
     const letters = firstPart.match(/^[A-Za-z]+/)?.[0] || '';
-    const digits = firstPart.match(/\d+/)?.[0] || '';
+    const digits = firstPart.match(/\\d+/)?.[0] || '';
     const cleanedDigits = digits ? String(parseInt(digits, 10)) : '';
-    return `${letters.toUpperCase()}${cleanedDigits}`.trim();
+    return \`\${letters.toUpperCase()}\${cleanedDigits}\`.trim();
 }
 
 function hasMeaningfulCardName(name) {
@@ -755,14 +762,14 @@ async function fetchPokemonTcgCandidates(card) {
     if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
 
     const queries = [];
-    const safeName = String(card.card_name || '').replace(/"/g, '\\"').trim();
-    const safeSet = String(card.card_set || '').replace(/"/g, '\\"').trim();
+    const safeName = String(card.card_name || '').replace(/"/g, '\\\\"').trim();
+    const safeSet = String(card.card_set || '').replace(/"/g, '\\\\"').trim();
     const normalizedNumber = normalizeCardNumber(card.card_number);
 
-    if (safeName && safeSet && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
-    if (safeName && safeSet) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
-    if (safeName && normalizedNumber) queries.push(`name:"${safeName}" number:"${normalizedNumber}"`);
-    if (safeName) queries.push(`name:"${safeName}"`);
+    if (safeName && safeSet && normalizedNumber) queries.push(\`name:"\${safeName}" set.name:"\${safeSet}" number:"\${normalizedNumber}"\`);
+    if (safeName && safeSet) queries.push(\`name:"\${safeName}" set.name:"\${safeSet}"\`);
+    if (safeName && normalizedNumber) queries.push(\`name:"\${safeName}" number:"\${normalizedNumber}"\`);
+    if (safeName) queries.push(\`name:"\${safeName}"\`);
 
     const unique = new Map();
 
@@ -779,7 +786,7 @@ async function fetchPokemonTcgCandidates(card) {
             }
             if (unique.size >= 15) break;
         } catch (err) {
-            console.error(`  [Verify] Pokemon TCG lookup failed for "${card.card_name}" with query "${q}":`, err.message);
+            console.error(\`  [Verify] Pokemon TCG lookup failed for "\${card.card_name}" with query "\${q}":\`, err.message);
         }
     }
 
@@ -803,7 +810,7 @@ async function verifyAndCanonicalizeCard(card) {
     });
 
     if (sameNameCandidates.length > 1 && exactNumberCandidates.length === 0 && exactSetCandidates.length !== 1) {
-        console.log(`  [Verify] Ambiguous same-name variant rejected for "${card.card_name}"`);
+        console.log(\`  [Verify] Ambiguous same-name variant rejected for "\${card.card_name}"\`);
         return null;
     }
 
@@ -858,10 +865,10 @@ async function convertToJpeg(buffer, filePath) {
             const outPath = filePath + '_converted.jpg';
             try {
                 // Try macOS native sips
-                execSync(`sips -s format jpeg -Z 2048 "${filePath}" --out "${outPath}"`, { stdio: 'ignore' });
+                execSync(\`sips -s format jpeg -Z 2048 "\${filePath}" --out "\${outPath}"\`, { stdio: 'ignore' });
             } catch (sipsErr) {
                 // Try Linux ImageMagick
-                execSync(`convert "${filePath}" -resize 2048x2048\\> "${outPath}"`, { stdio: 'ignore' });
+                execSync(\`convert "\${filePath}" -resize 2048x2048\\\\> "\${outPath}"\`, { stdio: 'ignore' });
             }
             const converted = readFileSync(outPath);
             try { rmSync(outPath, { force: true }); } catch {}
@@ -940,29 +947,29 @@ function scrydexHeaders() {
 async function fetchScrydexCard(cardName, cardSet, cardNumber) {
     try {
         // Build Lucene-style query
-        let q = `name:"${cardName}"`;
+        let q = \`name:"\${cardName}"\`;
         if (cardNumber) {
             const num = cardNumber.split('/')[0].replace(/^0+/, '');
-            q += ` number:${num}`;
+            q += \` number:\${num}\`;
         }
         if (cardSet) {
             // Try matching set name (partial)
-            q += ` expansion.name:"${cardSet}"`;
+            q += \` expansion.name:"\${cardSet}"\`;
         }
 
-        const url = `https://api.scrydex.com/pokemon/v1/cards?q=${encodeURIComponent(q)}&pageSize=5`;
+        const url = \`https://api.scrydex.com/pokemon/v1/cards?q=\${encodeURIComponent(q)}&pageSize=5\`;
         const resp = await axios.get(url, { headers: scrydexHeaders(), timeout: 12000 });
         const cards = resp.data?.data || [];
         return cards[0] || null;
     } catch (err) {
         // Try a simpler query if the complex one fails
         try {
-            const url = `https://api.scrydex.com/pokemon/v1/cards?q=${encodeURIComponent(`name:"${cardName}"`)}&pageSize=5`;
+            const url = \`https://api.scrydex.com/pokemon/v1/cards?q=\${encodeURIComponent(\`name:"\${cardName}"\`)}&pageSize=5\`;
             const resp = await axios.get(url, { headers: scrydexHeaders(), timeout: 12000 });
             const cards = resp.data?.data || [];
             return cards[0] || null;
         } catch (err2) {
-            console.error(`  [Scrydex] Error for "${cardName}":`, err2.message);
+            console.error(\`  [Scrydex] Error for "\${cardName}":\`, err2.message);
             return null;
         }
     }
@@ -1005,11 +1012,11 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
     if (!JUSTTCG_API_KEY) return null;
     try {
         const q = cardNumber && cardSet
-            ? `${cardName} ${cardSet} ${cardNumber}`
+            ? \`\${cardName} \${cardSet} \${cardNumber}\`
             : cardNumber
-                ? `${cardName} ${cardNumber}`
-                : `${cardName} ${cardSet || ''}`;
-        const url = `https://api.justtcg.com/v1/cards?q=${encodeURIComponent(q.trim())}&game=pokemon&condition=NM&limit=5`;
+                ? \`\${cardName} \${cardNumber}\`
+                : \`\${cardName} \${cardSet || ''}\`;
+        const url = \`https://api.justtcg.com/v1/cards?q=\${encodeURIComponent(q.trim())}&game=pokemon&condition=NM&limit=5\`;
         const resp = await axios.get(url, {
             headers: { 'x-api-key': JUSTTCG_API_KEY },
             timeout: 10000
@@ -1043,12 +1050,12 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
         return {
             price: variant.price,
             source: 'justtcg_tcgplayer',
-            url: `https://www.tcgplayer.com/product/${best.tcgplayerId}`,
+            url: \`https://www.tcgplayer.com/product/\${best.tcgplayerId}\`,
             condition: variant.condition,
             printing: variant.printing
         };
     } catch (err) {
-        console.error(`  [JustTCG] Error for "${cardName}":`, err.message);
+        console.error(\`  [JustTCG] Error for "\${cardName}":\`, err.message);
         return null;
     }
 }
@@ -1059,8 +1066,8 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
 
 async function scrapeTCGplayerPrice(cardName, cardSet, cardNumber) {
     try {
-        const q = `${cardName} ${cardSet || ''} ${cardNumber || ''}`.trim();
-        const url = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
+        const q = \`\${cardName} \${cardSet || ''} \${cardNumber || ''}\`.trim();
+        const url = \`https://www.tcgplayer.com/search/pokemon/product?q=\${encodeURIComponent(q)}&view=grid\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
@@ -1068,7 +1075,7 @@ async function scrapeTCGplayerPrice(cardName, cardSet, cardNumber) {
         // TCGplayer search results show market prices
         $('.search-result__market-price, .product-card__market-price').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1078,7 +1085,7 @@ async function scrapeTCGplayerPrice(cardName, cardSet, cardNumber) {
             // Try alternative selectors
             $('[class*="price"]').each((i, el) => {
                 const text = $(el).text();
-                const match = text.match(/Market\s*Price[:\s]*\$([\d,.]+)/i);
+                const match = text.match(/Market\\s*Price[:\\s]*\\\$([\\d,.]+)/i);
                 if (match && !price) {
                     const p = parsePrice(match[1]);
                     if (p > 0.10) price = p;
@@ -1088,15 +1095,15 @@ async function scrapeTCGplayerPrice(cardName, cardSet, cardNumber) {
         if (!price) return null;
         return { price, source: 'tcgplayer_direct', url };
     } catch (err) {
-        console.error(`  [TCGplayer-Scrape] Error: ${err.message}`);
+        console.error(\`  [TCGplayer-Scrape] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapeCardmarketPrice(cardName, cardSet) {
     try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(q)}`;
+        const q = \`\${cardName} \${cardSet || ''}\`.trim();
+        const url = \`https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=\${encodeURIComponent(q)}\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
@@ -1104,7 +1111,7 @@ async function scrapeCardmarketPrice(cardName, cardSet) {
         // Cardmarket shows trend prices in EUR
         $('.col-price, .price-container, [class*="trend"]').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/([\d,.]+)\s*€/) || text.match(/€\s*([\d,.]+)/);
+            const match = text.match(/([\\d,.]+)\\s*€/) || text.match(/€\\s*([\\d,.]+)/);
             if (match && !price) {
                 const p = parseFloat(match[1].replace(',', '.'));
                 if (p > 0.05) price = Number((p * 1.08).toFixed(2)); // EUR to USD approx
@@ -1113,15 +1120,15 @@ async function scrapeCardmarketPrice(cardName, cardSet) {
         if (!price) return null;
         return { price, source: 'cardmarket_direct', url };
     } catch (err) {
-        console.error(`  [Cardmarket-Scrape] Error: ${err.message}`);
+        console.error(\`  [Cardmarket-Scrape] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapeTrollAndToad(cardName, cardSet) {
     try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.trollandtoad.com/category.php?selected-cat=7061&search-words=${encodeURIComponent(q)}`;
+        const q = \`\${cardName} \${cardSet || ''}\`.trim();
+        const url = \`https://www.trollandtoad.com/category.php?selected-cat=7061&search-words=\${encodeURIComponent(q)}\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
@@ -1129,7 +1136,7 @@ async function scrapeTrollAndToad(cardName, cardSet) {
         // Troll and Toad shows prices in their product listing
         $('.product-col .product-info, .result-price, [class*="price"]').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1138,22 +1145,22 @@ async function scrapeTrollAndToad(cardName, cardSet) {
         if (!price) return null;
         return { price, source: 'trollandtoad', url };
     } catch (err) {
-        console.error(`  [TrollAndToad] Error: ${err.message}`);
+        console.error(\`  [TrollAndToad] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapeTCGFish(cardName, cardSet) {
     try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.tcgfish.com/search?q=${encodeURIComponent(q)}&game=pokemon`;
+        const q = \`\${cardName} \${cardSet || ''}\`.trim();
+        const url = \`https://www.tcgfish.com/search?q=\${encodeURIComponent(q)}&game=pokemon\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
         let price = null;
         $('[class*="price"], [class*="Price"]').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1162,15 +1169,15 @@ async function scrapeTCGFish(cardName, cardSet) {
         if (!price) return null;
         return { price, source: 'tcgfish', url };
     } catch (err) {
-        console.error(`  [TCGFish] Error: ${err.message}`);
+        console.error(\`  [TCGFish] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapeCardMavin(cardName, cardSet, cardNumber) {
     try {
-        const q = `${cardName} ${cardNumber || ''} pokemon card`.trim();
-        const url = `https://www.cardmavin.com/search?q=${encodeURIComponent(q)}`;
+        const q = \`\${cardName} \${cardNumber || ''} pokemon card\`.trim();
+        const url = \`https://www.cardmavin.com/search?q=\${encodeURIComponent(q)}\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
@@ -1178,7 +1185,7 @@ async function scrapeCardMavin(cardName, cardSet, cardNumber) {
         // Card Mavin shows "Fair Market Value" and eBay sold aggregation
         $('[class*="price"], [class*="value"], .card-price').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1187,22 +1194,22 @@ async function scrapeCardMavin(cardName, cardSet, cardNumber) {
         if (!price) return null;
         return { price, source: 'cardmavin', url };
     } catch (err) {
-        console.error(`  [CardMavin] Error: ${err.message}`);
+        console.error(\`  [CardMavin] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapeCoolStuffInc(cardName, cardSet) {
     try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.coolstuffinc.com/main_search.php?pa=searchOnName&token=${encodeURIComponent(q)}`;
+        const q = \`\${cardName} \${cardSet || ''}\`.trim();
+        const url = \`https://www.coolstuffinc.com/main_search.php?pa=searchOnName&token=\${encodeURIComponent(q)}\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
         let price = null;
         $('.product-price, [class*="price"]').each((i, el) => {
             const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1211,15 +1218,15 @@ async function scrapeCoolStuffInc(cardName, cardSet) {
         if (!price) return null;
         return { price, source: 'coolstuffinc', url };
     } catch (err) {
-        console.error(`  [CoolStuffInc] Error: ${err.message}`);
+        console.error(\`  [CoolStuffInc] Error: \${err.message}\`);
         return null;
     }
 }
 
 async function scrapePriceCharting(cardName, cardSet) {
     try {
-        const q = `${cardName} ${cardSet || ''} pokemon`.trim();
-        const url = `https://www.pricecharting.com/search-products?q=${encodeURIComponent(q)}&type=prices`;
+        const q = \`\${cardName} \${cardSet || ''} pokemon\`.trim();
+        const url = \`https://www.pricecharting.com/search-products?q=\${encodeURIComponent(q)}&type=prices\`;
         const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
         const $ = cheerio.load(resp.data);
 
@@ -1227,7 +1234,7 @@ async function scrapePriceCharting(cardName, cardSet) {
         // PriceCharting shows "ungraded" prices in the search results
         $('td.price, .js-price, [data-price]').each((i, el) => {
             const text = $(el).attr('data-price') || $(el).text();
-            const match = text.match(/\$?([\d,.]+)/);
+            const match = text.match(/\\\$?([\\d,.]+)/);
             if (match && !price) {
                 const p = parsePrice(match[1]);
                 if (p > 0.10) price = p;
@@ -1236,7 +1243,7 @@ async function scrapePriceCharting(cardName, cardSet) {
         if (!price) return null;
         return { price, source: 'pricecharting', url };
     } catch (err) {
-        console.error(`  [PriceCharting] Error: ${err.message}`);
+        console.error(\`  [PriceCharting] Error: \${err.message}\`);
         return null;
     }
 }
@@ -1272,7 +1279,7 @@ function filterComparableListings(listings, cardName, cardSet, cardNumber) {
     return (listings || []).filter(listing => {
         const title = normalizeText(listing.title);
         if (!title || (nameNeedle && !title.includes(nameNeedle))) return false;
-        const compactTitle = title.replace(/\s+/g, '');
+        const compactTitle = title.replace(/\\s+/g, '');
         const compactNumber = numberNeedle.toLowerCase();
         const hasNumberMatch = compactNumber ? compactTitle.includes(compactNumber) : false;
         const hasSetMatch = setNeedle ? title.includes(setNeedle) : false;
@@ -1301,7 +1308,7 @@ function summarizeComparableSales(listings) {
 async function lookupMarketPrice(card) {
     const { card_name: cardName, card_set: cardSet, card_number: cardNumber, year, language, holo_type: holoType } = card;
     if (!cardName) return null;
-    const key = `${cardName}|${cardSet || ''}|${cardNumber || ''}`.toLowerCase();
+    const key = \`\${cardName}|\text{cardSet || ''}|\text{cardNumber || ''}\`.toLowerCase();
 
     const cached = priceCache.get(key);
     if (cached && Date.now() - cached.ts < 86400000) return { ...cached };
@@ -1416,14 +1423,14 @@ async function lookupMarketPrice(card) {
                 sourcesFound: validPrices.length
             };
 
-            console.log(`  [Pricing] Aggregated for "${cardName}": $${finalResult.price.toFixed(2)} from ${refinedPrices.length}/${sourcesChecked} sources (best sold: $${bestSoldPrice.toFixed(2)})`);
+            console.log(\`  [Pricing] Aggregated for "\${cardName}": $\${finalResult.price.toFixed(2)} from \${refinedPrices.length}/\${sourcesChecked} sources (best sold: $\${bestSoldPrice.toFixed(2)})\`);
             priceCache.set(key, { ...finalResult, ts: Date.now() });
             return finalResult;
         }
     }
 
     if (sourcesChecked >= 5) {
-        console.log(`  [Pricing] No market price found for "${cardName}" (checked ${sourcesChecked} sources). Setting to 0.`);
+        console.log(\`  [Pricing] No market price found for "\${cardName}" (checked \${sourcesChecked} sources). Setting to 0.\`);
         const emptyResult = {
             price: 0,
             source: 'not_found',
@@ -1441,7 +1448,7 @@ async function lookupMarketPrice(card) {
         return emptyResult;
     }
 
-    console.log(`  [Pricing] No market price found for "${cardName}" (checked ${sourcesChecked} sources)`);
+    console.log(\`  [Pricing] No market price found for "\${cardName}" (checked \${sourcesChecked} sources)\`);
     return null;
 }
 
@@ -1453,7 +1460,7 @@ async function scrapeEbayHTML(searchTerm) {
     const listings = [];
     try {
         const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&LH_Sold=1&LH_Complete=1&_sop=13`;
+        const url = \`https://www.ebay.com/sch/i.html?_nkw=\${encoded}&LH_Sold=1&LH_Complete=1&_sop=13\`;
         const resp = await axios.get(url, {
             headers: { 
                 'User-Agent': randomUA(), 
@@ -1468,7 +1475,7 @@ async function scrapeEbayHTML(searchTerm) {
             const $el = $(el);
             const title = $el.find('.s-item__title').text().trim();
             const text = $el.find('.s-item__price').text();
-            const match = text.match(/\$([\d,.]+)/);
+            const match = text.match(/\\\$([\\d,.]+)/);
             if (title && match && !title.includes('Shop on eBay')) {
                 const price = parsePrice(match[1]);
                 if (price > 0.5) listings.push({ title, price });
@@ -1476,7 +1483,7 @@ async function scrapeEbayHTML(searchTerm) {
         });
         return listings;
     } catch (err) {
-        console.error(`  [eBay-HTML] Error: ${err.message}`);
+        console.error(\`  [eBay-HTML] Error: \${err.message}\`);
         return [];
     }
 }
@@ -1490,7 +1497,7 @@ const sseClients = new Set();
 function broadcast(event) {
     const data = JSON.stringify(event);
     for (const client of sseClients) {
-        try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
+        try { client.write(\`data: \${data}\\n\\n\`); } catch { sseClients.delete(client); }
     }
 }
 
@@ -1516,7 +1523,7 @@ async function refreshBatchPrices(batchSize = 5) {
 
     try {
         // Pick the N cards that haven't been checked in the longest (or never)
-        const res = await pool.query(`
+        const res = await pool.query(\`
             SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
             FROM portfolio_cards
             ORDER BY
@@ -1524,12 +1531,12 @@ async function refreshBatchPrices(batchSize = 5) {
                 CASE WHEN COALESCE(current_price, 0) = 0 THEN 0 ELSE 1 END ASC,
                 id ASC
             LIMIT $1
-        `, [batchSize]);
+        \`, [batchSize]);
 
         const cards = res.rows;
         let updated = 0;
 
-        console.log(`  [PriceRefresh] Processing batch of ${cards.length} cards...`);
+        console.log(\`  [PriceRefresh] Processing batch of \${cards.length} cards...\`);
 
         for (const card of cards) {
             try {
@@ -1552,12 +1559,12 @@ async function refreshBatchPrices(batchSize = 5) {
                     await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
                 }
             } catch (err) {
-                console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
+                console.error(\`  [PriceRefresh] Error for \${card.card_name}:\`, err.message);
                 await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
             }
         }
 
-        console.log(`  [PriceRefresh] Batch complete. Updated ${updated}/${cards.length} cards.`);
+        console.log(\`  [PriceRefresh] Batch complete. Updated \${updated}/\${cards.length} cards.\`);
         return { updated, total: cards.length, batchSize };
     } finally {
         priceRefreshRunning = false;
@@ -1574,11 +1581,11 @@ async function refreshAllPrices() {
     console.log('  [PriceRefresh] Starting full price refresh...');
     broadcastActivity('refresh_start', 'Refreshing market prices...');
 
-    const res = await pool.query(`
+    const res = await pool.query(\`
         SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
         FROM portfolio_cards
         ORDER BY last_price_check ASC NULLS FIRST, id ASC
-    `);
+    \`);
     const cards = res.rows;
     let updated = 0;
 
@@ -1589,7 +1596,7 @@ async function refreshAllPrices() {
                 if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
                 if (imageUrl) {
                     await updateCardImageUrl(card.id, imageUrl);
-                    console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
+                    console.log(\`  [PriceRefresh] Found image for \${card.card_name}\`);
                 }
             }
 
@@ -1598,19 +1605,19 @@ async function refreshAllPrices() {
                 await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
                 await updatePortfolioCardMarketData(card.id, result);
                 updated++;
-                broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
+                broadcastActivity('price_update', \`\${card.card_name}: $\${result.price.toFixed(2)} (\${result.source})\`);
             } else {
                 await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
             }
             await sleep(1500);
         } catch (err) {
-            console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
+            console.error(\`  [PriceRefresh] Error for \${card.card_name}:\`, err.message);
         }
     }
 
     priceRefreshRunning = false;
-    console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
-    broadcastActivity('refresh_complete', `Updated prices for ${updated} cards`);
+    console.log(\`  [PriceRefresh] Complete. Updated \${updated}/\${cards.length} cards.\`);
+    broadcastActivity('refresh_complete', \`Updated prices for \${updated} cards\`);
     broadcast({ type: 'portfolio_updated' });
     return { updated, total: cards.length };
 }
@@ -1728,11 +1735,11 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
     try {
         const { card_name, card_set, card_number } = req.body;
         await pool.query(
-            `UPDATE portfolio_cards SET card_name = $1, card_set = $2, card_number = $3, last_price_check = NULL WHERE id = $4 AND user_id = $5`,
+            \`UPDATE portfolio_cards SET card_name = $1, card_set = $2, card_number = $3, last_price_check = NULL WHERE id = $4 AND user_id = $5\`,
             [card_name, card_set, card_number, parseInt(req.params.id), req.user.id]
         );
         // Delete history so we start fresh with the new card variant
-        await pool.query(`DELETE FROM price_history WHERE card_id = $1`, [parseInt(req.params.id)]);
+        await pool.query(\`DELETE FROM price_history WHERE card_id = $1\`, [parseInt(req.params.id)]);
         // Trigger a background refresh for this specific card
         updatePortfolioCardMarketData(parseInt(req.params.id), {}).catch(err => console.error("Edit Refresh Error:", err));
         res.json({ success: true });
@@ -1784,11 +1791,11 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
                 return res.status(400).json({ success: false, error: 'No photos provided.' });
             }
 
-            broadcastActivity('upload_start', `Analyzing ${files.length} photo${files.length > 1 ? 's' : ''}...`);
+            broadcastActivity('upload_start', \`Analyzing \${files.length} photo\${files.length > 1 ? 's' : ''}...\`);
 
             // Process synchronously so we can return the results
             const result = await processPortfolioUpload(files, req.user.id);
-            res.json({ success: true, cards: result.cards, message: `Added ${result.totalAdded} card(s)` });
+            res.json({ success: true, cards: result.cards, message: \`Added \${result.totalAdded} card(s)\` });
         } catch (err) {
             console.error('Portfolio upload error:', err);
             res.status(500).json({ success: false, error: err.message });
@@ -1797,17 +1804,17 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
 });
 
 
-// Ensure the `lastInsertRowid` is mapped correctly (sqlite vs pg)
+// Ensure the \`lastInsertRowid\` is mapped correctly (sqlite vs pg)
 async function processPortfolioUpload(files, userId) {
     let totalAdded = 0;
     const addedCards = [];
 
-    broadcastActivity('analyzing', `Scanning ${files.length} photo${files.length > 1 ? 's' : ''} with AI...`);
+    broadcastActivity('analyzing', \`Scanning \${files.length} photo\${files.length > 1 ? 's' : ''} with AI...\`);
 
     // 1. Analyze images sequentially (prevents OOM on Render free tier)
     for (let index = 0; index < files.length; index++) {
         const file = files[index];
-        broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
+        broadcastActivity('analyzing', \`Scanning photo \${index + 1} of \${files.length}...\`);
 
         let buffer, analysis, thumbDataUrl = '';
         try {
@@ -1816,7 +1823,7 @@ async function processPortfolioUpload(files, userId) {
 
             // Immediately convert raw/unsupported formats to JPEG so resizing/AI both work
             if (!GEMINI_SUPPORTED_TYPES.has(sendMime)) {
-                console.log(`  [Vision] Converting ${sendMime} → JPEG for Gemini & Sharp...`);
+                console.log(\`  [Vision] Converting \${sendMime} → JPEG for Gemini & Sharp...\`);
                 const converted = await convertToJpeg(buffer, file.path);
                 if (converted) {
                     buffer = converted;
@@ -1832,18 +1839,18 @@ async function processPortfolioUpload(files, userId) {
                     .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
                     .jpeg({ quality: 80 })
                     .toBuffer();
-                thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
-            } catch (e) { console.error(`  [Thumb] Failed for photo ${index + 1}:`, e.message); }
+                thumbDataUrl = \`data:image/jpeg;base64,\${thumbBuffer.toString('base64')}\`;
+            } catch (e) { console.error(\`  [Thumb] Failed for photo \${index + 1}:\`, e.message); }
 
             try { rmSync(file.path, { force: true }); } catch { }
         } catch (err) {
-            console.error(`Photo ${index + 1} error:`, err.message);
+            console.error(\`Photo \${index + 1} error:\`, err.message);
             try { rmSync(file.path, { force: true }); } catch { }
             continue;
         }
 
         if (analysis?.is_pokemon_card === false || !analysis?.cards?.length) {
-            broadcastActivity('info', `No Pokemon card detected in photo ${index + 1}.`);
+            broadcastActivity('info', \`No Pokemon card detected in photo \${index + 1}.\`);
             continue;
         }
 
@@ -1854,11 +1861,11 @@ async function processPortfolioUpload(files, userId) {
         }
 
         if (!verifiedCards.length) {
-            broadcastActivity('info', `Could not confidently verify a Pokemon card in photo ${index + 1}.`);
+            broadcastActivity('info', \`Could not confidently verify a Pokemon card in photo \${index + 1}.\`);
             continue;
         }
 
-        broadcastActivity('found', `Verified ${verifiedCards.length} card(s) in photo ${index + 1}`);
+        broadcastActivity('found', \`Verified \${verifiedCards.length} card(s) in photo \${index + 1}\`);
 
         for (const card of verifiedCards) {
             // Look up official card image from TCGdex, fallback to Pokemon TCG API
@@ -1890,7 +1897,7 @@ async function processPortfolioUpload(files, userId) {
                     finalHighestRecentSaleUrl = priceResult.highestRecentSaleUrl || priceResult.url || '';
                 }
             } catch (err) {
-                console.error(`  [Pricing] Error fetching inline price for ${card.card_name}:`, err.message);
+                console.error(\`  [Pricing] Error fetching inline price for \${card.card_name}:\`, err.message);
             }
 
             const cardId = await insertPortfolioCard({
@@ -1951,12 +1958,12 @@ async function processPortfolioUpload(files, userId) {
             addedCards.push(finalCardData);
 
             // Stream the newly found card to the frontend immediately!
-            broadcastActivity('card_added_detail', `✅ ${card.card_name}`, finalCardData);
+            broadcastActivity('card_added_detail', \`✅ \${card.card_name}\`, finalCardData);
             broadcast({ type: 'card_added' });
         }
     }
 
-    broadcastActivity('upload_complete', `Added ${totalAdded} card${totalAdded !== 1 ? 's' : ''} to your portfolio!`);
+    broadcastActivity('upload_complete', \`Added \${totalAdded} card\${totalAdded !== 1 ? 's' : ''} to your portfolio!\`);
 
 
     return { totalAdded, cards: addedCards };
@@ -1972,14 +1979,14 @@ app.get('/api/events', (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     sseClients.add(res);
-    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+    res.write(\`data: \${JSON.stringify({ type: 'connected' })}\\n\\n\`);
     req.on('close', () => sseClients.delete(res));
 });
 
 // Vercel Cron endpoint — triggers price refresh (secured by CRON_SECRET)
 app.get('/api/cron/refresh-prices', async (req, res) => {
     const cronSecret = process.env.CRON_SECRET;
-    if (cronSecret && req.headers.authorization !== `Bearer ${cronSecret}`) {
+    if (cronSecret && req.headers.authorization !== \`Bearer \${cronSecret}\`) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     try {
@@ -2020,12 +2027,12 @@ app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 //  START
 // ═══════════════════════════════════════════════════════════════
 
-console.log(`
+console.log(\`
 ╔══════════════════════════════════════════════════╗
 ║  ⚡ Jack's Pokemon Portfolio Tracker v4          ║
 ║  Multi-Source Price Comparison (12 Sources)      ║
 ╚══════════════════════════════════════════════════╝
-`);
+\`);
 console.log('📊 Price Sources:');
 console.log('   TCGdex API:      ✅ Enabled (free, no key)');
 console.log('   JustTCG API:    ', JUSTTCG_API_KEY ? '✅ Key loaded' : '⚠️  No key — add JUSTTCG_API_KEY');
@@ -2043,11 +2050,11 @@ console.log('   PriceCharting:   ✅ Enabled (scraper)');
 // Only start listening in non-Vercel (long-running server) mode
 if (!IS_VERCEL) {
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`🌐 Dashboard running at http://0.0.0.0:${PORT}`);
+        console.log(\`🌐 Dashboard running at http://0.0.0.0:\${PORT}\`);
     });
 
     process.on('SIGINT', async () => {
-        console.log('\n🛑 Shutting down...');
+        console.log('\\n🛑 Shutting down...');
         await pool.end();
         process.exit(0);
     });

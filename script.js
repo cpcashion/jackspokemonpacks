@@ -65,6 +65,12 @@ const loginBtn          = document.getElementById('loginBtn');
 const logoutBtn         = document.getElementById('logoutBtn');
 const navUsername       = document.getElementById('navUsername');
 
+// ── NAVIGATION REFS ──────────────────────────────────────────────
+const sideNav         = document.getElementById('sideNav');
+const sideNavOverlay  = document.getElementById('sideNavOverlay');
+const hamburgerBtn    = document.getElementById('hamburgerBtn');
+const closeSideNavBtn  = document.getElementById('closeSideNav');
+
 // ── HELPERS ──────────────────────────────────────────────────────
 function fmt(n) {
   if (n === null || n === undefined || isNaN(n)) return '—';
@@ -1373,9 +1379,35 @@ async function checkAuth() {
   return true;
 }
 
+// ── SIDE NAVIGATION ACTIONS ──────────────────────────────────────
+function openSideNav() {
+  sideNav.classList.add('open');
+  sideNavOverlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeSideNav() {
+  sideNav.classList.remove('open');
+  sideNavOverlay.classList.remove('open');
+  document.body.style.overflow = '';
+}
+
 // ── INIT ──────────────────────────────────────────────────────────
 (async function init() {
   await checkAuth();
+
+  // Navigation Event Listeners
+  if (hamburgerBtn) hamburgerBtn.addEventListener('click', openSideNav);
+  if (closeSideNavBtn) closeSideNavBtn.addEventListener('click', closeSideNav);
+  if (sideNavOverlay) sideNavOverlay.addEventListener('click', closeSideNav);
+
+  // Ensure Add Cards button in sidenav still works and closes sidenav
+  if (openUploadBtn) {
+    openUploadBtn.addEventListener('click', () => {
+      closeSideNav();
+      openModal();
+    });
+  }
 
   // Edit Card Modal Logic
   const editBtn = document.getElementById('editCardBtn');

@@ -721,7 +721,9 @@ async function processCapturedImage(blob, scanId, thumbUrl) {
     const data = await res.json();
     const cards = data.cards || [];
     if (cards.length > 0) {
-      cards.forEach(card => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(card); }); showScanSuccessOverlay(cards[0]);
+      cards.forEach(card => { 
+        handleUnifiedScanSuccess(card);
+      });
       const c = cards[0];
       updateScanStripItem(scanId, { name: c.card_name || 'Unknown', price: c.current_price || c.estimated_value || 0, imageUrl: c.image_url || c.image_data || thumbUrl, status: 'success' });
       showToast(cards.length === 1 ? `✅ ${c.card_name} — ${fmt(c.current_price || c.estimated_value)}` : `✅ ${cards.length} cards found!`, 'success');
@@ -838,7 +840,9 @@ galleryInput.addEventListener('change', async () => {
         const data = await res.json();
         const cards = data.cards || [];
         if (cards.length > 0) {
-          cards.forEach(c => { scanCount++; scanCountNum.textContent = scanCount; scanSessionCards.push(c); });
+          cards.forEach(c => { 
+            handleUnifiedScanSuccess(c);
+          });
           updateScanStripItem(scanId, { name: cards[0].card_name || 'Unknown', price: cards[0].current_price || 0, imageUrl: cards[0].image_url || thumbUrl, status: 'success' });
         } else {
           updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
@@ -953,6 +957,21 @@ async function processFiles(files) {
 
 let verifyTimeout = null;
 
+function handleUnifiedScanSuccess(card) {
+  if (!card) return;
+  
+  // Track session cards
+  scanCount++;
+  scanCountNum.textContent = scanCount;
+  scanSessionCards.push(card);
+  
+  // Log success
+  console.log(`[Scan Success] Identified: ${card.card_name} (${card.card_set}) - Price: ${fmt(card.current_price || card.estimated_value)}`);
+  
+  // Trigger overlay
+  showScanSuccessOverlay(card);
+}
+
 function showScanSuccessOverlay(card) {
   const overlay = document.getElementById("quickVerifyOverlay");
   const img = document.getElementById("verifyImg");
@@ -968,6 +987,10 @@ function showScanSuccessOverlay(card) {
   const metaEl = document.getElementById("verifyMeta");
   if (metaEl) metaEl.textContent = `${card.card_set || "—"} • ${card.rarity || "—"}`;
   price.textContent = fmt(card.current_price || card.estimated_value || 0);
+
+  // Smooth reset for back-to-back scans: briefly remove active class to re-trigger transition
+  overlay.classList.remove("active");
+  void overlay.offsetWidth; // force reflow
 
   overlay.className = "quick-verify-overlay";
   const rarity = (card.rarity || "").toLowerCase();

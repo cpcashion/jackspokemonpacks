@@ -1,1458 +1,1593 @@
 /* ═══════════════════════════════════════════════════════════════
-   Jack's Pokémon Portfolio — Main Client Script
+   Jack's Pokémon Collection — client
    ═══════════════════════════════════════════════════════════════ */
 
 'use strict';
 
 // ── STATE ────────────────────────────────────────────────────────
-let portfolio = [];          // array of card objects from API
-let currentSort = { key: 'price', dir: 'desc' };
-let currentView = 'table';   // 'table' | 'grid'
-let searchQuery = '';
-let activeDrawerCard = null;
-let chartInstance = null;
-let priceChartDays = 7;
-let toastTimeout = null;
 
-// ── DOM REFS ─────────────────────────────────────────────────────
-const topbarTotal       = document.getElementById('portfolioTotal');
-const topbarChange      = document.getElementById('portfolioChange');
-const statTotalCards    = document.getElementById('statTotalCards');
-const statPortfolioVal  = document.getElementById('statPortfolioValue');
-const stat24h           = document.getElementById('stat24hChange');
-const statGainer        = document.getElementById('statBiggestGainer');
-const statLoser         = document.getElementById('statBiggestLoser');
+const state = {
+  cards: [],
+  stats: {},
+  pricing: { conditions: [], fx: null },
+  view: 'collection',
+  layout: localStorage.getItem('layout') || 'grid',
+  sort: { key: 'value', dir: 'desc' },
+  query: '',
+  openCardId: null,
+  chartDays: 30,
+  scanQueue: 0,
+  scanned: [],
+};
 
-const emptyState        = document.getElementById('emptyState');
-const tableView         = document.getElementById('tableView');
-const gridView          = document.getElementById('gridView');
-const tableBody         = document.getElementById('portfolioTableBody');
-const lastUpdatedEl     = document.getElementById('lastUpdated');
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
 
-const openUploadBtn     = document.getElementById('openUploadBtn');
-const emptyUploadBtn    = document.getElementById('emptyUploadBtn');
-const uploadModal       = document.getElementById('uploadModal');
-const closeUploadBtn    = document.getElementById('closeUploadBtn');
-const dropZone          = document.getElementById('dropZone');
-const fileInput         = document.getElementById('fileInput');
-const uploadQueue       = document.getElementById('uploadQueue');
-const queueTitle        = document.getElementById('queueTitle');
-const queueStatus       = document.getElementById('queueStatus');
-const queueItems        = document.getElementById('queueItems');
+// ── FORMATTING ───────────────────────────────────────────────────
 
-const drawerOverlay     = document.getElementById('drawerOverlay');
-const closeDrawerBtn    = document.getElementById('closeDrawerBtn');
-const drawerCardName    = document.getElementById('drawerCardName');
-const drawerCardMeta    = document.getElementById('drawerCardMeta');
-const drawerCurrentPx   = document.getElementById('drawerCurrentPrice');
-const drawerChange      = document.getElementById('drawerChange');
-const drawerCardImg     = document.getElementById('drawerCardImg');
-const deleteCardBtn     = document.getElementById('deleteCardBtn');
+const money = (n) => {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '—';
+  return v.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+};
 
-const tableViewBtn      = document.getElementById('tableViewBtn');
-const gridViewBtn       = document.getElementById('gridViewBtn');
-const searchInput       = document.getElementById('searchInput');
-const refreshBtn        = document.getElementById('refreshPricesBtn');
+/** Compact form for headline figures: $1.2k reads better than $1,234.56 in a tile. */
+const moneyShort = (n) => {
+  const v = Number(n) || 0;
+  if (Math.abs(v) >= 10000) return '$' + (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  return money(v);
+};
 
-const authGateway       = document.getElementById('authGateway');
-const appContainer      = document.getElementById('appContainer');
-const authForm          = document.getElementById('authForm');
-const authUsername      = document.getElementById('authUsername');
-const authPassword      = document.getElementById('authPassword');
-const authError         = document.getElementById('authError');
-const registerBtn       = document.getElementById('registerBtn');
-const loginBtn          = document.getElementById('loginBtn');
-const logoutBtn         = document.getElementById('logoutBtn');
-const navUsername       = document.getElementById('navUsername');
+const pct = (current, previous) => {
+  if (!current || !previous) return null;
+  return ((current - previous) / previous) * 100;
+};
 
-// ── NAVIGATION REFS ──────────────────────────────────────────────
-const sideNav         = document.getElementById('sideNav');
-const sideNavOverlay  = document.getElementById('sideNavOverlay');
-const hamburgerBtn    = document.getElementById('hamburgerBtn');
-const closeSideNavBtn  = document.getElementById('closeSideNav');
+const trendClass = (p) => (p === null || Math.abs(p) < 0.05 ? 'flat' : p > 0 ? 'up' : 'down');
+const trendText = (p) => {
+  if (p === null) return '—';
+  if (Math.abs(p) < 0.05) return '0.0%';
+  return `${p > 0 ? '↑' : '↓'} ${Math.abs(p).toFixed(1)}%`;
+};
 
-// ── HELPERS ──────────────────────────────────────────────────────
-function fmt(n) {
-  if (n === null || n === undefined || isNaN(n)) return '—';
-  return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const timeAgo = (ts) => {
+  if (!ts) return 'never';
+  const s = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (s < 90) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+};
+
+/** Turn a source key like `pokemontcg_tcgplayer` into something a human reads. */
+const sourceLabel = (key) => {
+  if (!key) return 'Unknown';
+  return String(key)
+    .replace(/_/g, ' ')
+    .replace(/\btcgplayer\b/gi, 'TCGplayer')
+    .replace(/\bcardmarket\b/gi, 'Cardmarket')
+    .replace(/\bpokemontcg\b/gi, 'Pokémon TCG API')
+    .replace(/\btcgdex\b/gi, 'TCGdex')
+    .replace(/\bjusttcg\b/gi, 'JustTCG')
+    .replace(/\bscrydex\b/gi, 'Scrydex')
+    .replace(/\bconsensus\b/gi, 'consensus')
+    .replace(/^./, (c) => c.toUpperCase());
+};
+
+// ── TOASTS ───────────────────────────────────────────────────────
+
+function toast(message, kind = 'info', ms = 3600) {
+  const node = el('div', 'toast glass glass-lg');
+  const icons = { success: '✅', error: '⚠️', info: '💬', dupe: '➕' };
+  node.append(el('span', null, icons[kind] || icons.info), el('span', null, message));
+  $('toasts').appendChild(node);
+  setTimeout(() => {
+    node.classList.add('out');
+    setTimeout(() => node.remove(), 260);
+  }, ms);
 }
 
-function fmtChange(current, previous) {
-  if (!current || !previous || previous === 0) return null;
-  const pct = ((current - previous) / previous) * 100;
-  return pct;
+const buzz = (ms) => { try { navigator.vibrate?.(ms); } catch { /* unsupported */ } };
+
+// ── API ──────────────────────────────────────────────────────────
+
+async function api(path, options) {
+  const res = await fetch(path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  return body;
 }
 
-function getPeriodChange(card, key) {
-  return fmtChange(card.current_price, card[key]);
-}
-
-function getPeriodDelta(card, key) {
-  if (!card.current_price || !card[key]) return null;
-  return card.current_price - card[key];
-}
-
-function formatTrendText(card, key) {
-  const pct = getPeriodChange(card, key);
-  const delta = getPeriodDelta(card, key);
-  if (pct === null || delta === null) return '—';
-  const sign = delta >= 0 ? '+' : '-';
-  return `${delta >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(2)}% (${sign}${fmt(Math.abs(delta))})`;
-}
-
-function changeBadge(pct, includePrice, deltaPrice) {
-  if (pct === null || pct === undefined) return `<span class="badge-neutral">—</span>`;
-  if (Math.abs(pct) < 0.01) {
-    return `<span class="badge-neutral">0.0%</span>`;
-  }
-  const dir = pct > 0 ? 'positive' : 'negative';
-  const arrow = pct > 0 ? '↑' : '↓';
-  const formatted = `${arrow} ${Math.abs(pct).toFixed(1)}%`;
-  if (includePrice && deltaPrice !== undefined) {
-    const sign = deltaPrice >= 0 ? '+' : '-';
-    return `<span class="badge-${dir}">${formatted} (${sign}${fmt(Math.abs(deltaPrice)).slice(1)})</span>`;
-  }
-  return `<span class="badge-${dir}">${formatted}</span>`;
-}
-
-function rarityClass(rarity) {
-  if (!rarity) return '';
-  const r = rarity.toLowerCase();
-  if (r.includes('secret')) return 'rarity-secret';
-  if (r.includes('ultra') || r.includes('v max') || r.includes('alt art')) return 'rarity-ultra';
-  if (r.includes('illustration')) return 'rarity-ultra';
-  if (r.includes('holo')) return 'rarity-holo';
-  if (r.includes('rare')) return 'rarity-rare';
-  if (r.includes('uncommon')) return 'rarity-uncommon';
-  return 'rarity-common';
-}
-
-function showToast(msg, type = 'info', duration = 4000) {
-  const container = document.querySelector('.toast-container') || (() => {
-    const c = document.createElement('div');
-    c.className = 'toast-container';
-    document.body.appendChild(c);
-    return c;
-  })();
-  const t = document.createElement('div');
-  t.className = `toast ${type}`;
-  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
-  t.innerHTML = `<span>${icons[type] || ''}</span><span>${msg}</span>`;
-  container.appendChild(t);
-  setTimeout(() => t.remove(), duration);
-}
-
-// ── HEIC CONVERSION ────────────────────────────────────────────────
-async function ensureJpeg(file) {
-  const isHeic = file.name.match(/\.(heic|heif)$/i) || file.type === 'image/heic' || file.type === 'image/heif';
-  if (!isHeic) return file;
-  
+async function loadCollection() {
   try {
-    if (typeof heic2any === 'undefined') {
-      console.warn('heic2any not loaded, attempting to upload raw HEIC');
-      return file;
-    }
-    showToast('Converting HEIC photo...', 'info', 2000);
-    const blob = await heic2any({
-      blob: file,
-      toType: 'image/jpeg',
-      quality: 0.8
-    });
-    // handle heic2any returning array of blobs for multi-frame images
-    const resultBlob = Array.isArray(blob) ? blob[0] : blob;
-    return new File([resultBlob], file.name.replace(/\.(heic|heif)$/i, '.jpg'), { type: 'image/jpeg' });
+    const data = await api('/api/portfolio');
+    state.cards = data.cards || [];
+    state.stats = data.stats || {};
+    state.pricing = data.pricing || state.pricing;
+    render();
+    checkForSplitRows();
   } catch (err) {
-    console.error('HEIC conversion failed:', err);
-    showToast('Could not convert HEIC, trying original...', 'info', 2000);
-    return file;
+    toast(`Could not load your collection: ${err.message}`, 'error');
   }
 }
 
-// ── SPARKLINE SVG ─────────────────────────────────────────────────
-function renderSparkline(priceHistory, positive) {
-  const prices = (priceHistory || []).slice(-14).map(p => Number(p.price || 0));
-  if (prices.length < 2) {
-    return `<svg class="sparkline" width="80" height="28" viewBox="0 0 80 28">
-      <line x1="0" y1="14" x2="80" y2="14" stroke="#e5e7eb" stroke-width="1.5" stroke-dasharray="4 3"/>
-    </svg>`;
+// ── THEME ────────────────────────────────────────────────────────
+
+function applyTheme(mode) {
+  if (mode === 'auto') {
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.removeItem('theme');
+  } else {
+    document.documentElement.setAttribute('data-theme', mode);
+    localStorage.setItem('theme', mode);
   }
-  const min = Math.min(...prices);
-  const max = Math.max(...prices);
-  const range = max - min || 1;
-  const W = 80, H = 28, PAD = 3;
-  const pts = prices.map((p, i) => {
-    const x = PAD + (i / (prices.length - 1)) * (W - PAD * 2);
-    const y = PAD + ((1 - (p - min) / range) * (H - PAD * 2));
-    return `${x},${y}`;
-  });
-  const color = positive ? '#16a34a' : '#dc2626';
-  const last = prices[prices.length - 1];
-  const first = prices[0];
-  const isPos = last >= first;
-  const lineColor = isPos ? '#16a34a' : '#dc2626';
-  return `<svg class="sparkline" width="80" height="28" viewBox="0 0 80 28">
-    <polyline points="${pts.join(' ')}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`;
+  syncThemeButtons();
 }
 
-// ── PORTFOLIO RENDERING ───────────────────────────────────────────
-function getFilteredSorted() {
-  let cards = portfolio.filter(c => {
-    if (!searchQuery) return true;
-    const q = searchQuery.toLowerCase();
-    return (
-      (c.card_name || '').toLowerCase().includes(q) ||
-      (c.card_set || '').toLowerCase().includes(q) ||
-      (c.rarity || '').toLowerCase().includes(q)
-    );
-  });
+function currentTheme() {
+  return localStorage.getItem('theme') || 'auto';
+}
 
+function syncThemeButtons() {
+  const mode = currentTheme();
+  document.querySelectorAll('[data-theme-set]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.themeSet === mode);
+  });
+}
+
+$('themeBtn').addEventListener('click', () => {
+  const resolved = document.documentElement.getAttribute('data-theme')
+    || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  applyTheme(resolved === 'dark' ? 'light' : 'dark');
+});
+
+document.querySelectorAll('[data-theme-set]').forEach((b) => {
+  b.addEventListener('click', () => applyTheme(b.dataset.themeSet));
+});
+
+// ── NAVIGATION ───────────────────────────────────────────────────
+
+const VIEW_TITLES = { collection: 'Collection', review: 'Needs review', settings: 'Settings' };
+
+function showView(name) {
+  if (name === 'scan') { openScanner(); return; }
+  state.view = name;
+  document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
+  document.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
+  window.scrollTo({ top: 0 });
+  render();
+}
+
+document.querySelectorAll('[data-view]').forEach((b) => {
+  b.addEventListener('click', () => showView(b.dataset.view));
+});
+$('railScanBtn').addEventListener('click', openScanner);
+
+// ── SEARCH / SORT / LAYOUT ───────────────────────────────────────
+
+let searchTimer = null;
+$('searchInput').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  const value = e.target.value;
+  searchTimer = setTimeout(() => { state.query = value.trim().toLowerCase(); render(); }, 130);
+});
+
+document.querySelectorAll('[data-layout]').forEach((b) => {
+  b.classList.toggle('active', b.dataset.layout === state.layout);
+  b.addEventListener('click', () => {
+    state.layout = b.dataset.layout;
+    localStorage.setItem('layout', state.layout);
+    document.querySelectorAll('[data-layout]').forEach((x) => x.classList.toggle('active', x === b));
+    render();
+  });
+});
+
+document.querySelectorAll('[data-sort]').forEach((b) => {
+  b.addEventListener('click', () => {
+    const key = b.dataset.sort;
+    // Tapping the active sort flips its direction, which is what people expect.
+    state.sort = state.sort.key === key
+      ? { key, dir: state.sort.dir === 'desc' ? 'asc' : 'desc' }
+      : { key, dir: key === 'name' ? 'asc' : 'desc' };
+    document.querySelectorAll('[data-sort]').forEach((x) => x.classList.toggle('active', x === b));
+    render();
+  });
+});
+
+function visibleCards() {
+  const q = state.query;
+  let cards = state.cards.filter((c) => (state.view === 'review' ? c.needs_review : !c.needs_review));
+
+  if (q) {
+    cards = cards.filter((c) =>
+      [c.card_name, c.card_set, c.card_number, c.rarity].some((f) => String(f || '').toLowerCase().includes(q)));
+  }
+
+  const { key, dir } = state.sort;
+  const sign = dir === 'asc' ? 1 : -1;
   cards.sort((a, b) => {
-    let av, bv;
-    if (currentSort.key === 'name') {
-      av = (a.card_name || '').toLowerCase();
-      bv = (b.card_name || '').toLowerCase();
-      return currentSort.dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
-    }
-    if (currentSort.key === 'price') {
-      av = a.current_price || 0;
-      bv = b.current_price || 0;
-    }
-    if (currentSort.key === 'change') {
-      av = getPeriodChange(a, 'prev_day_price') || 0;
-      bv = getPeriodChange(b, 'prev_day_price') || 0;
-    }
-    return currentSort.dir === 'asc' ? av - bv : bv - av;
+    if (key === 'name') return sign * String(a.card_name || '').localeCompare(String(b.card_name || ''));
+    if (key === 'qty') return sign * ((a.quantity || 0) - (b.quantity || 0));
+    if (key === 'change') return sign * ((pct(a.unit_price, a.prev_day_price) || 0) - (pct(b.unit_price, b.prev_day_price) || 0));
+    return sign * ((a.total_value || 0) - (b.total_value || 0));
   });
   return cards;
 }
 
-function renderTable(cards) {
-  tableBody.innerHTML = '';
-  cards.forEach(card => {
-    const pct = getPeriodChange(card, 'prev_day_price');
-    const delta = getPeriodDelta(card, 'prev_day_price');
-    const prices = card.price_history || [];
-    const isPos = pct !== null && pct >= 0;
+// ── RENDER ───────────────────────────────────────────────────────
 
-    const imgSrc = card.image_url || '';
-    const thumbHtml = imgSrc
-      ? `<img class="card-thumb" src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
-      : (card.has_local_image
-        ? `<img class="card-thumb" data-card-id="${card.id}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'card-thumb-placeholder\\'>🃏</div>'">`
-        : `<div class="card-thumb-placeholder">🃏</div>`);
-
-    let sourceLabel = `<span class="source-badge">${card.price_source || 'market'}</span>`;
-    if (card.price_source_url) {
-      sourceLabel = `<a href="${card.price_source_url}" target="_blank" class="source-badge-link" onclick="event.stopPropagation()">${sourceLabel}</a>`;
-    }
-
-    const tr = document.createElement('tr');
-    tr.dataset.id = card.id;
-    tr.innerHTML = `
-      <td class="col-thumb">${thumbHtml}</td>
-      <td class="col-name">
-        <div class="card-name-cell">
-          <div class="card-name">${card.card_name || 'Unknown'}</div>
-          <div class="card-badges">
-            ${card.is_holo ? '<span class="badge-holo">Holo</span>' : ''}
-            ${card.is_first_edition ? '<span class="badge-first">1st Ed</span>' : ''}
-          </div>
-        </div>
-      </td>
-      <td class="col-set">${card.card_set || '—'}</td>
-      <td class="col-rarity"><span class="${rarityClass(card.rarity)}">${card.rarity || '—'}</span></td>
-      <td class="col-condition">${card.condition || '—'}</td>
-      <td class="col-price">${fmt(card.current_price)}</td>
-      <td class="col-change">${changeBadge(pct, false)}</td>
-      <td class="col-sparkline">${renderSparkline(prices, isPos)}</td>
-      <td class="col-source">${sourceLabel}</td>
-      <td class="col-actions">
-        <button class="delete-row-btn" data-id="${card.id}" title="Remove card" onclick="event.stopPropagation();confirmDelete(${card.id})">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
-        </button>
-      </td>`;
-    tr.addEventListener('click', () => openDrawer(card));
-    tableBody.appendChild(tr);
-  });
-  // Lazy-load base64 thumbnails for cards that only have local images
-  lazyLoadLocalImages();
+function render() {
+  renderStats();
+  renderCounts();
+  if (state.view === 'review') renderReview();
+  else renderCollection();
 }
 
-function lazyLoadLocalImages() {
-  document.querySelectorAll('img[data-card-id]').forEach(img => {
-    if (img.src) return; // already loaded
-    const cardId = img.dataset.cardId;
-    fetch(`/api/portfolio/${cardId}/image`).then(r => r.json()).then(d => {
-      if (d.image_data) img.src = d.image_data;
-    }).catch(() => {});
-  });
-}
+function renderCounts() {
+  const reviewCount = state.cards.filter((c) => c.needs_review).length;
+  $('navCollectionCount').textContent = state.stats.totalCopies ?? 0;
 
-function renderGrid(cards) {
-  gridView.innerHTML = '';
-  cards.forEach(card => {
-    const pct = getPeriodChange(card, 'prev_day_price');
-    const imgSrc = card.image_url || '';
-    const div = document.createElement('div');
-    div.className = 'grid-card';
-    div.innerHTML = `
-      ${imgSrc
-        ? `<div class="grid-card-img"><img src="${imgSrc}" alt="${card.card_name}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=\\'grid-card-placeholder\\'>🃏</div>'"></div>`
-        : `<div class="grid-card-placeholder">🃏</div>`}
-      <div class="grid-card-body">
-        <div class="grid-card-name">${card.card_name || 'Unknown'}</div>
-        <div class="grid-card-set">${card.card_set || '—'}</div>
-        <div class="grid-card-price-row">
-          <span class="grid-card-price">${fmt(card.current_price)}</span>
-          ${changeBadge(pct, false)}
-        </div>
-      </div>`;
-    div.addEventListener('click', () => openDrawer(card));
-    gridView.appendChild(div);
-  });
-}
+  const navReview = $('navReviewCount');
+  navReview.hidden = reviewCount === 0;
+  navReview.textContent = reviewCount;
 
-function renderPortfolio() {
-  const cards = getFilteredSorted();
-  const hasCards = portfolio.length > 0;
+  const badge = $('tabReviewBadge');
+  badge.hidden = reviewCount === 0;
+  badge.textContent = reviewCount;
 
-  emptyState.style.display = hasCards || searchQuery ? 'none' : 'block';
+  $('railTotal').textContent = money(state.stats.totalValue || 0);
+  const change = pct(state.stats.totalValue, state.stats.prevValue);
+  const railChange = $('railChange');
+  railChange.className = `rail-total-change ${trendClass(change)}`;
+  railChange.textContent = change === null ? 'No history yet' : `${trendText(change)} today`;
 
-  // Force grid on mobile regardless of button state
-  const isMobile = window.innerWidth <= 700;
-  const activeView = isMobile ? 'grid' : currentView;
-
-  if (activeView === 'table') {
-    tableView.style.display  = hasCards ? 'block' : 'none';
-    gridView.style.display   = 'none';
-    if (hasCards) renderTable(cards);
-  } else {
-    tableView.style.display  = 'none';
-    gridView.style.display   = hasCards ? 'grid' : 'none';
-    if (hasCards) renderGrid(cards);
-  }
-
-  if (searchQuery && cards.length === 0 && hasCards) {
-    emptyState.style.display = 'block';
-    document.querySelector('.empty-title').textContent = 'No cards match your search';
-    document.querySelector('.empty-subtitle').textContent = `Try a different name or set.`;
+  const fx = state.pricing?.fx;
+  if (fx) {
+    $('fxNote').textContent = fx.live
+      ? `Euro prices converted at ${fx.usdPerEur} USD/EUR, refreshed ${timeAgo(fx.fetchedAt)}.`
+      : `Live exchange rate unavailable — using a fallback of ${fx.usdPerEur} USD/EUR.`;
   }
 }
 
-function updateStats() {
-  let totalValue = 0, prevValue = 0;
-  let maxGain = null, maxLoss = null;
-  let maxGainCard = null, maxLossCard = null;
+function renderStats() {
+  const s = state.stats;
+  const change = pct(s.totalValue, s.prevValue);
+  const delta = (s.totalValue || 0) - (s.prevValue || 0);
 
-  portfolio.forEach(c => {
-    const price = c.current_price || 0;
-    const prev  = c.prev_day_price || 0;
-    totalValue += price;
-    prevValue  += prev;
-    const pct = fmtChange(price, prev);
-    if (pct !== null) {
-      if (maxGain === null || pct > maxGain) { maxGain = pct; maxGainCard = c; }
-      if (maxLoss === null || pct < maxLoss) { maxLoss = pct; maxLossCard = c; }
-    }
-  });
+  const tiles = [
+    { label: 'Collection value', value: moneyShort(s.totalValue || 0), sub: s.prevValue ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta)).slice(1)} today` : 'Tracking from today', cls: trendClass(change) },
+    { label: 'Cards held', value: String(s.totalCopies || 0), sub: `${s.totalCards || 0} unique printing${s.totalCards === 1 ? '' : 's'}` },
+    { label: 'Duplicates', value: String(s.duplicateCards || 0), sub: s.duplicateCards ? 'cards you own more than one of' : 'no repeats yet' },
+    { label: 'Unpriced', value: String(s.unpricedCopies || 0), sub: s.unpricedCopies ? 'no market data found' : 'every card is priced', cls: s.unpricedCopies ? 'flat' : undefined },
+  ];
 
-  const delta = totalValue - prevValue;
-  const deltaPct = prevValue > 0 ? (delta / prevValue) * 100 : null;
-
-  topbarTotal.textContent = fmt(totalValue);
-  if (deltaPct !== null) {
-    const cls = deltaPct >= 0 ? 'positive' : 'negative';
-    const arrow = deltaPct >= 0 ? '↑' : '↓';
-    topbarChange.textContent = `${arrow} ${Math.abs(deltaPct).toFixed(2)}%`;
-    topbarChange.className = `portfolio-change ${cls}`;
-  } else {
-    topbarChange.textContent = '—';
-    topbarChange.className = 'portfolio-change neutral';
+  const wrap = $('stats');
+  wrap.innerHTML = '';
+  for (const t of tiles) {
+    const tile = el('div', 'stat glass');
+    tile.append(el('div', 'stat-label', t.label));
+    tile.append(el('div', `stat-value ${t.cls || ''}`.trim(), t.value));
+    tile.append(el('div', 'stat-sub', t.sub));
+    wrap.appendChild(tile);
   }
 
-  statTotalCards.textContent = portfolio.length;
-  statPortfolioVal.textContent = fmt(totalValue);
-
-  if (deltaPct !== null) {
-    const sign = delta >= 0 ? '+' : '';
-    stat24h.textContent = `${sign}${fmt(delta)} (${delta >= 0 ? '+' : ''}${deltaPct.toFixed(2)}%)`;
-    stat24h.className = `stat-value ${deltaPct >= 0 ? 'positive' : 'negative'}`;
-  } else {
-    stat24h.textContent = '—';
-    stat24h.className = 'stat-value neutral';
-  }
-
-  if (maxGainCard) {
-    statGainer.textContent = `${maxGainCard.card_name} +${maxGain.toFixed(1)}%`;
-  } else {
-    statGainer.textContent = '—';
-  }
-
-  if (maxLossCard) {
-    statLoser.textContent = `${maxLossCard.card_name} ${maxLoss.toFixed(1)}%`;
-  } else {
-    statLoser.textContent = '—';
-  }
 }
 
-// ── FETCH PORTFOLIO ───────────────────────────────────────────────
-async function fetchPortfolio() {
+/**
+ * The merge banner only appears when there is actually something to merge.
+ * Owning duplicates is normal and already shown as a ×N badge; a permanent
+ * banner about it would just be noise.
+ */
+let splitRowCheck = null;
+
+async function checkForSplitRows() {
+  const banner = $('dupeBanner');
   try {
-    const res = await fetch('/api/portfolio');
-    if (!res.ok) throw new Error(`Status ${res.status}`);
-    const data = await res.json();
-    portfolio = data.cards || [];
-    // OPTIMIZATION: Removed fetchSparklineData() - history is now batched in /api/portfolio
-    updateStats();
-    renderPortfolio();
-    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
-  } catch (err) {
-    console.error('Failed to fetch portfolio:', err);
-    showToast('Failed to load portfolio data', 'error');
+    splitRowCheck = await api('/api/portfolio/duplicates');
+    const groups = splitRowCheck.groups || [];
+    banner.hidden = groups.length === 0;
+    if (groups.length) {
+      const rows = groups.reduce((sum, g) => sum + g.row_count, 0);
+      const one = groups.length === 1;
+      $('dupeBannerTitle').textContent = one
+        ? 'One card is listed twice'
+        : `${groups.length} cards are listed more than once`;
+      $('dupeBannerText').textContent =
+        `${rows} separate rows describe ${one ? 'the same card' : `only ${groups.length} cards`}. ` +
+        'Merging keeps every copy and all price history.';
+      $('dupeBannerBtn').textContent = 'Review merge';
+    }
+  } catch {
+    banner.hidden = true;
   }
 }
 
-// ── SORT ──────────────────────────────────────────────────────────
-document.querySelectorAll('th.sortable').forEach(th => {
-  th.addEventListener('click', () => {
-    const key = th.dataset.sort;
-    if (currentSort.key === key) {
-      currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
-    } else {
-      currentSort.key = key;
-      currentSort.dir = key === 'name' ? 'asc' : 'desc';
-    }
-    document.querySelectorAll('th.sortable').forEach(h => {
-      h.classList.remove('sort-asc', 'sort-desc');
-    });
-    th.classList.add(currentSort.dir === 'asc' ? 'sort-asc' : 'sort-desc');
-    renderPortfolio();
+function cardArt(card, cls) {
+  const wrap = el('div', cls);
+  if (card.image_url) {
+    const img = el('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = card.card_name || 'Card';
+    img.src = card.image_url;
+    img.addEventListener('error', () => { img.replaceWith(el('div', 'ph', '🃏')); }, { once: true });
+    wrap.appendChild(img);
+  } else if (card.has_local_image) {
+    const img = el('img');
+    img.loading = 'lazy';
+    img.alt = card.card_name || 'Card';
+    img.dataset.localFor = card.id;
+    wrap.appendChild(img);
+  } else {
+    wrap.appendChild(el('div', 'ph', '🃏'));
+  }
+  return wrap;
+}
+
+/** Scan photos live in the database as base64; fetch them only once on screen. */
+function hydrateLocalImages(root) {
+  root.querySelectorAll('img[data-local-for]').forEach((img) => {
+    if (img.dataset.hydrated) return;
+    img.dataset.hydrated = '1';
+    fetch(`/api/portfolio/${img.dataset.localFor}/image`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(el('div', 'ph', '🃏')); })
+      .catch(() => img.replaceWith(el('div', 'ph', '🃏')));
   });
-});
+}
 
-// ── VIEW TOGGLE ───────────────────────────────────────────────────
-tableViewBtn.addEventListener('click', () => {
-  if (window.innerWidth <= 700) return; // Disabled on mobile
-  currentView = 'table';
-  tableViewBtn.classList.add('active');
-  gridViewBtn.classList.remove('active');
-  renderPortfolio();
-});
-gridViewBtn.addEventListener('click', () => {
-  currentView = 'grid';
-  gridViewBtn.classList.add('active');
-  tableViewBtn.classList.remove('active');
-  renderPortfolio();
-});
+function sparkline(history) {
+  const prices = (history || []).map((p) => Number(p.price)).filter((p) => p > 0).slice(-24);
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', '78');
+  svg.setAttribute('height', '26');
+  svg.setAttribute('viewBox', '0 0 78 26');
 
-// Auto-switch view on resize
-window.addEventListener('resize', () => {
-  // Debounce render if needed, but it's fast enough for now
-  renderPortfolio();
-});
+  if (prices.length < 2) {
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', '2'); line.setAttribute('y1', '13');
+    line.setAttribute('x2', '76'); line.setAttribute('y2', '13');
+    line.setAttribute('stroke', 'currentColor');
+    line.setAttribute('stroke-opacity', '0.25');
+    line.setAttribute('stroke-dasharray', '3 3');
+    svg.appendChild(line);
+    return svg;
+  }
 
-// ── SEARCH ────────────────────────────────────────────────────────
-searchInput.addEventListener('input', () => {
-  searchQuery = searchInput.value.trim();
-  renderPortfolio();
-});
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const points = prices.map((p, i) => {
+    const x = 2 + (i / (prices.length - 1)) * 74;
+    const y = 3 + (1 - (p - min) / range) * 20;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
 
-// ── REFRESH PRICES ────────────────────────────────────────────────
-refreshBtn.addEventListener('click', async () => {
-  if (portfolio.length === 0) {
-    showToast('No cards to refresh', 'info');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+  path.setAttribute('points', points);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', prices[prices.length - 1] >= prices[0] ? 'var(--up)' : 'var(--down)');
+  path.setAttribute('stroke-width', '1.6');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(path);
+  return svg;
+}
+
+function renderCollection() {
+  const host = $('collectionBody');
+  host.innerHTML = '';
+  const cards = visibleCards();
+
+  if (!state.cards.length) {
+    host.appendChild(emptyState(
+      '🃏',
+      'No cards yet',
+      'Point your camera at a card and it will be identified, priced and added in a couple of seconds.',
+      'Scan your first card',
+      openScanner,
+    ));
     return;
   }
-  refreshBtn.classList.add('loading');
-  refreshBtn.disabled = true;
+
+  if (!cards.length) {
+    host.appendChild(emptyState('🔍', 'Nothing matches that', `No cards match “${state.query}”.`));
+    return;
+  }
+
+  host.appendChild(state.layout === 'grid' ? gridOf(cards) : listOf(cards));
+  hydrateLocalImages(host);
+}
+
+function emptyState(icon, title, text, actionLabel, onAction) {
+  const box = el('div', 'empty glass');
+  box.append(el('div', 'empty-icon', icon), el('h2', null, title), el('p', null, text));
+  if (actionLabel) {
+    const btn = el('button', 'btn btn-primary', actionLabel);
+    btn.addEventListener('click', onAction);
+    box.appendChild(btn);
+  }
+  return box;
+}
+
+function gridOf(cards) {
+  const grid = el('div', 'grid');
+  for (const card of cards) {
+    const change = pct(card.unit_price, card.prev_day_price);
+    const btn = el('button', 'card glass glass-tap');
+    btn.addEventListener('click', () => openSheet(card.id));
+
+    const art = cardArt(card, 'card-art');
+    if (card.quantity > 1) art.appendChild(el('div', 'qty', `×${card.quantity}`));
+
+    const flags = el('div', 'card-flags');
+    if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Review'));
+    if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
+    if (card.is_holo && !card.is_first_edition) flags.appendChild(el('span', 'flag flag-holo', 'Holo'));
+    if (flags.children.length) art.appendChild(flags);
+
+    const body = el('div', 'card-body');
+    body.append(
+      el('div', 'card-name', card.card_name || 'Unknown'),
+      el('div', 'card-meta', [card.card_set, card.card_number].filter(Boolean).join(' · ') || '—'),
+    );
+
+    const priceRow = el('div', 'card-price-row');
+    if (card.unit_price > 0) {
+      priceRow.append(el('span', 'card-price', money(card.total_value)));
+      priceRow.append(el('span', `card-delta ${trendClass(change)}`, trendText(change)));
+    } else {
+      priceRow.append(el('span', 'card-price unpriced', card.needs_review ? 'Needs review' : 'No price found'));
+    }
+    body.appendChild(priceRow);
+
+    if (card.quantity > 1 && card.unit_price > 0) {
+      body.appendChild(el('div', 'card-unit', `${card.quantity} copies · ${money(card.unit_price)} each`));
+    }
+
+    btn.append(art, body);
+    grid.appendChild(btn);
+  }
+  return grid;
+}
+
+function listOf(cards) {
+  const list = el('div', 'list glass');
+
+  const head = el('div', 'row row-head');
+  head.append(el('div'), el('div', null, 'Card'), el('div', 'row-set', 'Set'), el('div', 'row-qty', 'Qty'),
+    el('div', 'row-num', 'Value'), el('div', 'row-delta', '24h'), el('div', 'row-spark'));
+  list.appendChild(head);
+
+  for (const card of cards) {
+    const change = pct(card.unit_price, card.prev_day_price);
+    const row = el('button', 'row');
+    row.addEventListener('click', () => openSheet(card.id));
+
+    row.appendChild(cardArt(card, 'row-thumb'));
+
+    const nameCell = el('div');
+    nameCell.append(el('div', 'row-name', card.card_name || 'Unknown'));
+    const bits = [card.card_number, card.rarity].filter(Boolean).join(' · ');
+    nameCell.append(el('div', 'row-sub', card.needs_review ? 'Needs review' : bits || '—'));
+    row.appendChild(nameCell);
+
+    row.appendChild(el('div', 'row-set', card.card_set || '—'));
+    row.appendChild(el('div', 'row-qty', card.quantity > 1 ? `×${card.quantity}` : '1'));
+    row.appendChild(el('div', 'row-num', card.unit_price > 0 ? money(card.total_value) : '—'));
+    row.appendChild(el('div', `row-delta ${trendClass(change)}`, trendText(change)));
+
+    const spark = el('div', 'row-spark');
+    spark.appendChild(sparkline(card.price_history));
+    row.appendChild(spark);
+
+    list.appendChild(row);
+  }
+  return list;
+}
+
+function renderReview() {
+  const host = $('reviewBody');
+  host.innerHTML = '';
+  const cards = visibleCards();
+  if (!cards.length) {
+    host.appendChild(emptyState('✅', 'Nothing to review', 'Every card we scanned was matched to the card database.'));
+    return;
+  }
+  host.appendChild(gridOf(cards));
+  hydrateLocalImages(host);
+}
+
+// ── CARD SHEET ───────────────────────────────────────────────────
+
+const sheet = $('sheet');
+const scrim = $('scrim');
+
+function cardById(id) { return state.cards.find((c) => c.id === id); }
+
+function openSheet(id) {
+  const card = cardById(id);
+  if (!card) return;
+  state.openCardId = id;
+  state.chartDays = 30;
+
+  $('sheetTitle').textContent = card.card_name || 'Unknown card';
+  $('sheetSub').textContent = [card.card_set, card.card_number, card.rarity].filter(Boolean).join(' · ') || '—';
+
+  renderSheetBody();
+  sheet.classList.add('open');
+  sheet.setAttribute('aria-hidden', 'false');
+  scrim.classList.add('open');
+  document.body.style.overflow = 'hidden';
+
+  loadPriceDetail(id);
+  loadChart(id);
+}
+
+function closeSheet() {
+  state.openCardId = null;
+  sheet.classList.remove('open');
+  sheet.setAttribute('aria-hidden', 'true');
+  scrim.classList.remove('open');
+  sheet.style.transform = '';
+  document.body.style.overflow = '';
+}
+
+$('sheetCloseBtn').addEventListener('click', closeSheet);
+scrim.addEventListener('click', closeSheet);
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if ($('scanner').classList.contains('open')) closeScanner();
+  else if (document.querySelector('.modal.open')) closeModals();
+  else if (state.openCardId) closeSheet();
+});
+
+function renderSheetBody() {
+  const card = cardById(state.openCardId);
+  const body = $('sheetBody');
+  body.innerHTML = '';
+  if (!card) return;
+
+  // Hero: value, what it is made of, and how much to trust it.
+  const hero = el('div', 'sheet-hero');
+  hero.appendChild(cardArt(card, 'sheet-art'));
+
+  const figures = el('div', 'sheet-figures');
+  figures.append(el('div', 'figure-label', card.quantity > 1 ? `${card.quantity} copies worth` : 'Market value'));
+  figures.append(el('div', 'figure-value', card.unit_price > 0 ? money(card.total_value) : '—'));
+
+  if (card.unit_price > 0 && card.quantity > 1) {
+    figures.append(el('div', 'figure-note', `${money(card.unit_price)} each at Near Mint, adjusted per copy below`));
+  } else if (card.unit_price > 0) {
+    figures.append(el('div', 'figure-note', `${money(card.unit_price)} Near Mint · adjusted for condition`));
+  } else {
+    figures.append(el('div', 'figure-note', card.needs_review
+      ? 'Not priced — we could not confirm this card. Correct it and it will price itself.'
+      : 'No market data found for this printing.'));
+  }
+
+  const pills = el('div', 'figure-pills');
+  const conf = Number(card.price_confidence) || 0;
+  if (card.unit_price > 0) {
+    const level = conf >= 0.8 ? 'good' : conf >= 0.55 ? 'warn' : 'bad';
+    const pill = el('span', `pill pill-${level}`);
+    pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
+    pills.appendChild(pill);
+    if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
+    if (card.price_variant_matched === false || card.price_variant_matched === 0) {
+      pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
+    }
+  }
+  if (card.needs_review) pills.appendChild(el('span', 'pill pill-warn', 'Unconfirmed card'));
+  if (card.has_mixed_conditions) pills.appendChild(el('span', 'pill', 'Mixed conditions'));
+  if (pills.children.length) figures.appendChild(pills);
+
+  hero.appendChild(figures);
+  body.appendChild(hero);
+
+  // Copies
+  const copiesPanel = el('div', 'panel glass');
+  const copiesTitle = el('div', 'section-title');
+  copiesTitle.append(el('span', null, `Copies you own (${card.quantity})`));
+  const addBtn = el('button', 'btn btn-quiet btn-sm', '+ Add copy');
+  addBtn.addEventListener('click', () => openCopyModal(card.id, null));
+  copiesTitle.appendChild(addBtn);
+  copiesPanel.appendChild(copiesTitle);
+
+  const copies = el('div', 'copies');
+  copies.style.marginTop = '11px';
+  (card.copies || []).forEach((copy, i) => {
+    const row = el('div', 'copy');
+    row.append(el('div', 'copy-n', `#${i + 1}`));
+
+    const main = el('div', 'copy-main');
+    main.append(el('div', 'copy-cond', copy.grade ? `${copy.grade} (graded)` : (copy.condition || 'Unknown')));
+    const notes = [];
+    if (copy.manual_value > 0) notes.push('value set by hand');
+    else if (!copy.grade && copy.condition && copy.condition !== 'Near Mint' && copy.condition !== 'Mint') notes.push('condition-adjusted');
+    if (copy.acquired_price > 0) notes.push(`paid ${money(copy.acquired_price)}`);
+    if (copy.notes) notes.push(copy.notes);
+    if (notes.length) main.append(el('div', 'copy-note', notes.join(' · ')));
+    row.appendChild(main);
+
+    row.append(el('div', 'copy-val', copy.value > 0 ? money(copy.value) : '—'));
+
+    const actions = el('div', 'copy-actions');
+    if (copy.id) {
+      const edit = el('button');
+      edit.title = 'Edit this copy';
+      edit.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+      edit.addEventListener('click', () => openCopyModal(card.id, copy));
+      const del = el('button', 'danger');
+      del.title = 'Remove this copy';
+      del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>';
+      del.addEventListener('click', () => removeCopy(card, copy));
+      actions.append(edit, del);
+    }
+    row.appendChild(actions);
+    copies.appendChild(row);
+  });
+  copiesPanel.appendChild(copies);
+  body.appendChild(copiesPanel);
+
+  // Chart
+  const chartPanel = el('div', 'panel glass');
+  const chartTitle = el('div', 'section-title');
+  chartTitle.append(el('span', null, 'Price history'));
+  chartPanel.appendChild(chartTitle);
+
+  const tabs = el('div', 'chart-tabs');
+  tabs.style.marginTop = '10px';
+  for (const [label, days] of [['7D', 7], ['30D', 30], ['90D', 90], ['All', 0]]) {
+    const tab = el('button', days === state.chartDays ? 'active' : '', label);
+    tab.addEventListener('click', () => {
+      state.chartDays = days;
+      tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === tab));
+      loadChart(card.id);
+    });
+    tabs.appendChild(tab);
+  }
+  chartPanel.appendChild(tabs);
+  const chartHost = el('div', 'chart-wrap');
+  chartHost.id = 'chartHost';
+  chartHost.appendChild(el('div', 'chart-empty', 'Loading…'));
+  chartPanel.appendChild(chartHost);
+  body.appendChild(chartPanel);
+
+  // Where the price came from
+  const sourcePanel = el('div', 'panel glass');
+  sourcePanel.id = 'sourcePanel';
+  sourcePanel.appendChild(el('div', 'section-title', 'Where this price comes from'));
+  const sourceHost = el('div', 'sources');
+  sourceHost.id = 'sourceHost';
+  sourceHost.style.marginTop = '11px';
+  sourceHost.appendChild(el('div', 'chart-empty', 'Loading…'));
+  sourcePanel.appendChild(sourceHost);
+  body.appendChild(sourcePanel);
+
+  // Details
+  const detailPanel = el('div', 'panel glass');
+  detailPanel.appendChild(el('div', 'section-title', 'Card details'));
+  const details = el('div', 'details');
+  details.style.marginTop = '11px';
+  const rows = [
+    ['Set', card.card_set || '—'],
+    ['Number', card.card_number || '—'],
+    ['Rarity', card.rarity || '—'],
+    ['Printing', card.holo_type || 'Unknown'],
+    ['1st Edition', card.is_first_edition ? 'Yes' : 'No'],
+    ['Language', card.language || '—'],
+    ['Year', card.year ? String(card.year) : '—'],
+    ['Price checked', timeAgo(card.last_price_check)],
+  ];
+  for (const [k, v] of rows) {
+    const cell = el('div', 'detail');
+    cell.append(el('div', 'detail-k', k), el('div', 'detail-v', v));
+    details.appendChild(cell);
+  }
+  detailPanel.appendChild(details);
+  body.appendChild(detailPanel);
+
+  const removeBtn = el('button', 'btn btn-glass btn-danger btn-block', 'Remove this card entirely');
+  removeBtn.addEventListener('click', () => removeCard(card));
+  body.appendChild(removeBtn);
+
+  hydrateLocalImages(body);
+}
+
+async function loadPriceDetail(cardId) {
+  const host = $('sourceHost');
+  if (!host) return;
   try {
-    const res = await fetch('/api/portfolio/refresh-prices', { method: 'POST' });
-    const data = await res.json();
-    showToast(data.message || 'Prices refreshed!', 'success');
-    await fetchPortfolio();
+    const data = await api(`/api/portfolio/${cardId}/prices`);
+    if (state.openCardId !== cardId) return;
+    host.innerHTML = '';
+
+    const entries = Object.entries(data.sources || {});
+    if (!entries.length) {
+      host.appendChild(el('div', 'chart-empty', 'No market quotes were recorded for this card yet.'));
+      return;
+    }
+
+    for (const [key, s] of entries) {
+      const row = el('div', `source-row${s.used ? '' : ' unused'}`);
+      const name = el('div', 'source-name', sourceLabel(key));
+      row.appendChild(name);
+      if (s.currency && s.currency !== 'USD') {
+        row.appendChild(el('span', 'source-native', `${s.nativePrice} ${s.currency}`));
+      }
+      if (!s.variantMatched) row.appendChild(el('span', 'pill pill-warn', 'other printing'));
+      row.appendChild(el('div', 'source-price', money(s.price)));
+      host.appendChild(row);
+    }
+
+    const summary = el('div', 'copy-note');
+    summary.style.marginTop = '4px';
+    const bits = [];
+    if (data.low && data.high && data.low !== data.high) bits.push(`Sources ranged ${money(data.low)}–${money(data.high)}`);
+    if (data.variant) bits.push(`priced as ${data.variant}`);
+    bits.push(`checked ${timeAgo(data.checkedAt)}`);
+    summary.textContent = bits.join(' · ');
+    host.appendChild(summary);
+
+    if (data.priceSourceUrl) {
+      const link = el('a', 'pill', 'Open on the marketplace ↗');
+      link.href = data.priceSourceUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.style.marginTop = '6px';
+      link.style.alignSelf = 'flex-start';
+      host.appendChild(link);
+    }
+  } catch {
+    host.innerHTML = '';
+    host.appendChild(el('div', 'chart-empty', 'Could not load the price breakdown.'));
+  }
+}
+
+async function loadChart(cardId) {
+  const host = $('chartHost');
+  if (!host) return;
+  try {
+    const data = await api(`/api/portfolio/${cardId}/history`);
+    if (state.openCardId !== cardId) return;
+
+    let points = (data.history || []).map((h) => ({ t: new Date(h.recorded_at).getTime(), v: Number(h.price) }))
+      .filter((p) => p.v > 0 && Number.isFinite(p.t));
+
+    if (state.chartDays > 0) {
+      const cutoff = Date.now() - state.chartDays * 86400000;
+      const windowed = points.filter((p) => p.t >= cutoff);
+      if (windowed.length >= 2) points = windowed;
+    }
+
+    host.innerHTML = '';
+    host.appendChild(points.length >= 2
+      ? lineChart(points)
+      : el('div', 'chart-empty', 'Only one price recorded so far. The chart fills in as daily prices are collected.'));
+  } catch {
+    host.innerHTML = '';
+    host.appendChild(el('div', 'chart-empty', 'Could not load price history.'));
+  }
+}
+
+/** Small dependency-free area chart — no CDN, themes with CSS variables. */
+function lineChart(points) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const W = 320, H = 148, PAD_X = 4, PAD_Y = 10;
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'chart-svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  const values = points.map((p) => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || Math.max(max * 0.1, 1);
+  const x = (i) => PAD_X + (i / (points.length - 1)) * (W - PAD_X * 2);
+  const y = (v) => PAD_Y + (1 - (v - min) / range) * (H - PAD_Y * 2);
+
+  const rising = values[values.length - 1] >= values[0];
+  const stroke = rising ? 'var(--up)' : 'var(--down)';
+  const id = `g${Math.random().toString(36).slice(2, 8)}`;
+
+  const defs = document.createElementNS(NS, 'defs');
+  const grad = document.createElementNS(NS, 'linearGradient');
+  grad.setAttribute('id', id);
+  grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+  grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+  const s1 = document.createElementNS(NS, 'stop');
+  s1.setAttribute('offset', '0%'); s1.setAttribute('stop-color', stroke); s1.setAttribute('stop-opacity', '0.28');
+  const s2 = document.createElementNS(NS, 'stop');
+  s2.setAttribute('offset', '100%'); s2.setAttribute('stop-color', stroke); s2.setAttribute('stop-opacity', '0');
+  grad.append(s1, s2);
+  defs.appendChild(grad);
+  svg.appendChild(defs);
+
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(' ');
+
+  const area = document.createElementNS(NS, 'path');
+  area.setAttribute('d', `${line} L${x(points.length - 1).toFixed(1)} ${H} L${x(0).toFixed(1)} ${H} Z`);
+  area.setAttribute('fill', `url(#${id})`);
+  svg.appendChild(area);
+
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', line);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', stroke);
+  path.setAttribute('stroke-width', '2');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('vector-effect', 'non-scaling-stroke');
+  svg.appendChild(path);
+
+  const dot = document.createElementNS(NS, 'circle');
+  dot.setAttribute('cx', x(points.length - 1).toFixed(1));
+  dot.setAttribute('cy', y(values[values.length - 1]).toFixed(1));
+  dot.setAttribute('r', '3');
+  dot.setAttribute('fill', stroke);
+  svg.appendChild(dot);
+
+  const wrap = el('div');
+  wrap.appendChild(svg);
+  const legend = el('div', 'copy-note');
+  legend.style.marginTop = '6px';
+  legend.textContent = `${money(min)} – ${money(max)} over ${points.length} recorded price${points.length === 1 ? '' : 's'}`;
+  wrap.appendChild(legend);
+  return wrap;
+}
+
+// Drag-to-dismiss on mobile, the way a native sheet behaves.
+(function enableSheetDrag() {
+  let startY = 0;
+  let delta = 0;
+  let dragging = false;
+
+  const start = (e) => {
+    if (window.innerWidth > 860) return;
+    dragging = true;
+    delta = 0;
+    startY = e.touches ? e.touches[0].clientY : e.clientY;
+    sheet.classList.add('dragging');
+  };
+  const move = (e) => {
+    if (!dragging) return;
+    const y = e.touches ? e.touches[0].clientY : e.clientY;
+    delta = Math.max(0, y - startY);
+    sheet.style.transform = `translateY(${delta}px)`;
+  };
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    sheet.classList.remove('dragging');
+    sheet.style.transform = '';
+    if (delta > 110) closeSheet();
+  };
+
+  for (const node of [$('sheetHead'), $('sheetGrip')]) {
+    node.addEventListener('touchstart', start, { passive: true });
+    node.addEventListener('touchmove', move, { passive: true });
+    node.addEventListener('touchend', end);
+  }
+})();
+
+// ── COPIES ───────────────────────────────────────────────────────
+
+let copyContext = { cardId: null, copyId: null };
+
+function openCopyModal(cardId, copy) {
+  copyContext = { cardId, copyId: copy?.id || null };
+  $('copyModalTitle').textContent = copy ? 'Edit this copy' : 'Add another copy';
+
+  const select = $('copyCondition');
+  select.innerHTML = '';
+  const conditions = state.pricing?.conditions?.length
+    ? state.pricing.conditions
+    : ['Mint', 'Near Mint', 'Lightly Played', 'Moderately Played', 'Heavily Played', 'Damaged', 'Unknown'];
+  for (const c of conditions) {
+    const opt = el('option', null, c);
+    opt.value = c;
+    select.appendChild(opt);
+  }
+  select.value = copy?.condition || 'Near Mint';
+
+  $('copyGrade').value = copy?.grade || '';
+  $('copyPaid').value = copy?.acquired_price > 0 ? copy.acquired_price : '';
+  $('copyManual').value = copy?.manual_value > 0 ? copy.manual_value : '';
+  $('copyNotes').value = copy?.notes || '';
+
+  openModal('copyModal');
+}
+
+$('copySaveBtn').addEventListener('click', async () => {
+  const payload = {
+    condition: $('copyCondition').value,
+    grade: $('copyGrade').value.trim(),
+    acquired_price: Number($('copyPaid').value) || 0,
+    manual_value: Number($('copyManual').value) || 0,
+    notes: $('copyNotes').value.trim(),
+  };
+  try {
+    if (copyContext.copyId) {
+      await api(`/api/portfolio/copies/${copyContext.copyId}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      toast('Copy updated', 'success');
+    } else {
+      await api(`/api/portfolio/${copyContext.cardId}/copies`, { method: 'POST', body: JSON.stringify(payload) });
+      toast('Copy added', 'success');
+    }
+    closeModals();
+    await loadCollection();
+    if (state.openCardId) renderSheetBody();
   } catch (err) {
-    showToast('Failed to refresh prices', 'error');
-  } finally {
-    refreshBtn.classList.remove('loading');
-    refreshBtn.disabled = false;
+    toast(err.message, 'error');
   }
 });
 
-// ── SCANNER MODAL ─────────────────────────────────────────────────
-const scannerCameraTab = document.getElementById('scannerCameraTab');
-const scannerUploadTab = document.getElementById('scannerUploadTab');
-const scanResults = document.getElementById('scanResults');
-const tabCamera = document.getElementById('tabCamera');
-const tabUpload = document.getElementById('tabUpload');
-const cameraVideo = document.getElementById('cameraVideo');
-const viewfinderContainer = document.getElementById('viewfinderContainer');
-const cameraPermission = document.getElementById('cameraPermission');
-const cameraErrorEl = document.getElementById('cameraError');
-const captureBtn = document.getElementById('captureBtn');
-const captureFlash = document.getElementById('captureFlash');
-const captureCanvas = document.getElementById('captureCanvas');
-const scanStrip = document.getElementById('scanStrip');
-const scanStripCards = document.getElementById('scanStripCards');
-const scanCounter = document.getElementById('scanCounter');
-const scanCountNum = document.getElementById('scanCountNum');
-const flashBtn = document.getElementById('flashBtn');
-const switchCameraBtn = document.getElementById('switchCameraBtn');
-const galleryBtn = document.getElementById('galleryBtn');
-const galleryInput = document.getElementById('galleryInput');
-const guideHint = document.getElementById('guideHint');
+async function removeCopy(card, copy) {
+  const last = card.quantity <= 1;
+  const question = last
+    ? `Remove the last copy of ${card.card_name}? This removes the card from your collection.`
+    : `Remove one copy of ${card.card_name}? You will have ${card.quantity - 1} left.`;
+  if (!confirm(question)) return;
 
-let cameraStream = null;
-let isCapturing = false;
-let scanSessionCards = [];
-let scanCount = 0;
-let currentFacingMode = 'environment';
-let torchEnabled = false;
-
-function openModal() {
-  uploadModal.classList.add('open');
-  document.body.style.overflow = 'hidden';
-  switchTab('camera');
+  try {
+    const result = await api(`/api/portfolio/copies/${copy.id}`, { method: 'DELETE' });
+    toast(result.cardRemoved ? 'Card removed' : 'Copy removed', 'success');
+    if (result.cardRemoved) closeSheet();
+    await loadCollection();
+    if (state.openCardId) renderSheetBody();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
 }
 
-function closeModal() {
-  uploadModal.classList.remove('open');
+async function removeCard(card) {
+  if (!confirm(`Remove ${card.card_name} and all ${card.quantity} cop${card.quantity === 1 ? 'y' : 'ies'} from your collection?`)) return;
+  try {
+    await api(`/api/portfolio/${card.id}`, { method: 'DELETE' });
+    toast('Card removed', 'success');
+    closeSheet();
+    await loadCollection();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// ── EDIT CARD ────────────────────────────────────────────────────
+
+$('sheetEditBtn').addEventListener('click', () => {
+  const card = cardById(state.openCardId);
+  if (!card) return;
+  $('editName').value = card.card_name || '';
+  $('editSet').value = card.card_set || '';
+  $('editNumber').value = card.card_number || '';
+  $('editHolo').value = ['Unknown', 'Non-Holo', 'Holofoil', 'Reverse Holo', 'Cosmos Holo'].includes(card.holo_type)
+    ? card.holo_type : 'Unknown';
+  $('editLanguage').value = card.language || 'English';
+  $('editFirstEd').checked = Boolean(card.is_first_edition);
+  openModal('editModal');
+});
+
+$('editSaveBtn').addEventListener('click', async () => {
+  const id = state.openCardId;
+  if (!id) return;
+  const btn = $('editSaveBtn');
+  btn.disabled = true;
+  btn.textContent = 'Re-pricing…';
+  try {
+    const holo = $('editHolo').value;
+    const result = await api(`/api/portfolio/${id}/edit`, {
+      method: 'POST',
+      body: JSON.stringify({
+        card_name: $('editName').value.trim(),
+        card_set: $('editSet').value.trim(),
+        card_number: $('editNumber').value.trim(),
+        holo_type: holo,
+        language: $('editLanguage').value.trim() || 'English',
+        is_first_edition: $('editFirstEd').checked,
+        is_holo: holo === 'Holofoil' || holo === 'Reverse Holo' || holo === 'Cosmos Holo',
+      }),
+    });
+    closeModals();
+    toast(result.price > 0 ? `Re-priced at ${money(result.price)}` : 'Saved, but no market price was found', result.price > 0 ? 'success' : 'info');
+    await loadCollection();
+    if (state.openCardId) {
+      const card = cardById(state.openCardId);
+      if (card) openSheet(card.id); else closeSheet();
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save & re-price';
+  }
+});
+
+// ── MODALS ───────────────────────────────────────────────────────
+
+function openModal(id) {
+  $(id).classList.add('open');
+  $(id).setAttribute('aria-hidden', 'false');
+  scrim.classList.add('open');
+}
+
+function closeModals() {
+  document.querySelectorAll('.modal.open').forEach((m) => {
+    m.classList.remove('open');
+    m.setAttribute('aria-hidden', 'true');
+  });
+  if (!state.openCardId) scrim.classList.remove('open');
+}
+
+document.querySelectorAll('[data-close-modal]').forEach((b) => b.addEventListener('click', closeModals));
+
+// ── MERGE DUPLICATES ─────────────────────────────────────────────
+
+$('openMergeBtn').addEventListener('click', openMergeModal);
+$('dupeBannerBtn').addEventListener('click', openMergeModal);
+
+async function openMergeModal() {
+  openModal('mergeModal');
+  const body = $('mergeBody');
+  body.innerHTML = '';
+  $('mergeIntro').textContent = 'Checking your collection…';
+  $('mergeConfirmBtn').disabled = true;
+
+  try {
+    const { groups } = await api('/api/portfolio/duplicates');
+    body.innerHTML = '';
+
+    if (!groups.length) {
+      $('mergeIntro').textContent = 'Nothing to merge — every printing already sits on a single card.';
+      return;
+    }
+
+    const rows = groups.reduce((sum, g) => sum + g.row_count, 0);
+    const one = groups.length === 1;
+    $('mergeIntro').textContent =
+      `${one ? 'One printing is' : `${groups.length} printings are`} split across ${rows} separate rows. ` +
+      'Merging keeps every copy and all price history, and puts them under one card.';
+
+    for (const g of groups) {
+      const row = el('label', 'dupe-group');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = true;
+      box.value = g.variant_key;
+      row.appendChild(box);
+
+      const info = el('div', 'dupe-group-body');
+      info.append(el('div', 'dupe-group-name', g.card_name || 'Unknown'));
+      info.append(el('div', 'dupe-group-meta', [g.card_set, g.card_number].filter(Boolean).join(' · ') || '—'));
+      row.appendChild(info);
+
+      row.appendChild(el('div', 'dupe-group-count', `${g.row_count} rows → 1`));
+      body.appendChild(row);
+    }
+
+    $('mergeConfirmBtn').disabled = false;
+  } catch (err) {
+    $('mergeIntro').textContent = `Could not check for duplicates: ${err.message}`;
+  }
+}
+
+$('mergeConfirmBtn').addEventListener('click', async () => {
+  const keys = [...$('mergeBody').querySelectorAll('input:checked')].map((i) => i.value);
+  if (!keys.length) { toast('Nothing selected', 'info'); return; }
+
+  const btn = $('mergeConfirmBtn');
+  btn.disabled = true;
+  btn.textContent = 'Merging…';
+  try {
+    const result = await api('/api/portfolio/merge-duplicates', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, variantKeys: keys }),
+    });
+    closeModals();
+    toast(`Merged ${result.mergedGroups} card${result.mergedGroups === 1 ? '' : 's'}, ${result.removedRows} duplicate rows folded in`, 'success');
+    await loadCollection();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Merge selected';
+  }
+});
+
+// ── REFRESH ──────────────────────────────────────────────────────
+
+async function refreshPrices(button) {
+  const original = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Refreshing…'; }
+  try {
+    await api('/api/portfolio/refresh-prices', { method: 'POST' });
+    toast('Refreshing prices in the background', 'info');
+    setTimeout(loadCollection, 6000);
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    if (button) { button.disabled = false; button.textContent = original; }
+  }
+}
+
+$('refreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+$('settingsRefreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+
+// ═══════════════════════════════════════════════════════════════
+//  SCANNER
+// ═══════════════════════════════════════════════════════════════
+
+const scanner = $('scanner');
+const video = $('cameraVideo');
+const canvas = $('captureCanvas');
+
+let stream = null;
+let facing = 'environment';
+let torchOn = false;
+let capturing = false;
+
+function openScanner() {
+  scanner.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  state.scanned = [];
+  renderTray();
+  startCamera();
+}
+
+function closeScanner() {
+  scanner.classList.remove('open');
   document.body.style.overflow = '';
   stopCamera();
-  resetScanSession();
-}
+  setTrayOpen(false);
+  hideHit();
 
-function resetScanSession() {
-  scanSessionCards = [];
-  scanCount = 0;
-  scanStripCards.innerHTML = '';
-  scanStrip.style.display = 'none';
-  scanCounter.style.display = 'none';
-  scanCountNum.textContent = '0';
-  scanResults.style.display = 'none';
-}
+  const saved = state.scanned.filter((s) => s.status === 'ok' || s.status === 'dupe');
+  if (saved.length) loadCollection();
 
-function switchTab(tab) {
-  scannerCameraTab.style.display = 'none';
-  scannerUploadTab.style.display = 'none';
-  scanResults.style.display = 'none';
-  tabCamera.classList.remove('active');
-  tabUpload.classList.remove('active');
-  if (tab === 'camera') {
-    tabCamera.classList.add('active');
-    scannerCameraTab.style.display = 'flex';
-    initCamera();
-  } else {
-    tabUpload.classList.add('active');
-    scannerUploadTab.style.display = 'flex';
-    stopCamera();
+  // Unconfirmed cards live in the Review tab, so the collection can look
+  // unchanged after a scan. Say where they went rather than leave you guessing.
+  const pending = saved.filter((s) => s.needsReview).length;
+  if (pending) {
+    toast(`${pending} card${pending === 1 ? '' : 's'} need${pending === 1 ? 's' : ''} confirming — see Needs review`, 'info', 6000);
   }
 }
 
-tabCamera.addEventListener('click', () => switchTab('camera'));
-tabUpload.addEventListener('click', () => switchTab('upload'));
+$('scannerCloseBtn').addEventListener('click', closeScanner);
 
-openUploadBtn.addEventListener('click', openModal);
-emptyUploadBtn.addEventListener('click', openModal);
-closeUploadBtn.addEventListener('click', closeModal);
-uploadModal.addEventListener('click', e => {
-  if (e.target === uploadModal) closeModal();
-});
-
-document.getElementById('switchToUploadBtn')?.addEventListener('click', () => switchTab('upload'));
-document.getElementById('switchToUploadBtn2')?.addEventListener('click', () => switchTab('upload'));
-document.getElementById('grantCameraBtn')?.addEventListener('click', () => initCamera(true));
-document.getElementById('retryCameraBtn')?.addEventListener('click', () => initCamera(true));
-
-// ── CAMERA MANAGEMENT ─────────────────────────────────────────────
-async function initCamera(forceRequest = false) {
-  cameraPermission.style.display = 'none';
-  cameraErrorEl.style.display = 'none';
-  viewfinderContainer.style.display = 'none';
-
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showCameraError('Camera Not Supported', 'Your browser doesn\'t support camera access. Try Chrome or Safari.');
+async function startCamera() {
+  hideScannerMessage();
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showScannerMessage('📷', 'Live camera not supported',
+      'This browser cannot open a live viewfinder. You can still use your phone’s camera app or pick a photo.');
     return;
-  }
-
-  if (!forceRequest) {
-    try {
-      const permResult = await navigator.permissions?.query({ name: 'camera' });
-      if (permResult && permResult.state === 'prompt') {
-        cameraPermission.style.display = 'flex';
-        return;
-      }
-    } catch {}
   }
 
   try {
     stopCamera();
-    const constraints = {
-      video: { facingMode: currentFacingMode, width: { ideal: 2048 }, height: { ideal: 2048 } },
-      audio: false
-    };
-    cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
-    cameraVideo.srcObject = cameraStream;
-    await new Promise(resolve => {
-      cameraVideo.onloadedmetadata = () => { cameraVideo.play(); resolve(); };
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: facing }, width: { ideal: 2560 }, height: { ideal: 1440 } },
+      audio: false,
     });
+    video.srcObject = stream;
+    await video.play();
 
-    viewfinderContainer.style.display = 'flex';
-    cameraPermission.style.display = 'none';
-    cameraErrorEl.style.display = 'none';
-
-    const track = cameraStream.getVideoTracks()[0];
-    const capabilities = track.getCapabilities?.();
-    flashBtn.style.display = capabilities?.torch ? 'flex' : 'none';
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities?.() || {};
+    $('torchBtn').hidden = !caps.torch;
 
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
-      const cameras = devices.filter(d => d.kind === 'videoinput');
-      switchCameraBtn.style.display = cameras.length > 1 ? 'flex' : 'none';
-    } catch {}
+      $('flipBtn').hidden = devices.filter((d) => d.kind === 'videoinput').length < 2;
+    } catch { /* device list is not essential */ }
 
-    setTimeout(() => { if (guideHint) guideHint.style.opacity = '0.4'; }, 4000);
+    startAimAssist();
   } catch (err) {
-    console.error('Camera init error:', err);
-    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-      showCameraError('Camera Access Denied', 'Please allow camera access in your browser settings, or use the Upload tab.');
-    } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-      showCameraError('No Camera Found', 'No camera was detected. Use the Upload tab instead.');
-    } else {
-      showCameraError('Camera Error', 'Could not access camera: ' + err.message);
-    }
+    const denied = err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError';
+    showScannerMessage(
+      denied ? '🔒' : '📷',
+      denied ? 'Camera access blocked' : 'No camera available',
+      denied
+        ? 'Allow camera access for this site in your browser settings, or use your phone’s camera app instead.'
+        : 'We could not open a camera on this device. Your phone’s camera app and photo library still work.',
+    );
   }
 }
 
 function stopCamera() {
-  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
-  if (cameraVideo) cameraVideo.srcObject = null;
-  torchEnabled = false;
-  flashBtn.classList.remove('active');
+  stopAimAssist();
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+  torchOn = false;
+  $('torchBtn').classList.remove('active');
 }
 
-function showCameraError(title, text) {
-  cameraErrorEl.style.display = 'flex';
-  viewfinderContainer.style.display = 'none';
-  cameraPermission.style.display = 'none';
-  document.getElementById('cameraErrorTitle').textContent = title;
-  document.getElementById('cameraErrorText').textContent = text;
+function showScannerMessage(icon, title, text) {
+  $('scannerMsgIcon').textContent = icon;
+  $('scannerMsgTitle').textContent = title;
+  $('scannerMsgText').textContent = text;
+  $('scannerMsg').classList.add('show');
 }
 
-flashBtn.addEventListener('click', async () => {
-  if (!cameraStream) return;
-  const track = cameraStream.getVideoTracks()[0];
+function hideScannerMessage() { $('scannerMsg').classList.remove('show'); }
+
+$('scannerRetryBtn').addEventListener('click', startCamera);
+$('scannerNativeBtn').addEventListener('click', () => $('nativeCameraInput').click());
+$('scannerPickBtn').addEventListener('click', () => $('libraryInput').click());
+$('pickBtn').addEventListener('click', () => $('libraryInput').click());
+
+$('torchBtn').addEventListener('click', async () => {
+  if (!stream) return;
+  const track = stream.getVideoTracks()[0];
   try {
-    torchEnabled = !torchEnabled;
-    await track.applyConstraints({ advanced: [{ torch: torchEnabled }] });
-    flashBtn.classList.toggle('active', torchEnabled);
-  } catch { torchEnabled = false; flashBtn.classList.remove('active'); }
-});
-
-switchCameraBtn.addEventListener('click', () => {
-  currentFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
-  initCamera(true);
-});
-
-// ── CAPTURE ───────────────────────────────────────────────────────
-captureBtn.addEventListener('click', captureCard);
-
-async function captureCard() {
-  hideVerifyOverlay();
-  if (isCapturing || !cameraStream) return;
-  isCapturing = true;
-  captureBtn.classList.add('capturing');
-
-  captureFlash.classList.add('flash');
-  setTimeout(() => captureFlash.classList.remove('flash'), 300);
-  if (navigator.vibrate) navigator.vibrate(50);
-
-  try {
-    const video = cameraVideo;
-    const canvas = captureCanvas;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    const scale = Math.min(2048 / w, 2048 / h, 1);
-    canvas.width = Math.round(w * scale);
-    canvas.height = Math.round(h * scale);
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
-    if (!blob) { showToast('Failed to capture image', 'error'); isCapturing = false; captureBtn.classList.remove('capturing'); return; }
-
-    const scanId = Date.now();
-    const thumbUrl = canvas.toDataURL('image/jpeg', 0.5);
-    addScanStripItem(scanId, thumbUrl, 'Analyzing…', 'processing');
-    scanStrip.style.display = 'block';
-    scanCounter.style.display = 'flex';
-
-    captureBtn.classList.remove('capturing');
-    isCapturing = false;
-    processCapturedImage(blob, scanId, thumbUrl);
-  } catch (err) {
-    console.error('Capture error:', err);
-    showToast('Failed to capture: ' + err.message, 'error');
-    isCapturing = false;
-    captureBtn.classList.remove('capturing');
-  }
-}
-
-async function processCapturedImage(blob, scanId, thumbUrl) {
-  try {
-    const formData = new FormData();
-    formData.append('cards', blob, `scan_${scanId}.jpg`);
-    const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
-    if (!res.ok) {
-      let errMsg = `Upload failed (${res.status})`;
-      try { const d = await res.json(); errMsg = d.error || errMsg; } catch {}
-      throw new Error(errMsg);
-    }
-    const data = await res.json();
-    const cards = data.cards || [];
-    if (cards.length > 0) {
-      cards.forEach(card => { 
-        handleUnifiedScanSuccess(card);
-      });
-      const c = cards[0];
-      updateScanStripItem(scanId, { name: c.card_name || 'Unknown', price: c.current_price || c.estimated_value || 0, imageUrl: c.image_url || c.image_data || thumbUrl, status: 'success' });
-      showToast(cards.length === 1 ? `✅ ${c.card_name} — ${fmt(c.current_price || c.estimated_value)}` : `✅ ${cards.length} cards found!`, 'success');
-    } else {
-      updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
-      showToast('No card detected — try adjusting angle or lighting', 'info');
-    }
-    await fetchPortfolio();
-  } catch (err) {
-    console.error('Process error:', err);
-    updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
-    showToast('Scan failed: ' + err.message, 'error');
-  }
-}
-
-function addScanStripItem(id, thumbUrl, text, status) {
-  const item = document.createElement('div');
-  item.className = `scan-card-item ${status}`;
-  item.id = `scan-item-${id}`;
-  item.innerHTML = `
-    <img class="scan-card-item-img" src="${thumbUrl}" alt="Scanning…" />
-    <div class="scan-card-item-info">
-      <div class="scan-card-item-name">${text}</div>
-      <div class="scan-card-item-status">🔍 Identifying…</div>
-    </div>`;
-  scanStripCards.appendChild(item);
-  scanStripCards.scrollLeft = scanStripCards.scrollWidth;
-}
-
-function updateScanStripItem(id, data) {
-  const item = document.getElementById(`scan-item-${id}`);
-  if (!item) return;
-  item.className = `scan-card-item ${data.status}`;
-  if (data.imageUrl && data.status === 'success') {
-    const img = item.querySelector('.scan-card-item-img');
-    if (img) img.src = data.imageUrl;
-  }
-  const nameEl = item.querySelector('.scan-card-item-name');
-  const statusEl = item.querySelector('.scan-card-item-status');
-  if (nameEl) nameEl.textContent = data.name;
-  if (data.status === 'success') {
-    if (statusEl) { statusEl.className = 'scan-card-item-price'; statusEl.textContent = data.price > 0 ? fmt(data.price) : 'Unpriced'; }
-  } else if (data.status === 'error') {
-    if (statusEl) { statusEl.className = 'scan-card-item-status'; statusEl.textContent = '⚠️ Try again'; }
-  }
-}
-
-// ── SCAN DONE → SHOW RESULTS ──────────────────────────────────────
-document.getElementById('scanDoneBtn')?.addEventListener('click', showScanResults);
-
-function showScanResults() {
-  stopCamera();
-  scannerCameraTab.style.display = 'none';
-  scannerUploadTab.style.display = 'none';
-  scanResults.style.display = 'flex';
-
-  const totalCards = scanSessionCards.length;
-  const resultsTitle = document.getElementById('resultsTitle');
-  const resultsSubtitle = document.getElementById('resultsSubtitle');
-  const resultsCardsEl = document.getElementById('resultsCards');
-
-  if (totalCards === 0) {
-    resultsTitle.textContent = 'No Cards Added';
-    resultsSubtitle.textContent = 'No cards were identified. Try again with better lighting.';
-    document.querySelector('.results-icon').textContent = '📸';
-  } else {
-    resultsTitle.textContent = totalCards === 1 ? 'Card Added!' : `${totalCards} Cards Added!`;
-    const totalValue = scanSessionCards.reduce((sum, c) => sum + (c.current_price || c.estimated_value || 0), 0);
-    resultsSubtitle.textContent = totalValue > 0 ? `Total value: ${fmt(totalValue)}` : `${totalCards} card${totalCards !== 1 ? 's' : ''} added to your portfolio`;
-    document.querySelector('.results-icon').textContent = '🎉';
-  }
-
-  resultsCardsEl.innerHTML = '';
-  scanSessionCards.forEach(card => {
-    const imgSrc = card.image_url || card.image_data || '';
-    const div = document.createElement('div');
-    div.className = 'result-card';
-    div.innerHTML = `
-      ${imgSrc ? `<img class="result-card-img" src="${imgSrc}" alt="${card.card_name}" onerror="this.outerHTML='<div class=\\'result-card-img-placeholder\\'>🃏</div>'">`
-        : '<div class="result-card-img-placeholder">🃏</div>'}
-      <div class="result-card-info">
-        <div class="result-card-name">${card.card_name || 'Unknown'}</div>
-        <div class="result-card-set">${card.card_set || '—'} ${card.rarity ? '• ' + card.rarity : ''}</div>
-      </div>
-      <div class="result-card-price">${fmt(card.current_price || card.estimated_value)}</div>`;
-    resultsCardsEl.appendChild(div);
-  });
-}
-
-document.getElementById('resultsScanMoreBtn')?.addEventListener('click', () => {
-  resetScanSession();
-  scanResults.style.display = 'none';
-  switchTab('camera');
-});
-document.getElementById('resultsDoneBtn')?.addEventListener('click', closeModal);
-
-// ── GALLERY BUTTON (from camera tab) ──────────────────────────────
-galleryBtn.addEventListener('click', () => galleryInput.click());
-galleryInput.addEventListener('change', async () => {
-  const files = Array.from(galleryInput.files);
-  if (files.length) {
-    for (const file of files) {
-      const scanId = Date.now() + Math.random();
-      const thumbUrl = URL.createObjectURL(file);
-      addScanStripItem(scanId, thumbUrl, file.name, 'processing');
-      scanStrip.style.display = 'block';
-      scanCounter.style.display = 'flex';
-      
-      try {
-        const jpegFile = await ensureJpeg(file);
-        const formData = new FormData();
-        formData.append('cards', jpegFile);
-        const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
-        const data = await res.json();
-        const cards = data.cards || [];
-        if (cards.length > 0) {
-          cards.forEach(c => { 
-            handleUnifiedScanSuccess(c);
-          });
-          updateScanStripItem(scanId, { name: cards[0].card_name || 'Unknown', price: cards[0].current_price || 0, imageUrl: cards[0].image_url || thumbUrl, status: 'success' });
-        } else {
-          updateScanStripItem(scanId, { name: 'No card found', price: 0, imageUrl: thumbUrl, status: 'error' });
-        }
-        await fetchPortfolio();
-      } catch (err) {
-        updateScanStripItem(scanId, { name: err.message, price: 0, imageUrl: thumbUrl, status: 'error' });
-      }
-    }
-  }
-  galleryInput.value = '';
-});
-
-// ── UPLOAD TAB FILE HANDLING ──────────────────────────────────────
-dropZone.addEventListener('click', () => fileInput.click());
-['dragenter','dragover'].forEach(evt => {
-  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-});
-['dragleave','dragend'].forEach(evt => {
-  dropZone.addEventListener(evt, () => dropZone.classList.remove('drag-over'));
-});
-dropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZone.classList.remove('drag-over');
-  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/') || f.name.match(/\.(heic|heif|dng|cr2|nef|arw|raw)$/i));
-  if (files.length) processFiles(files);
-});
-fileInput.addEventListener('change', () => {
-  const files = Array.from(fileInput.files);
-  if (files.length) processFiles(files);
-  fileInput.value = '';
-});
-
-// ── FILE PROCESSING (Upload Tab) ──────────────────────────────────
-async function processFiles(files) {
-  dropZone.style.display = 'none';
-  uploadQueue.style.display = 'block';
-  queueTitle.textContent = `Processing ${files.length} card${files.length > 1 ? 's' : ''}…`;
-  queueStatus.textContent = '';
-  queueItems.innerHTML = '';
-
-  const itemEls = files.map((file, i) => {
-    const el = document.createElement('div');
-    el.className = 'queue-item';
-    el.id = `qitem-${i}`;
-    const preview = URL.createObjectURL(file);
-    el.innerHTML = `
-      <img class="queue-item-thumb" src="${preview}" alt="${file.name}">
-      <div class="queue-item-info">
-        <div class="queue-item-name">${file.name}</div>
-        <div class="queue-item-status">Waiting…</div>
-        <div class="queue-item-progress"><div class="queue-item-progress-bar" style="width:0%"></div></div>
-      </div>
-      <div class="queue-item-status-icon">⏳</div>`;
-    queueItems.appendChild(el);
-    return el;
-  });
-
-  let success = 0, fail = 0;
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    const el = itemEls[i];
-    const statusEl = el.querySelector('.queue-item-status');
-    const progress = el.querySelector('.queue-item-progress-bar');
-    const icon = el.querySelector('.queue-item-status-icon');
-    
-    try {
-      const jpegFile = await ensureJpeg(file);
-      statusEl.textContent = 'Analyzing with AI…';
-      progress.style.width = '30%';
-      icon.textContent = '🔍';
-      
-      const formData = new FormData();
-      formData.append('cards', jpegFile);
-      progress.style.width = '60%';
-      statusEl.textContent = 'Fetching market price…';
-      const res = await fetch('/api/portfolio/upload', { method: 'POST', body: formData });
-      progress.style.width = '90%';
-      if (!res.ok) { let errMsg = `Upload failed (${res.status})`; try { const d = await res.json(); errMsg = d.error || errMsg; } catch {} throw new Error(errMsg); }
-      const data = await res.json();
-      progress.style.width = '100%';
-      const cards = data.cards || data.results || [];
-      if (cards.length > 0) {
-        const c = cards[0];
-        statusEl.textContent = cards.length > 1 ? `✅ Found ${cards.length} cards (incl. ${c.card_name || 'Unknown'})` : `✅ ${c.card_name || 'Identified'} — ${fmt(c.current_price || c.estimated_value)}`;
-        icon.textContent = '✅';
-        success += cards.length;
-      } else {
-        statusEl.textContent = '⚠️ No card detected in image';
-        icon.textContent = '⚠️';
-      }
-    } catch (err) {
-      statusEl.textContent = `❌ ${err.message}`;
-      icon.textContent = '❌';
-      progress.style.width = '100%';
-      progress.style.background = '#dc2626';
-      fail++;
-    }
-  }
-
-  queueTitle.textContent = `Done! ${success} card${success !== 1 ? 's' : ''} added`;
-  queueStatus.textContent = fail > 0 ? `${fail} failed` : '✓ All successful';
-  queueStatus.style.color = fail > 0 ? '#dc2626' : '#16a34a';
-  await fetchPortfolio();
-  setTimeout(() => {
-    dropZone.style.display = 'block';
-    uploadQueue.style.display = 'none';
-    queueItems.innerHTML = '';
-  }, 5000);
-}
-
-
-let verifyTimeout = null;
-
-function handleUnifiedScanSuccess(card) {
-  if (!card) return;
-  
-  // Track session cards
-  scanCount++;
-  scanCountNum.textContent = scanCount;
-  scanSessionCards.push(card);
-  
-  // Log success
-  console.log(`[Scan Success] Identified: ${card.card_name} (${card.card_set}) - Price: ${fmt(card.current_price || card.estimated_value)}`);
-  
-  // Trigger overlay
-  showScanSuccessOverlay(card);
-}
-
-function showScanSuccessOverlay(card) {
-  const overlay = document.getElementById("quickVerifyOverlay");
-  const img = document.getElementById("verifyImg");
-  const name = document.getElementById("verifyName");
-  const price = document.getElementById("verifyPrice");
-
-  if (!overlay || !card) return;
-
-  if (verifyTimeout) clearTimeout(verifyTimeout);
-
-  img.src = card.image_url || card.image_data || "";
-  name.textContent = card.card_name || "Unknown Card";
-  const metaEl = document.getElementById("verifyMeta");
-  if (metaEl) metaEl.textContent = `${card.card_set || "—"} • ${card.rarity || "—"}`;
-  price.textContent = fmt(card.current_price || card.estimated_value || 0);
-
-  // Smooth reset for back-to-back scans: briefly remove active class to re-trigger transition
-  overlay.classList.remove("active");
-  void overlay.offsetWidth; // force reflow
-
-  overlay.className = "quick-verify-overlay";
-  const rarity = (card.rarity || "").toLowerCase();
-  if (rarity.includes("secret")) overlay.classList.add("verify-rarity-secret");
-  else if (rarity.includes("ultra") || rarity.includes("v max")) overlay.classList.add("verify-rarity-ultra");
-  else if (rarity.includes("holo")) overlay.classList.add("verify-rarity-holo");
-  else if (rarity.includes("rare")) overlay.classList.add("verify-rarity-rare");
-
-  overlay.classList.add("active");
-
-  verifyTimeout = setTimeout(() => {
-    overlay.classList.remove("active");
-  }, 3000);
-}
-
-function hideVerifyOverlay() {
-  const overlay = document.getElementById("quickVerifyOverlay");
-  if (overlay) overlay.classList.remove("active");
-  if (verifyTimeout) clearTimeout(verifyTimeout);
-}
-
-// ── CARD DETAIL DRAWER ─────────────────────────────────────────────
-function openDrawer(card) {
-  activeDrawerCard = card;
-  const pct = getPeriodChange(card, 'prev_day_price');
-  const delta = getPeriodDelta(card, 'prev_day_price');
-  const summary = card.history_summary || {};
-
-  drawerCardName.textContent = card.card_name || 'Unknown Card';
-  drawerCardMeta.textContent = [card.card_set, card.rarity, card.condition].filter(Boolean).join(' • ') || '—';
-  drawerCurrentPx.textContent = fmt(card.current_price);
-
-  if (pct !== null) {
-    const sign = delta >= 0 ? '+' : '';
-    drawerChange.textContent = `${delta >= 0 ? '↑' : '↓'} ${Math.abs(pct).toFixed(2)}% (${sign}${fmt(delta)})`;
-    drawerChange.className = `drawer-change ${pct >= 0 ? 'badge-positive' : 'badge-negative'}`;
-  } else {
-    drawerChange.textContent = 'New Tracking';
-    drawerChange.className = 'drawer-change badge-neutral';
-  }
-
-  const imgSrc = card.image_url || '';
-  if (imgSrc) {
-    drawerCardImg.src = imgSrc;
-    drawerCardImg.style.display = 'block';
-  } else if (card.has_local_image) {
-    drawerCardImg.style.display = 'block';
-    drawerCardImg.src = '';
-    fetch(`/api/portfolio/${card.id}/image`).then(r => r.json()).then(d => {
-      if (d.image_data) drawerCardImg.src = d.image_data;
-    }).catch(() => { drawerCardImg.style.display = 'none'; });
-  } else {
-    drawerCardImg.style.display = 'none';
-  }
-
-  // Detail fields
-  setDetail('drawerSet', card.card_set);
-  setDetail('drawerNumber', card.card_number);
-  setDetail('drawerRarity', card.rarity);
-  setDetail('drawerCondition', card.condition);
-  setDetail('drawerYear', card.year > 0 ? card.year : '—');
-  setDetail('drawerLanguage', card.language);
-  setDetail('drawerHolo', card.is_holo ? '✓ Yes' : 'No');
-  setDetail('drawerHoloType', card.holo_type);
-  setDetail('drawer1stEd', card.is_first_edition ? '✓ Yes' : 'No');
-  setDetail('drawerConfidence', card.confidence != null ? `${Math.round(card.confidence * 100)}%` : '—');
-  setDetail('drawerHighestSale', fmt(card.highest_recent_sale));
-  setDetail('drawer24hTrend', formatTrendText(card, 'prev_day_price'));
-  setDetail('drawer7dTrend', formatTrendText(card, 'prev_7d_price'));
-  setDetail('drawer30dTrend', formatTrendText(card, 'prev_30d_price'));
-  setDetail('drawerAllTimeHigh', fmt(summary.all_time_high));
-  setDetail('drawerAllTimeLow', fmt(summary.all_time_low));
-  const sourceBadgeHtml = card.price_source_url 
-    ? `<a href="${card.price_source_url}" target="_blank" style="color:#3b82f6;text-decoration:none;">${card.price_source || 'market'} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg></a>`
-    : (card.price_source || '—');
-  const priceSourceEl = document.getElementById('drawerPriceSource');
-  if (priceSourceEl) priceSourceEl.innerHTML = sourceBadgeHtml;
-
-  drawerOverlay.classList.add('open');
-  document.body.style.overflow = 'hidden';
-
-  // Load price chart
-  priceChartDays = 7;
-  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector('.chart-tab[data-days="7"]').classList.add('active');
-  
-  // Hide empty state initially
-  const emptyState = document.getElementById('chartEmptyState');
-  if (emptyState) emptyState.style.display = 'none';
-  
-  fetchAndDrawChart(card.id, 7);
-
-  // Load price comparison data
-  renderPriceComparison(card);
-}
-const SOURCE_LABELS = {
-  'tcgdex_tcgplayer': 'TCGdex → TCGplayer',
-  'tcgdex_cardmarket': 'TCGdex → Cardmarket',
-  'pokemon_tcg_api': 'Pokemon TCG API',
-  'pokemon_tcg_api_fallback': 'Pokemon TCG API (Fallback)',
-  'tcgplayer_reverse_holo': 'TCGplayer (Reverse Holo)',
-  'tcgplayer_1st_edition': 'TCGplayer (1st Edition)',
-  'tcgplayer_unlimited_holo': 'TCGplayer (Unlimited Holo)',
-  'tcgplayer_unlimited': 'TCGplayer (Unlimited)',
-  'tcgplayer_holo': 'TCGplayer (Holo)',
-  'tcgplayer_normal': 'TCGplayer (Normal)',
-  'justtcg_tcgplayer': 'JustTCG → TCGplayer',
-  'scrydex_tcgplayer': 'Scrydex → TCGplayer',
-  'scrydex_cardmarket': 'Scrydex → Cardmarket',
-  'ebay_sold': 'eBay Sold Listings',
-  'tcgplayer_direct': 'TCGplayer (Direct)',
-  'cardmarket_direct': 'Cardmarket (Direct)',
-  'cardmarket': 'Cardmarket',
-  'trollandtoad': 'Troll and Toad',
-  'tcgfish': 'TCGFish',
-  'cardmavin': 'Card Mavin',
-  'coolstuffinc': 'CoolStuffInc',
-  'pricecharting': 'PriceCharting',
-  'aggregated_market': 'Aggregated',
-  'reference': 'Reference',
-  'ai_estimate': 'AI Estimate',
-  'market': 'Market'
-};
-
-function renderPriceComparison(card) {
-  const tableEl = document.getElementById('priceComparisonTable');
-  const badgeEl = document.getElementById('sourcesCheckedBadge');
-  if (!tableEl) return;
-
-  const sources = card.price_sources || {};
-  const entries = Object.entries(sources).filter(([, v]) => v && v.price > 0);
-
-  if (entries.length === 0) {
-    tableEl.innerHTML = '<div style="color:#9ca3af;text-align:center;padding:0.75rem;font-size:0.75rem;">Click "Refresh Prices" to check 12 sources</div>';
-    if (badgeEl) badgeEl.textContent = '';
-    return;
-  }
-
-  // Sort by price descending (highest first = best sold price)
-  entries.sort((a, b) => b[1].price - a[1].price);
-
-  const bestPrice = entries[0][1].price;
-  if (badgeEl) badgeEl.textContent = `${entries.length} sources found`;
-
-  let html = '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">';
-  html += '<table style="width:100%;border-collapse:collapse;">';
-  html += '<thead><tr style="background:#f9fafb;"><th style="text-align:left;padding:6px 10px;font-weight:500;color:#6b7280;font-size:0.75rem;">Source</th><th style="text-align:right;padding:6px 10px;font-weight:500;color:#6b7280;font-size:0.75rem;">Price</th></tr></thead>';
-  html += '<tbody>';
-
-  for (const [source, data] of entries) {
-    const label = SOURCE_LABELS[source] || source;
-    const isBest = data.price === bestPrice;
-    const priceColor = isBest ? '#10b981' : '#111827';
-    const bestBadge = isBest ? ' <span style="background:#10b981;color:white;padding:1px 5px;border-radius:4px;font-size:0.65rem;font-weight:600;">BEST</span>' : '';
-
-    const link = data.url
-      ? `<a href="${data.url}" target="_blank" style="color:#3b82f6;text-decoration:none;">${label} <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg></a>`
-      : `<span style="color:#374151;">${label}</span>`;
-
-    html += `<tr style="border-top:1px solid #f3f4f6;">`;
-    html += `<td style="padding:6px 10px;">${link}${bestBadge}</td>`;
-    html += `<td style="padding:6px 10px;text-align:right;font-weight:${isBest ? '700' : '500'};color:${priceColor};font-variant-numeric:tabular-nums;">$${data.price.toFixed(2)}</td>`;
-    html += `</tr>`;
-  }
-
-  html += '</tbody></table></div>';
-  tableEl.innerHTML = html;
-}
-
-function setDetail(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val || '—';
-}
-
-function closeDrawer() {
-  drawerOverlay.classList.remove('open');
-  document.body.style.overflow = '';
-  activeDrawerCard = null;
-  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
-}
-
-closeDrawerBtn.addEventListener('click', closeDrawer);
-drawerOverlay.addEventListener('click', e => { if (e.target === drawerOverlay) closeDrawer(); });
-
-// Chart tab switching
-document.querySelectorAll('.chart-tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    priceChartDays = parseInt(tab.dataset.days);
-    if (activeDrawerCard) fetchAndDrawChart(activeDrawerCard.id, priceChartDays);
-  });
-});
-
-async function fetchAndDrawChart(cardId, days) {
-  try {
-    const res = await fetch(`/api/portfolio/${cardId}/history`);
-    if (!res.ok) return;
-    const data = await res.json();
-    const history = (data.history || []);
-    const card = portfolio.find(c => c.id === cardId);
-    if (card) {
-        card.price_history = history; // Update local history
-        card.history_summary = data.summary || null;
-        // Update trend labels in drawer if currently open
-        if (activeDrawerCard && activeDrawerCard.id === cardId) {
-            setDetail('drawer24hTrend', formatTrendText(card, 'prev_day_price'));
-            setDetail('drawer7dTrend', formatTrendText(card, 'prev_7d_price'));
-            setDetail('drawer30dTrend', formatTrendText(card, 'prev_30d_price'));
-            setDetail('drawerAllTimeHigh', fmt(card.history_summary?.all_time_high));
-            setDetail('drawerAllTimeLow', fmt(card.history_summary?.all_time_low));
-        }
-    }
-
-    let pts = history;
-    if (days > 0) {
-      const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-      const filtered = history.filter(h => new Date(h.recorded_at) >= cutoff);
-      pts = filtered.length >= 2 ? filtered : history.slice(-2);
-    }
-
-    drawChart(pts);
-  } catch (err) {
-    console.error('Chart fetch failed:', err);
-  }
-}
-
-function drawChart(pts) {
-  const canvas = document.getElementById('priceChart');
-  let emptyState = document.getElementById('chartEmptyState');
-  
-  if (!emptyState && canvas) {
-    emptyState = document.createElement('div');
-    emptyState.id = 'chartEmptyState';
-    emptyState.className = 'chart-empty-state';
-    emptyState.innerHTML = '<span class="empty-icon">📈</span><br><strong>Tracking Began Today</strong><p>Historical charts will populate tomorrow as daily market checks are recorded.</p>';
-    canvas.parentElement.appendChild(emptyState);
-  }
-
-  if (!canvas) return;
-  if (chartInstance) chartInstance.destroy();
-
-  if (pts.length <= 1) {
-    canvas.style.display = 'none';
-    if (emptyState) emptyState.style.display = 'flex';
-    return;
-  } else {
-    canvas.style.display = 'block';
-    if (emptyState) emptyState.style.display = 'none';
-  }
-
-  const labels = pts.map(p => {
-    const d = new Date(p.recorded_at);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  });
-  const prices = pts.map(p => Number(p.price));
-  const isUp = prices.length >= 2 ? prices[prices.length - 1] >= prices[0] : true;
-  const color = isUp ? '#16a34a' : '#dc2626';
-
-  chartInstance = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        data: prices,
-        borderColor: color,
-        backgroundColor: 'transparent',
-        borderWidth: 2,
-        pointRadius: pts.length <= 10 ? 3 : 0,
-        pointBackgroundColor: color,
-        tension: 0.3,
-      }]
-    },
-    options: {
-      responsive: true,
-      animation: { duration: 300 },
-      plugins: { legend: { display: false }, tooltip: {
-        callbacks: {
-          label: ctx => `$${Number(ctx.raw).toFixed(2)}`
-        }
-      }},
-      scales: {
-        x: { grid: { display: false }, ticks: { color: '#9ca3af', font: { size: 11 } } },
-        y: {
-          grid: { color: '#f3f4f6' },
-          ticks: {
-            color: '#9ca3af',
-            font: { size: 11 },
-            callback: v => `$${v.toFixed(0)}`
-          }
-        }
-      }
-    }
-  });
-}
-
-// ── DELETE CARD ────────────────────────────────────────────────────
-async function confirmDelete(cardId) {
-  if (!confirm('Remove this card from your portfolio?')) return;
-  try {
-    const res = await fetch(`/api/portfolio/${cardId}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Delete failed');
-    portfolio = portfolio.filter(c => c.id !== cardId);
-    updateStats();
-    renderPortfolio();
-    showToast('Card removed from portfolio', 'success');
-    if (activeDrawerCard && activeDrawerCard.id === cardId) closeDrawer();
+    torchOn = !torchOn;
+    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    $('torchBtn').classList.toggle('active', torchOn);
   } catch {
-    showToast('Failed to remove card', 'error');
+    torchOn = false;
+    $('torchBtn').classList.remove('active');
+    toast('This camera has no controllable torch', 'info');
+  }
+});
+
+$('flipBtn').addEventListener('click', () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  startCamera();
+});
+
+/**
+ * Aim assist. Samples the centre of the frame and reports how much fine detail
+ * is present: a blurred or empty frame has little, a sharp card in focus has a
+ * lot. It only colours the guide and updates the hint — it never blocks a
+ * capture, because a hard gate on a heuristic is worse than no gate.
+ */
+let aimTimer = null;
+const aimCanvas = document.createElement('canvas');
+
+function startAimAssist() {
+  stopAimAssist();
+  aimCanvas.width = 96;
+  aimCanvas.height = 96;
+  const ctx = aimCanvas.getContext('2d', { willReadFrequently: true });
+
+  aimTimer = setInterval(() => {
+    if (!video.videoWidth) return;
+    const side = Math.min(video.videoWidth, video.videoHeight) * 0.5;
+    ctx.drawImage(video,
+      (video.videoWidth - side) / 2, (video.videoHeight - side) / 2, side, side,
+      0, 0, 96, 96);
+
+    const { data } = ctx.getImageData(0, 0, 96, 96);
+    let sum = 0;
+    let sumSq = 0;
+    const n = 96 * 96;
+    for (let i = 0; i < data.length; i += 4) {
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      sum += lum;
+      sumSq += lum * lum;
+    }
+    const mean = sum / n;
+    const variance = sumSq / n - mean * mean;
+
+    const dark = mean < 42;
+    const sharp = variance > 480;
+    scanner.classList.toggle('aim-ok', sharp && !dark);
+    $('guideHint').textContent = dark
+      ? 'Too dark — try the torch'
+      : sharp ? 'Looks good — tap to capture' : 'Fill the frame with one card';
+  }, 420);
+}
+
+function stopAimAssist() {
+  if (aimTimer) clearInterval(aimTimer);
+  aimTimer = null;
+  scanner.classList.remove('aim-ok');
+}
+
+/**
+ * Capture. The frame is cropped to the on-screen guide rectangle before upload.
+ *
+ * This matters more than it sounds: `object-fit: cover` means the video is
+ * cropped on screen, so the guide covers a different part of the sensor image
+ * than it appears to. Sending the whole frame instead hands the model the table,
+ * the binder and your hand along with the card, which is a common cause of
+ * misreads.
+ */
+const CROP_PAD = 0.04; // a little context around the card helps, a lot hurts
+
+/**
+ * Pure geometry: given the sensor size, the on-screen stage and the guide
+ * rectangle, work out which part of the sensor image the guide is covering.
+ * Kept separate from the DOM so it can be tested with plain numbers.
+ */
+function mapGuideToSource({ videoW, videoH, stage, frame, pad = CROP_PAD }) {
+  if (!videoW || !videoH || !stage.width || !stage.height) return null;
+
+  const scale = Math.max(stage.width / videoW, stage.height / videoH);
+  const offsetX = (stage.width - videoW * scale) / 2;
+  const offsetY = (stage.height - videoH * scale) / 2;
+
+  let sx = (frame.left - stage.left - offsetX) / scale;
+  let sy = (frame.top - stage.top - offsetY) / scale;
+  let sw = frame.width / scale;
+  let sh = frame.height / scale;
+
+  sx -= sw * pad;
+  sy -= sh * pad;
+  sw += sw * pad * 2;
+  sh += sh * pad * 2;
+
+  sx = Math.max(0, Math.min(sx, videoW - 1));
+  sy = Math.max(0, Math.min(sy, videoH - 1));
+  sw = Math.max(1, Math.min(sw, videoW - sx));
+  sh = Math.max(1, Math.min(sh, videoH - sy));
+
+  // Upscale small crops so fine print stays readable, capped so uploads stay small.
+  const longest = Math.max(sw, sh);
+  const outScale = Math.min(Math.min(1600, longest * 2) / longest, 3);
+
+  return { sx, sy, sw, sh, outW: Math.round(sw * outScale), outH: Math.round(sh * outScale) };
+}
+
+function cropToGuide() {
+  const geo = mapGuideToSource({
+    videoW: video.videoWidth,
+    videoH: video.videoHeight,
+    stage: $('stage').getBoundingClientRect(),
+    frame: $('guideFrame').getBoundingClientRect(),
+  });
+  if (!geo) return null;
+
+  canvas.width = geo.outW;
+  canvas.height = geo.outH;
+  canvas.getContext('2d').drawImage(video, geo.sx, geo.sy, geo.sw, geo.sh, 0, 0, geo.outW, geo.outH);
+  return canvas;
+}
+
+// Exposed for the browser test suite; nothing in the app reads it.
+window.__test = { mapGuideToSource };
+
+$('shutterBtn').addEventListener('click', capture);
+
+async function capture() {
+  if (capturing || !stream) return;
+  capturing = true;
+  const shutter = $('shutterBtn');
+  shutter.classList.add('busy');
+
+  $('flash').classList.add('fire');
+  setTimeout(() => $('flash').classList.remove('fire'), 340);
+  buzz(35);
+
+  try {
+    const cropped = cropToGuide();
+    if (!cropped) throw new Error('Camera is not ready yet');
+
+    const blob = await new Promise((resolve) => cropped.toBlob(resolve, 'image/jpeg', 0.92));
+    if (!blob) throw new Error('Could not read the frame');
+
+    const preview = cropped.toDataURL('image/jpeg', 0.4);
+    // Deliberately not awaited: you can keep shooting while this one is analysed.
+    submitScan(blob, preview, `scan_${Date.now()}.jpg`);
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    // Released quickly so burst-scanning a stack of cards feels immediate.
+    setTimeout(() => { capturing = false; shutter.classList.remove('busy'); }, 320);
   }
 }
 
-deleteCardBtn.addEventListener('click', () => {
-  if (activeDrawerCard) confirmDelete(activeDrawerCard.id);
+$('nativeCameraInput').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  files.forEach((f) => submitScan(f, URL.createObjectURL(f), f.name));
 });
 
-// Make confirmDelete accessible globally (called from inline onclick)
-window.confirmDelete = confirmDelete;
+$('libraryInput').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  if (!scanner.classList.contains('open')) openScanner();
+  files.forEach((f) => submitScan(f, URL.createObjectURL(f), f.name));
+});
 
-// ── SSE (Server-Sent Events) live updates ─────────────────────────
-// Falls back to polling on serverless platforms (Vercel) where SSE isn't supported
-let _ssePollingMode = false;
+/** Upload one image and reflect its outcome in the tray and the live result card. */
+async function submitScan(blob, previewUrl, filename) {
+  const id = `s${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+  state.scanned.unshift({ id, status: 'working', preview: previewUrl, name: 'Reading the card…' });
+  state.scanQueue++;
+  renderTray();
 
-function connectSSE() {
-  // First, probe the endpoint to see if we're in polling mode
-  fetch('/api/events').then(r => {
-    const ct = r.headers.get('content-type') || '';
-    if (ct.includes('application/json')) {
-      // Serverless mode — use polling instead of SSE
-      _ssePollingMode = true;
-      console.log('[SSE] Serverless detected, switching to polling');
-      startPolling();
+  try {
+    const form = new FormData();
+    form.append('cards', blob, filename);
+    const res = await fetch('/api/portfolio/upload', { method: 'POST', body: form });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+
+    const results = data.results || [];
+    const added = results.filter((r) => r.status === 'added');
+
+    if (!added.length) {
+      const reason = results[0]?.message || 'No card was found in that photo.';
+      updateScan(id, { status: 'error', name: 'Not recognised', note: reason });
+      showHit(null, reason);
+      buzz([25, 60, 25]);
       return;
     }
-    // Close this fetch (it was a probe) and open a real EventSource
-    r.body?.cancel();
-    openEventSource();
-  }).catch(() => openEventSource());
-}
 
-function startPolling() {
-  // Polling disabled in favor of Server-Sent Events (SSE)
-  // which will trigger fetchPortfolio() automatically when the server broadcasts an update.
-}
-
-function openEventSource() {
-  const evtSource = new EventSource('/api/events');
-  evtSource.onmessage = async (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'card_added' || msg.type === 'prices_refreshed' || msg.type === 'portfolio_updated') {
-        await fetchPortfolio();
-      }
-      
-      // Real-time upload UI stream
-      if (msg.type === 'activity' && document.getElementById('uploadModal').classList.contains('open')) {
-        if (msg.activityType === 'card_added_detail' && msg.data) {
-          const c = msg.data;
-          const qItems = document.getElementById('queueItems');
-          if (qItems) {
-            const div = document.createElement('div');
-            div.className = 'queue-card-detail';
-            const imgSrc = c.image_url || c.image_data || '';
-            div.innerHTML = `
-              ${imgSrc ? `<img src="${imgSrc}" class="queue-mini-img" onerror="this.outerHTML='<div class=\\'queue-mini-placeholder\\'>🃏</div>'">` : `<div class="queue-mini-placeholder">🃏</div>`}
-              <div class="queue-mini-info">
-                <div class="queue-mini-name">${c.card_name || 'Unknown'} <span class="queue-mini-set">${c.card_set || ''}</span></div>
-                <div class="queue-mini-price">${fmt(c.current_price)} <span class="source-badge" style="font-size:0.65rem;">${c.price_source || 'market'}</span></div>
-              </div>
-            `;
-            qItems.appendChild(div);
-            qItems.scrollTop = qItems.scrollHeight;
-          }
-        }
-      }
-    } catch {}
-  };
-  evtSource.onerror = () => {
-    evtSource.close();
-    setTimeout(connectSSE, 10000);
-  };
-}
-
-// ── NO AUTH — single-user mode ────────────────────────────────────
-async function checkAuth() {
-  if (authGateway) authGateway.style.display = 'none';
-  if (appContainer) appContainer.style.display = 'block';
-  if (navUsername) navUsername.textContent = 'Jack';
-  await fetchPortfolio();
-  connectSSE();
-  return true;
-}
-
-// ── SIDE NAVIGATION ACTIONS ──────────────────────────────────────
-function openSideNav() {
-  sideNav.classList.add('open');
-  sideNavOverlay.classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function closeSideNav() {
-  sideNav.classList.remove('open');
-  sideNavOverlay.classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-// ── INIT ──────────────────────────────────────────────────────────
-(async function init() {
-  await checkAuth();
-
-  // Navigation Event Listeners
-  if (hamburgerBtn) hamburgerBtn.addEventListener('click', openSideNav);
-  if (closeSideNavBtn) closeSideNavBtn.addEventListener('click', closeSideNav);
-  if (sideNavOverlay) sideNavOverlay.addEventListener('click', closeSideNav);
-
-  // Ensure Add Cards button in sidenav still works and closes sidenav
-  if (openUploadBtn) {
-    openUploadBtn.addEventListener('click', () => {
-      closeSideNav();
-      openModal();
+    const first = added[0];
+    updateScan(id, {
+      status: first.is_new_copy ? 'dupe' : 'ok',
+      name: first.card_name,
+      note: first.is_new_copy
+        ? `Copy ${first.quantity} of one you already own`
+        : [first.card_set, first.card_number].filter(Boolean).join(' · ') || 'Added',
+      price: first.unit_price,
+      image: first.image_url || previewUrl,
+      needsReview: first.needs_review,
     });
+    showHit(first, null, previewUrl);
+    buzz(first.is_new_copy ? [20, 40, 20] : 45);
+
+    // Extra cards found in the same photo still belong in the tray.
+    for (const extra of added.slice(1)) {
+      state.scanned.unshift({
+        id: `${id}x${extra.id}`,
+        status: extra.is_new_copy ? 'dupe' : 'ok',
+        preview: extra.image_url || previewUrl,
+        name: extra.card_name,
+        note: extra.is_new_copy ? `Copy ${extra.quantity}` : (extra.card_set || ''),
+        price: extra.unit_price,
+      });
+    }
+  } catch (err) {
+    updateScan(id, { status: 'error', name: 'Scan failed', note: err.message });
+    showHit(null, err.message);
+  } finally {
+    state.scanQueue--;
+    renderTray();
+  }
+}
+
+function updateScan(id, patch) {
+  const item = state.scanned.find((s) => s.id === id);
+  if (item) Object.assign(item, patch, { image: patch.image || item.preview });
+  renderTray();
+}
+
+function renderTray() {
+  const count = state.scanned.filter((s) => s.status === 'ok' || s.status === 'dupe').length;
+  const badge = $('trayCount');
+  badge.hidden = count === 0;
+  badge.textContent = count;
+
+  const working = state.scanQueue > 0;
+  $('scannerTitle').textContent = working
+    ? `Analysing ${state.scanQueue} card${state.scanQueue === 1 ? '' : 's'}…`
+    : count ? `${count} card${count === 1 ? '' : 's'} added` : 'Scan a card';
+
+  $('trayTitle').textContent = count ? `Added this session (${count})` : 'This session';
+
+  const list = $('trayList');
+  list.innerHTML = '';
+  for (const item of state.scanned) {
+    const row = el('div', `tray-item ${item.status === 'ok' ? '' : item.status}`.trim());
+
+    const img = el('img');
+    img.alt = '';
+    img.src = item.image || item.preview || '';
+    row.appendChild(img);
+
+    const body = el('div', 'tray-item-body');
+    body.append(el('div', 'tray-item-name', item.name || 'Scanning…'));
+    const status = el('div', 'tray-item-status');
+    if (item.status === 'working') {
+      status.appendChild(el('span', 'spinner'));
+      status.append(' Identifying…');
+    } else {
+      status.textContent = item.note || '';
+    }
+    body.appendChild(status);
+    row.appendChild(body);
+
+    if (item.price > 0) row.appendChild(el('div', 'tray-item-price', money(item.price)));
+    list.appendChild(row);
+  }
+}
+
+// The tray is translucent, so anything left underneath it bleeds through.
+function setTrayOpen(open) {
+  $('tray').classList.toggle('open', open);
+  scanner.classList.toggle('tray-open', open);
+  if (open) hideHit();
+}
+
+$('trayBtn').addEventListener('click', () => setTrayOpen(!$('tray').classList.contains('open')));
+$('trayCloseBtn').addEventListener('click', () => setTrayOpen(false));
+
+let hitTimer = null;
+
+function showHit(card, failureText, fallbackImage) {
+  const hit = $('hit');
+  const img = $('hitImg');
+  clearTimeout(hitTimer);
+  // The tray already lists everything; a result card under it would show through.
+  if ($('tray').classList.contains('open')) return;
+
+  if (!card) {
+    hit.className = 'hit miss show';
+    img.hidden = true;
+    img.removeAttribute('src');
+    $('hitName').textContent = 'No card identified';
+    $('hitMeta').textContent = failureText || 'Try again with less glare';
+    $('hitPrice').textContent = '';
+    $('hitTag').textContent = 'Try again';
+  } else {
+    hit.className = `hit show${card.is_new_copy ? ' dupe' : ''}`;
+    const src = card.image_url || card.image_data || fallbackImage || '';
+    img.hidden = !src;
+    if (src) img.src = src;
+    $('hitName').textContent = card.card_name || 'Unknown';
+    $('hitMeta').textContent = [card.card_set, card.card_number].filter(Boolean).join(' · ') || '—';
+    $('hitPrice').textContent = card.unit_price > 0 ? money(card.unit_price) : '—';
+    $('hitTag').textContent = card.needs_review
+      ? 'Needs review'
+      : card.is_new_copy ? `Copy ${card.quantity}` : 'Added';
   }
 
-  // Edit Card Modal Logic
-  const editBtn = document.getElementById('editCardBtn');
-  const editModal = document.getElementById('editCardModal');
-  const cancelEditBtn = document.getElementById('cancelEditBtn');
-  const saveEditBtn = document.getElementById('saveEditBtn');
-  const editName = document.getElementById('editCardNameInput');
-  const editSet = document.getElementById('editCardSetInput');
-  const editNumber = document.getElementById('editCardNumberInput');
+  scanner.classList.add('has-hit');
+  hitTimer = setTimeout(hideHit, 4200);
+}
 
-  if (editBtn && editModal) {
-    editBtn.addEventListener('click', () => {
-      if (!activeDrawerCard) return;
-      editName.value = activeDrawerCard.card_name || '';
-      editSet.value = activeDrawerCard.card_set || '';
-      editNumber.value = activeDrawerCard.card_number || '';
-      editModal.style.display = 'flex';
-    });
+function hideHit() {
+  $('hit').classList.remove('show');
+  scanner.classList.remove('has-hit');
+}
 
-    cancelEditBtn.addEventListener('click', () => {
-      editModal.style.display = 'none';
-    });
+// ── LIVE UPDATES ─────────────────────────────────────────────────
 
-    saveEditBtn.addEventListener('click', async () => {
-      if (!activeDrawerCard) return;
-      saveEditBtn.disabled = true;
-      saveEditBtn.textContent = 'Saving...';
-      try {
-        const res = await fetch(`/api/portfolio/${activeDrawerCard.id}/edit`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            card_name: editName.value.trim(),
-            card_set: editSet.value.trim(),
-            card_number: editNumber.value.trim()
-          })
-        });
-        const data = await res.json();
-        if (data.success) {
-          showToast('Card updated! Re-fetching price in background...');
-          editModal.style.display = 'none';
-          setTimeout(fetchPortfolio, 1500); // refresh after a moment to let the background job start
-        } else {
-          showToast('Error: ' + data.error);
-        }
-      } catch (err) {
-        showToast('Network error updating card.');
-      }
-      saveEditBtn.disabled = false;
-      saveEditBtn.textContent = 'Save & Refresh';
-    });
+function connectEvents() {
+  try {
+    const source = new EventSource('/api/events');
+    source.onmessage = (e) => {
+      let payload;
+      try { payload = JSON.parse(e.data); } catch { return; }
+      if (payload.type === 'portfolio_updated' || payload.type === 'card_added') loadCollection();
+      if (payload.activityType === 'refresh_complete') toast(payload.message, 'success');
+    };
+    source.onerror = () => {
+      source.close();
+      // Serverless hosts cannot hold the connection open; poll instead.
+      setInterval(loadCollection, 60000);
+    };
+  } catch {
+    setInterval(loadCollection, 60000);
   }
-})();
+}
+
+// ── SERVICE WORKER ───────────────────────────────────────────────
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is optional */ });
+  });
+}
+
+// ── BOOT ─────────────────────────────────────────────────────────
+
+syncThemeButtons();
+loadCollection();
+connectEvents();
+window.addEventListener('resize', () => { if (state.cards.length) render(); });

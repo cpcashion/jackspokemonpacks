@@ -18,7 +18,6 @@ import { tmpdir } from 'os';
 import pkg from 'pg';
 const { Pool } = pkg;
 import bcrypt from 'bcrypt';
-import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
 import { createGzip } from 'zlib';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -57,7 +56,6 @@ const JUSTTCG_API_KEY = process.env.JUSTTCG_API_KEY || '';
 //  DATABASE
 // ═══════════════════════════════════════════════════════════════
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-please-change-in-prod';
 const DB_URL = process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.DATABASE_POSTGRES_URL || 'postgres://localhost:5432/pokesniper';
 
 /** Hosted Postgres needs SSL; a local or explicitly-disabled one must not use it. */
@@ -761,28 +759,53 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
     console.log('🤖 Vision AI: ❌ Disabled — add GEMINI_API_KEY to .env');
 }
 
-const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Analyze this image and identify any Pokemon cards.
-Look closely at the card name, set symbol, card number, rarity, holographic patterns, 1st edition stamps, language, copyright year, and condition.
-Be conservative. Do not guess, infer, or invent card names, sets, numbers, or values. Only include a card when the physical printed card details are actually visible in the image.
-Ignore binder pages, pack art, sleeves, background objects, partial text that is not clearly readable, and any artwork that is not a physical Pokemon card.
-If the image is blurry, obstructed, or ambiguous, return an empty cards array and is_pokemon_card false.
+/**
+ * The model identifies the card; it never prices it. Prices come from the market
+ * APIs, because a language model asked for a dollar value will confidently
+ * produce a plausible wrong one.
+ *
+ * The fields that matter most for pricing are the card number and the printing
+ * (holo type / 1st edition), since those select the price bucket — hence the
+ * emphasis on reading them off the card rather than inferring them.
+ */
+const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Identify every physical Pokemon card visible in this image.
+
+Read these directly off the card. Do not infer them from the artwork or from what is typical:
+- Card name exactly as printed, including suffixes such as EX, GX, V, VMAX, VSTAR, ex.
+- Card number, bottom of the card, exactly as printed (e.g. "4/102", "SWSH045", "TG12/TG30").
+- Set: use the set symbol and the number's denominator. If you cannot identify the set with confidence, use "".
+- Printing. This is critical and is decided by the foil pattern:
+  * "Reverse Holo" - the card BORDER/background is foiled but the artwork is not.
+  * "Holofoil" - the ARTWORK BOX is foiled.
+  * "Cosmos Holo" - starry/cosmos foil pattern.
+  * "Non-Holo" - no foil anywhere.
+  If the foil pattern is not clearly visible, use "Unknown" rather than guessing.
+- 1st Edition: true ONLY if the "1st Edition" stamp is actually visible on the card.
+- Language, from the printed text. Copyright year, from the bottom of the card.
+- Condition, from visible edge wear, surface scratches, whitening and centering.
+
+Rules:
+- Never invent a name, set or number. An empty string is always better than a guess.
+- Ignore binder pages, sleeves, pack art, background objects and anything that is not a physical card.
+- If a card is blurry, cropped, or obstructed, either omit it or give it a low confidence.
+- Confidence reflects how clearly you could READ the card, not how sure you are the card exists.
+- Do not estimate any monetary value. Prices are looked up separately.
 
 Return ONLY valid JSON (no markdown fences):
 {
   "cards": [{
     "card_name": "Pokemon name",
-    "card_set": "Set name",
+    "card_set": "Set name or empty string",
     "card_number": "e.g. 4/102",
-    "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Illustration Rare|Unknown",
+    "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Illustration Rare|Promo|Unknown",
     "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
     "is_holographic": true/false,
     "holo_type": "Holofoil|Reverse Holo|Non-Holo|Cosmos Holo|Unknown",
     "year": 1999,
     "language": "English|Japanese|Spanish|etc",
     "is_first_edition": true/false,
-    "estimated_value_usd": number,
     "confidence": 0.0 to 1.0,
-    "notes": "Any identifying features or damage"
+    "notes": "Identifying features, visible damage, or what was unreadable"
   }],
   "is_pokemon_card": true/false
 }`;
@@ -1452,14 +1475,30 @@ app.use((req, res, next) => {
 // CORS — allow local dev
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
 
-// Serve static files
-app.use(express.static(__dirname));
+/**
+ * Static assets, by allowlist.
+ *
+ * The previous `express.static(__dirname)` published the whole project
+ * directory — server.js, package.json, lib/ and test/ were all downloadable.
+ * Only the files the browser actually needs are served now.
+ */
+const PUBLIC_FILES = new Set(['/index.html', '/styles.css', '/script.js', '/sw.js', '/manifest.webmanifest']);
+const staticHandler = express.static(__dirname, { index: false, dotfiles: 'ignore', maxAge: '1h' });
+
+app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    const isPublic = PUBLIC_FILES.has(req.path) || req.path.startsWith('/icons/');
+    if (!isPublic) return next();
+    // A cached service worker would pin users to an old build.
+    if (req.path === '/sw.js') res.setHeader('Cache-Control', 'no-cache');
+    return staticHandler(req, res, next);
+});
 
 // No auth — single-user mode (Jack's portfolio)
 const DEFAULT_USER_ID = 1;
@@ -1760,7 +1799,14 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
 
             // Process synchronously so we can return the results
             const result = await processPortfolioUpload(files, req.user.id);
-            res.json({ success: true, cards: result.cards, message: `Added ${result.totalAdded} card(s)` });
+            // `results` carries the rejections too, so the scanner can say why a
+            // photo produced nothing instead of failing silently.
+            res.json({
+                success: true,
+                cards: result.cards,
+                results: result.results,
+                message: `Added ${result.cards.length} card(s)`,
+            });
         } catch (err) {
             console.error('Portfolio upload error:', err);
             res.status(500).json({ success: false, error: err.message });

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1b2350"/>
+      <stop offset="55%" stop-color="#0d1230"/>
+      <stop offset="100%" stop-color="#070912"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#ffe17a"/>
+      <stop offset="52%" stop-color="#ff9a3d"/>
+      <stop offset="100%" stop-color="#ff5f8f"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- card silhouette -->
+  <rect x="146" y="96" width="220" height="308" rx="26"
+        fill="url(#glass)" stroke="#ffffff" stroke-opacity="0.28" stroke-width="3"/>
+
+  <!-- bolt -->
+  <path d="M289 138 187 288h62l-24 92 104-152h-63z" fill="url(#bolt)"/>
+
+  <!-- specular highlight -->
+  <path d="M146 122a26 26 0 0 1 26-26h168a26 26 0 0 1 26 26v40c-60 26-160 26-220 0z"
+        fill="#ffffff" fill-opacity="0.1"/>
+</svg>

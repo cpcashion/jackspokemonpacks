@@ -2,492 +2,429 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Jack's Pokémon Portfolio | Live Market Tracker</title>
-  <meta name="description" content="Track the market value of your Pokémon card collection in real time. AI-powered card identification with stock-market-style price tracking." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <title>Jack's Pokémon Collection</title>
+  <meta name="description" content="Scan a Pokémon card with your phone camera and track what your collection is actually worth." />
+
+  <!-- Installs to the home screen and runs without browser chrome. -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Jack's Cards" />
+  <meta name="theme-color" content="#eef1f6" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#070912" media="(prefers-color-scheme: dark)" />
+  <link rel="apple-touch-icon" href="/icons/icon-180.png" />
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+
   <link rel="stylesheet" href="styles.css" />
-  <!-- HEIC Conversion Support -->
-  <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
+
+  <!-- Theme is applied before first paint so the page never flashes the wrong one. -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
 
-  <!-- Hidden auth elements (kept for JS compatibility) -->
-  <div id="authGateway" style="display:none;"></div>
-  <div id="authForm" style="display:none;"></div>
-  <input id="authUsername" type="hidden"><input id="authPassword" type="hidden">
-  <span id="authError" style="display:none;"></span>
-  <button id="registerBtn" style="display:none;"></button>
-  <button id="loginBtn" style="display:none;"></button>
+<div class="app">
 
-  <!-- ── SIDE NAVIGATION ──────────────────────────────────── -->
-  <div class="sidenav-overlay" id="sideNavOverlay"></div>
-  <nav class="sidenav" id="sideNav">
-    <div class="sidenav-header">
-      <div class="sidenav-brand">
-        <div class="topbar-logo">⚡</div>
-        <span class="topbar-name">Jack's Pokémon</span>
+  <!-- ── DESKTOP RAIL ──────────────────────────────────────── -->
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark">⚡</div>
+      <div class="brand-text">
+        <span class="brand-name">Jack's Cards</span>
+        <span class="brand-sub">Pokémon collection</span>
       </div>
-      <button class="sidenav-close" id="closeSideNav" aria-label="Close menu">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </div>
+
+    <nav class="rail-nav glass">
+      <button class="nav-item active" data-view="collection">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        Collection
+        <span class="nav-count" id="navCollectionCount">0</span>
       </button>
-    </div>
-    <div class="sidenav-content">
-      <div class="sidenav-section">
-        <button class="btn-primary" id="openUploadBtn" style="width: 100%; justify-content: center; padding: 12px;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          Add Cards
-        </button>
-      </div>
-      <ul class="sidenav-list">
-        <li class="sidenav-item active">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
-          Dashboard
-        </li>
-        <li class="sidenav-item">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          Market News
-        </li>
-        <li class="sidenav-item">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-          Settings
-        </li>
-      </ul>
-    </div>
-  </nav>
+      <button class="nav-item" data-view="scan">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.2"/></svg>
+        Scan a card
+      </button>
+      <button class="nav-item" data-view="review">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+        Needs review
+        <span class="nav-count alert" id="navReviewCount" hidden>0</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+      </button>
+    </nav>
 
-  <div class="app-container" id="appContainer">
+    <div class="rail-spacer"></div>
 
-  <!-- ── TOP NAVIGATION BAR ─────────────────────────────────── -->
-  <header class="topbar">
-    <button class="hamburger" id="hamburgerBtn" aria-label="Open menu">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    <div class="rail-total glass">
+      <div class="rail-total-label">Collection value</div>
+      <div class="rail-total-value" id="railTotal">$0.00</div>
+      <div class="rail-total-change flat" id="railChange">—</div>
+    </div>
+
+    <button class="btn btn-primary btn-block" id="railScanBtn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+      Scan a card
     </button>
-    <div class="topbar-brand">
-      <div class="topbar-logo">⚡</div>
-      <span class="topbar-name">Jack's Pokémon Portfolio</span>
-    </div>
-    <div class="topbar-portfolio">
-      <span class="portfolio-total" id="portfolioTotal">$0.00</span>
-      <span class="portfolio-change neutral" id="portfolioChange">—</span>
-    </div>
-    <div class="topbar-actions">
-      <!-- Add Cards button moved to sidenav -->
-      <div class="user-menu" style="display: flex; align-items: center; gap: 0.5rem; margin-left: 1rem; color: #4b5563; font-weight: 500;">
-        <span id="navUsername">Jack</span>
-        <button id="logoutBtn" style="display:none;"></button>
-      </div>
-    </div>
-  </header>
+  </aside>
 
-  <!-- ── SUMMARY STATS ROW ──────────────────────────────────── -->
-  <div class="stats-row">
-    <div class="stat-card">
-      <span class="stat-label">Total Cards</span>
-      <span class="stat-value" id="statTotalCards">0</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Portfolio Value</span>
-      <span class="stat-value" id="statPortfolioValue">$0.00</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">24h Change</span>
-      <span class="stat-value neutral" id="stat24hChange">—</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Biggest Gainer</span>
-      <span class="stat-value positive" id="statBiggestGainer">—</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-label">Biggest Loser</span>
-      <span class="stat-value negative" id="statBiggestLoser">—</span>
-    </div>
-  </div>
+  <!-- ── MAIN ──────────────────────────────────────────────── -->
+  <main class="main">
 
-  <!-- ── MAIN CONTENT ───────────────────────────────────────── -->
-  <main class="main-content">
-
-    <!-- Controls bar -->
-    <div class="controls-bar">
-      <div class="view-toggle">
-        <button class="view-btn active" id="tableViewBtn" title="Table View">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
-        </button>
-        <button class="view-btn" id="gridViewBtn" title="Grid View">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-        </button>
-      </div>
-      <div class="search-box">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="searchInput" placeholder="Search cards…" autocomplete="off" />
-      </div>
-      <div class="refresh-section">
-        <button class="btn-ghost" id="refreshPricesBtn">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-          Refresh Prices
-        </button>
-        <span class="last-updated" id="lastUpdated"></span>
-      </div>
-    </div>
-
-    <!-- Empty state -->
-    <div class="empty-state" id="emptyState">
-      <div class="empty-icon">🃏</div>
-      <h2 class="empty-title">Your portfolio is empty</h2>
-      <p class="empty-subtitle">Upload photos of your Pokémon cards to start tracking their market value.</p>
-      <button class="btn-primary" id="emptyUploadBtn">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        Add Your First Cards
+    <header class="topbar glass">
+      <h1 id="viewTitle">Collection</h1>
+      <label class="search">
+        <span class="sr-only">Search your collection</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input type="search" id="searchInput" placeholder="Search cards, sets…" autocomplete="off" />
+      </label>
+      <button class="btn btn-glass btn-icon" id="themeBtn" title="Switch theme" aria-label="Switch theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
       </button>
-    </div>
+    </header>
 
-    <!-- Table View -->
-    <div class="table-container" id="tableView" style="display:none;">
-      <table class="portfolio-table" id="portfolioTable">
-        <thead>
-          <tr>
-            <th class="col-thumb"></th>
-            <th class="col-name sortable" data-sort="name">
-              Card
-              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-            </th>
-            <th class="col-set">Set</th>
-            <th class="col-rarity">Rarity</th>
-            <th class="col-condition">Condition</th>
-            <th class="col-price sortable" data-sort="price">
-              Price
-              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-            </th>
-            <th class="col-change sortable" data-sort="change">
-              Change
-              <svg class="sort-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-            </th>
-            <th class="col-sparkline">7d Trend</th>
-            <th class="col-source">Source</th>
-            <th class="col-actions"></th>
-          </tr>
-        </thead>
-        <tbody id="portfolioTableBody">
-        </tbody>
-      </table>
-    </div>
+    <!-- ── COLLECTION ── -->
+    <section class="view active" id="view-collection">
 
-    <!-- Grid View -->
-    <div class="cards-grid" id="gridView" style="display:none;"></div>
+      <div class="stats" id="stats"></div>
+
+      <div class="banner glass" id="dupeBanner" hidden>
+        <span class="banner-icon">🗂️</span>
+        <div class="banner-body">
+          <div class="banner-title" id="dupeBannerTitle">Duplicate cards found</div>
+          <div class="banner-text" id="dupeBannerText"></div>
+        </div>
+        <button class="btn btn-glass btn-sm" id="dupeBannerBtn">Review</button>
+      </div>
+
+      <div class="toolbar">
+        <div class="segmented" role="group" aria-label="Layout">
+          <button data-layout="grid" class="active" title="Grid">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+            Grid
+          </button>
+          <button data-layout="list" title="List">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+            List
+          </button>
+        </div>
+
+        <div class="segmented" role="group" aria-label="Sort">
+          <button data-sort="value" class="active">Value</button>
+          <button data-sort="name">Name</button>
+          <button data-sort="qty">Copies</button>
+          <button data-sort="change">Change</button>
+        </div>
+
+        <div class="toolbar-spacer"></div>
+        <span class="sync-note" id="syncNote"></span>
+        <button class="btn btn-glass btn-sm" id="refreshBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+          Refresh prices
+        </button>
+      </div>
+
+      <div id="collectionBody"></div>
+    </section>
+
+    <!-- ── REVIEW ── -->
+    <section class="view" id="view-review">
+      <div class="banner glass">
+        <span class="banner-icon">🔎</span>
+        <div class="banner-body">
+          <div class="banner-title">Cards we could not confirm</div>
+          <div class="banner-text">These were saved from your scans but not found in the card database, so they are not priced. Correct the name, set or number and they will price themselves.</div>
+        </div>
+      </div>
+      <div id="reviewBody"></div>
+    </section>
+
+    <!-- ── SETTINGS ── -->
+    <section class="view" id="view-settings">
+      <div class="glass" style="border-radius: var(--r-md); overflow: hidden;">
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Appearance</div>
+            <div class="setting-desc">Follows your device by default.</div>
+          </div>
+          <div class="segmented">
+            <button data-theme-set="auto">Auto</button>
+            <button data-theme-set="light">Light</button>
+            <button data-theme-set="dark">Dark</button>
+          </div>
+        </div>
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Merge duplicate cards</div>
+            <div class="setting-desc">Fold separate rows of the same printing into one card with a copy count. Shows you what will change before anything happens.</div>
+          </div>
+          <button class="btn btn-glass btn-sm" id="openMergeBtn">Review</button>
+        </div>
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Refresh all prices</div>
+            <div class="setting-desc">Re-checks every card against the market APIs. Takes a while for a large collection.</div>
+          </div>
+          <button class="btn btn-glass btn-sm" id="settingsRefreshBtn">Refresh</button>
+        </div>
+      </div>
+
+      <div class="panel glass">
+        <div class="section-title" style="margin-bottom: 10px;">How prices are worked out</div>
+        <p style="font-size: 13.5px; color: var(--text-2); line-height: 1.6;">
+          Every card is priced from live marketplace data — never from the AI, which identifies the
+          card but never values it. Quotes are converted to USD, the US market is preferred over the
+          European one, and the price used is the median of the sources that agree. Each price shows
+          how many sources backed it.
+        </p>
+        <p style="font-size: 13.5px; color: var(--text-2); line-height: 1.6; margin-top: 10px;">
+          Market prices are Near Mint. Each copy you own is adjusted for its own condition, so three
+          played copies are not valued as three mint ones. Graded slabs are a different market: set a
+          value by hand on that copy.
+        </p>
+        <div id="fxNote" style="font-size: 12px; color: var(--text-3); margin-top: 12px;"></div>
+      </div>
+    </section>
 
   </main>
+</div>
 
-  <!-- ── SCANNER MODAL ───────────────────────────────────────── -->
-  <div class="scanner-overlay" id="uploadModal">
-    <div class="scanner-modal">
-      <!-- Scanner Header -->
-      <div class="scanner-header">
-        <h2 class="scanner-title">Add Cards</h2>
-        <div class="scanner-tabs">
-          <button class="scanner-tab active" id="tabCamera" data-tab="camera">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-            Camera
-          </button>
-          <button class="scanner-tab" id="tabUpload" data-tab="upload">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-            Upload
-          </button>
-        </div>
-        <button class="scanner-close" id="closeUploadBtn" aria-label="Close">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
+<!-- ── MOBILE TAB BAR ──────────────────────────────────────── -->
+<nav class="tabbar glass glass-lg">
+  <button class="tab active" data-view="collection">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+    Collection
+  </button>
+  <button class="tab tab-scan" data-view="scan">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.2"/></svg>
+    Scan
+  </button>
+  <button class="tab" data-view="review">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+    Review
+    <span class="tab-badge" id="tabReviewBadge" hidden>0</span>
+  </button>
+  <button class="tab" data-view="settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    Settings
+  </button>
+</nav>
+
+<!-- ── SCANNER ─────────────────────────────────────────────── -->
+<div class="scanner" id="scanner">
+  <div class="stage" id="stage">
+    <video id="cameraVideo" autoplay playsinline muted></video>
+
+    <div class="guide" id="guide">
+      <div class="guide-frame" id="guideFrame">
+        <span class="guide-corner guide-tl"></span>
+        <span class="guide-corner guide-tr"></span>
+        <span class="guide-corner guide-bl"></span>
+        <span class="guide-corner guide-br"></span>
       </div>
+      <div class="guide-hint" id="guideHint">Fill the frame with one card</div>
+    </div>
 
-      <!-- ── CAMERA TAB ── -->
-      <div class="scanner-body" id="scannerCameraTab">
-        <!-- Permission / Error States -->
-        <div class="camera-permission" id="cameraPermission" style="display:none;">
-          <div class="permission-icon">📸</div>
-          <h3>Camera Access Needed</h3>
-          <p>Allow camera access to scan your Pokémon cards directly.</p>
-          <button class="btn-primary" id="grantCameraBtn">Enable Camera</button>
-          <button class="btn-ghost" id="switchToUploadBtn" style="margin-top:12px;">Use File Upload Instead</button>
-        </div>
+    <div class="flash" id="flash"></div>
 
-        <div class="camera-error" id="cameraError" style="display:none;">
-          <div class="permission-icon">⚠️</div>
-          <h3 id="cameraErrorTitle">Camera Not Available</h3>
-          <p id="cameraErrorText">Your browser doesn't support camera access or permission was denied.</p>
-          <button class="btn-primary" id="retryCameraBtn">Try Again</button>
-          <button class="btn-ghost" id="switchToUploadBtn2" style="margin-top:12px;">Use File Upload Instead</button>
-        </div>
-
-        <!-- Live Viewfinder -->
-        <div class="viewfinder-container" id="viewfinderContainer" style="display:none;">
-          <video id="cameraVideo" autoplay playsinline muted></video>
-
-          <!-- Quick Verification Overlay -->
-          <div id="quickVerifyOverlay" class="quick-verify-overlay">
-            <div class="verify-img-container">
-              <img id="verifyImg" src="" alt="Verified Card" />
-            </div>
-            <div class="verify-info">
-              <div id="verifyName" class="verify-name">Card Name</div>
-              <div id="verifyMeta" class="verify-meta">Set • Rarity</div>
-              <div class="verify-price-row">
-                <div id="verifyPrice" class="verify-price">$0.00</div>
-                <div class="verify-badge">LIVE MARKET</div>
-              </div>
-            </div>
-          </div>
-          
-          <!-- Card alignment guide overlay -->
-          <div class="card-guide-overlay">
-            <div class="card-guide">
-              <div class="guide-corner guide-tl"></div>
-              <div class="guide-corner guide-tr"></div>
-              <div class="guide-corner guide-bl"></div>
-              <div class="guide-corner guide-br"></div>
-            </div>
-            <div class="guide-hint" id="guideHint">Center card in frame</div>
-          </div>
-
-          <!-- Capture flash effect -->
-          <div class="capture-flash" id="captureFlash"></div>
-
-          <!-- Camera controls -->
-          <div class="camera-controls">
-            <button class="camera-btn camera-btn-gallery" id="galleryBtn" title="Choose from gallery">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-            </button>
-            <input type="file" id="galleryInput" accept="image/*,.heic,.heif" multiple hidden />
-            
-            <button class="camera-btn camera-btn-capture" id="captureBtn" title="Capture card">
-              <div class="capture-ring"></div>
-            </button>
-            
-            <button class="camera-btn camera-btn-flash" id="flashBtn" title="Toggle flash" style="display:none;">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            </button>
-            <button class="camera-btn camera-btn-switch" id="switchCameraBtn" title="Switch camera" style="display:none;">
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-            </button>
-          </div>
-
-          <!-- Scan counter badge -->
-          <div class="scan-counter" id="scanCounter" style="display:none;">
-            <span id="scanCountNum">0</span> scanned
-          </div>
-        </div>
-
-        <!-- Scanned cards strip (shows at bottom during scanning) -->
-        <div class="scan-strip" id="scanStrip" style="display:none;">
-          <div class="scan-strip-header">
-            <span class="scan-strip-title" id="scanStripTitle">Scanned Cards</span>
-            <button class="btn-ghost btn-sm" id="scanDoneBtn">Done</button>
-          </div>
-          <div class="scan-strip-cards" id="scanStripCards"></div>
-        </div>
+    <div class="hit" id="hit">
+      <img id="hitImg" alt="" />
+      <div class="hit-body">
+        <div class="hit-name" id="hitName"></div>
+        <div class="hit-meta" id="hitMeta"></div>
       </div>
-
-      <!-- ── UPLOAD TAB ── -->
-      <div class="scanner-body" id="scannerUploadTab" style="display:none;">
-        <div class="drop-zone" id="dropZone">
-          <div class="drop-icon">📁</div>
-          <p class="drop-text">Drag &amp; drop card photos here</p>
-          <p class="drop-subtext">or</p>
-          <label class="btn-secondary" for="fileInput">Browse Files</label>
-          <input type="file" id="fileInput" accept="image/*,.heic,.heif,.dng,.cr2,.nef,.arw,.raw" multiple hidden />
-          <p class="drop-hint">Supports JPG, PNG, HEIC, WEBP, RAW — up to 20 photos at once<br>AI will identify each card and fetch live market prices</p>
-        </div>
-
-        <div class="upload-queue" id="uploadQueue" style="display:none;">
-          <div class="queue-header">
-            <span class="queue-title" id="queueTitle">Processing 0 cards…</span>
-            <span class="queue-status" id="queueStatus"></span>
-          </div>
-          <div class="queue-items" id="queueItems"></div>
-        </div>
+      <div>
+        <div class="hit-price" id="hitPrice"></div>
+        <div class="hit-tag" id="hitTag"></div>
       </div>
+    </div>
 
-      <!-- ── SCAN RESULTS (shown after scanning session) ── -->
-      <div class="scanner-body scan-results" id="scanResults" style="display:none;">
-        <div class="results-header">
-          <div class="results-icon">🎉</div>
-          <h3 class="results-title" id="resultsTitle">Cards Added!</h3>
-          <p class="results-subtitle" id="resultsSubtitle">3 cards identified and added to your portfolio</p>
-        </div>
-        <div class="results-cards" id="resultsCards"></div>
-        <div class="results-actions">
-          <button class="btn-primary" id="resultsScanMoreBtn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-            Scan More Cards
-          </button>
-          <button class="btn-ghost" id="resultsDoneBtn">Done</button>
-        </div>
+    <div class="scanner-top">
+      <button class="btn btn-icon" id="scannerCloseBtn" aria-label="Close scanner">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+      <span class="scanner-title" id="scannerTitle">Scan a card</span>
+      <button class="btn btn-icon" id="torchBtn" aria-label="Toggle torch" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>
+      </button>
+      <button class="btn btn-icon" id="flipBtn" aria-label="Switch camera" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+      </button>
+    </div>
+
+    <!-- Shown when the live viewfinder is unavailable; the native camera and the
+         photo library still work, so scanning is never fully blocked. -->
+    <div class="scanner-msg" id="scannerMsg">
+      <div class="ico" id="scannerMsgIcon">📷</div>
+      <h3 id="scannerMsgTitle">Camera unavailable</h3>
+      <p id="scannerMsgText"></p>
+      <button class="btn btn-primary" id="scannerRetryBtn">Try again</button>
+      <button class="btn btn-glass" id="scannerNativeBtn">Use the phone camera</button>
+      <button class="btn btn-quiet" id="scannerPickBtn">Choose from photos</button>
+    </div>
+
+    <div class="tray" id="tray">
+      <div class="tray-head">
+        <h3 id="trayTitle">Scanned</h3>
+        <button class="btn btn-quiet btn-sm" id="trayCloseBtn" style="color: rgba(255,255,255,.75)">Hide</button>
       </div>
-      </div>
+      <div class="tray-list" id="trayList"></div>
     </div>
   </div>
 
-  <!-- Edit Card Modal -->
-  <div class="modal" id="editCardModal" style="display:none;">
-    <div class="modal-content" style="max-width: 400px;">
-      <h3>Edit Card Details</h3>
-      <p class="text-secondary" style="font-size: 13px; margin-bottom: 16px;">Update incorrect AI scans. A new price will be fetched.</p>
-      <div style="display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px;">
-        <div>
-          <label style="font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-bottom: 4px; display: block;">Card Name</label>
-          <input type="text" id="editCardNameInput" class="app-input" style="width: 100%; padding: 8px;" />
-        </div>
-        <div>
-          <label style="font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-bottom: 4px; display: block;">Set Name</label>
-          <input type="text" id="editCardSetInput" class="app-input" style="width: 100%; padding: 8px;" />
-        </div>
-        <div>
-          <label style="font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-bottom: 4px; display: block;">Card Number</label>
-          <input type="text" id="editCardNumberInput" class="app-input" style="width: 100%; padding: 8px;" />
-        </div>
-      </div>
-      <div style="display: flex; justify-content: flex-end; gap: 8px;">
-        <button class="btn-secondary" id="cancelEditBtn">Cancel</button>
-        <button class="btn-primary" id="saveEditBtn">Save & Refresh</button>
-      </div>
+  <div class="scanner-bar">
+    <div class="scanner-side">
+      <button class="btn btn-icon" id="pickBtn" aria-label="Choose from photos">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="m21 15-5-5L5 21"/></svg>
+      </button>
+    </div>
+
+    <button class="shutter" id="shutterBtn" aria-label="Capture card"></button>
+
+    <div class="scanner-side">
+      <button class="btn btn-icon" id="trayBtn" aria-label="Show scanned cards">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+        <span class="tray-count" id="trayCount" hidden>0</span>
+      </button>
     </div>
   </div>
+</div>
 
-  <!-- Hidden canvas for camera capture -->
-  <canvas id="captureCanvas" style="display:none;"></canvas>
+<!-- Native camera app (single shot) and photo library (multi) -->
+<input type="file" id="nativeCameraInput" accept="image/*" capture="environment" hidden />
+<input type="file" id="libraryInput" accept="image/*,.heic,.heif" multiple hidden />
+<canvas id="captureCanvas" hidden></canvas>
 
-  <!-- ── CARD DETAIL DRAWER ─────────────────────────────────── -->
-  <div class="drawer-overlay" id="drawerOverlay">
-    <div class="drawer" id="cardDrawer">
-      <div class="drawer-header">
-        <div class="drawer-card-info">
-          <h3 class="drawer-card-name" id="drawerCardName">Card Name</h3>
-          <p class="drawer-card-meta" id="drawerCardMeta">Set • Rarity • Condition</p>
-        </div>
-        <div class="drawer-header-actions">
-          <button class="btn-ghost btn-sm" id="editCardBtn" title="Edit Card" style="margin-right: 8px;">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
-          </button>
-          <button class="drawer-close" id="closeDrawerBtn" title="Close drawer">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-          </button>
-        </div>
+<!-- ── CARD DETAIL SHEET ───────────────────────────────────── -->
+<div class="scrim" id="scrim"></div>
+<aside class="sheet glass glass-lg" id="sheet" aria-hidden="true">
+  <div class="sheet-grip" id="sheetGrip"></div>
+  <div class="sheet-head" id="sheetHead">
+    <div style="flex:1; min-width:0;">
+      <div class="sheet-title" id="sheetTitle">Card</div>
+      <div class="sheet-sub" id="sheetSub"></div>
+    </div>
+    <button class="btn btn-quiet btn-icon" id="sheetEditBtn" aria-label="Edit card">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+    </button>
+    <button class="btn btn-quiet btn-icon" id="sheetCloseBtn" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div class="sheet-body" id="sheetBody"></div>
+</aside>
+
+<!-- ── EDIT MODAL ──────────────────────────────────────────── -->
+<div class="modal glass glass-lg" id="editModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3>Correct this card</h3>
+    <p>The printing fields decide which price we look up, so they matter as much as the name.</p>
+  </div>
+  <div class="modal-body">
+    <div class="field">
+      <label for="editName">Card name</label>
+      <input id="editName" type="text" autocomplete="off" />
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="editSet">Set</label>
+        <input id="editSet" type="text" autocomplete="off" />
       </div>
-      <div class="drawer-body">
-        <div class="drawer-price-row">
-          <div>
-            <span class="drawer-current-price" id="drawerCurrentPrice">$0.00</span>
-            <span class="drawer-change" id="drawerChange"></span>
-          </div>
-          <div class="drawer-card-img-wrap">
-            <img class="drawer-card-img" id="drawerCardImg" src="" alt="Card image" loading="lazy" />
-          </div>
-        </div>
-        <div class="chart-container">
-          <div class="chart-tabs">
-            <button class="chart-tab" data-days="1">1D</button>
-            <button class="chart-tab active" data-days="7">7D</button>
-            <button class="chart-tab" data-days="30">30D</button>
-            <button class="chart-tab" data-days="0">All</button>
-          </div>
-          <canvas id="priceChart" height="200"></canvas>
-        </div>
-        <div class="drawer-details">
-          <div class="detail-grid">
-            <div class="detail-item">
-              <span class="detail-label">Set</span>
-              <span class="detail-value" id="drawerSet">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Number</span>
-              <span class="detail-value" id="drawerNumber">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Rarity</span>
-              <span class="detail-value" id="drawerRarity">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Condition</span>
-              <span class="detail-value" id="drawerCondition">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Year</span>
-              <span class="detail-value" id="drawerYear">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Language</span>
-              <span class="detail-value" id="drawerLanguage">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Holographic</span>
-              <span class="detail-value" id="drawerHolo">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Holo Type</span>
-              <span class="detail-value" id="drawerHoloType">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">1st Edition</span>
-              <span class="detail-value" id="drawer1stEd">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">AI Confidence</span>
-              <span class="detail-value" id="drawerConfidence">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Price Source</span>
-              <span class="detail-value" id="drawerPriceSource">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">Highest Sale (30D)</span>
-              <span class="detail-value" id="drawerHighestSale">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">24H Change</span>
-              <span class="detail-value" id="drawer24hTrend">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">7D Change</span>
-              <span class="detail-value" id="drawer7dTrend">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">30D Change</span>
-              <span class="detail-value" id="drawer30dTrend">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">All-Time High</span>
-              <span class="detail-value" id="drawerAllTimeHigh">—</span>
-            </div>
-            <div class="detail-item">
-              <span class="detail-label">All-Time Low</span>
-              <span class="detail-value" id="drawerAllTimeLow">—</span>
-            </div>
-          </div>
-
-          <!-- Price Comparison Section -->
-          <div class="price-comparison-section" id="priceComparisonSection" style="margin-top:1rem;">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-              <h4 style="margin:0;font-size:0.85rem;font-weight:600;color:#6b7280;">📊 Price Comparison</h4>
-              <span id="sourcesCheckedBadge" style="font-size:0.7rem;color:#9ca3af;"></span>
-            </div>
-            <div id="priceComparisonTable" style="font-size:0.8rem;">
-              <div style="color:#9ca3af;text-align:center;padding:1rem;">Prices load after first refresh</div>
-            </div>
-          </div>
-
-          <button class="btn-danger-outline" id="deleteCardBtn">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-            Remove from Portfolio
-          </button>
-        </div>
+      <div class="field">
+        <label for="editNumber">Number</label>
+        <input id="editNumber" type="text" autocomplete="off" placeholder="4/102" />
       </div>
     </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="editHolo">Printing</label>
+        <select id="editHolo">
+          <option>Unknown</option>
+          <option>Non-Holo</option>
+          <option>Holofoil</option>
+          <option>Reverse Holo</option>
+          <option>Cosmos Holo</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="editLanguage">Language</label>
+        <input id="editLanguage" type="text" autocomplete="off" />
+      </div>
+    </div>
+    <label class="field-check">
+      <input id="editFirstEd" type="checkbox" />
+      1st Edition stamp
+    </label>
+    <p class="field-hint">Saving re-prices the card straight away. If the printing changes, its old price history is cleared because it belonged to a different card.</p>
   </div>
-
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Cancel</button>
+    <button class="btn btn-primary" id="editSaveBtn">Save &amp; re-price</button>
   </div>
+</div>
 
-  <!-- Chart.js CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="script.js"></script>
+<!-- ── COPY MODAL ──────────────────────────────────────────── -->
+<div class="modal glass glass-lg" id="copyModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3 id="copyModalTitle">Copy details</h3>
+    <p>Each copy is priced on its own condition.</p>
+  </div>
+  <div class="modal-body">
+    <div class="field">
+      <label for="copyCondition">Condition</label>
+      <select id="copyCondition"></select>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="copyGrade">Grade (optional)</label>
+        <input id="copyGrade" type="text" placeholder="PSA 9" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="copyPaid">Paid (optional)</label>
+        <input id="copyPaid" type="number" step="0.01" min="0" placeholder="0.00" />
+      </div>
+    </div>
+    <div class="field">
+      <label for="copyManual">Set value by hand (optional)</label>
+      <input id="copyManual" type="number" step="0.01" min="0" placeholder="Leave empty to use the market price" />
+      <span class="field-hint">Use this for graded slabs. We track raw market prices, not graded ones, so a hand-set value is the honest answer there.</span>
+    </div>
+    <div class="field">
+      <label for="copyNotes">Notes (optional)</label>
+      <input id="copyNotes" type="text" autocomplete="off" />
+    </div>
+  </div>
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Cancel</button>
+    <button class="btn btn-primary" id="copySaveBtn">Save</button>
+  </div>
+</div>
+
+<!-- ── MERGE MODAL ─────────────────────────────────────────── -->
+<div class="modal glass glass-lg" id="mergeModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3>Merge duplicate cards</h3>
+    <p id="mergeIntro">Checking your collection…</p>
+  </div>
+  <div class="modal-body" id="mergeBody"></div>
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Cancel</button>
+    <button class="btn btn-primary" id="mergeConfirmBtn" disabled>Merge selected</button>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="script.js"></script>
 </body>
 </html>

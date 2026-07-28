@@ -6,7 +6,8 @@
     "type": "module",
     "scripts": {
         "start": "node server.js",
-        "dev": "node server.js"
+        "dev": "node server.js",
+        "test": "node --test \"test/*.test.js\""
     },
     "dependencies": {
         "@google/generative-ai": "^0.21.0",

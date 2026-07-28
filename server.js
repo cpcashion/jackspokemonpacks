@@ -26,7 +26,24 @@ import axios from 'axios';
 import multer from 'multer';
 import sharp from 'sharp';
 import { execSync } from 'child_process';
-import * as cheerio from 'cheerio';
+
+import {
+    normalizeText,
+    normalizeCardNumber,
+    buildVariantKey,
+    canonicalCondition,
+    conditionMultiplier,
+    copyValue,
+    CONDITIONS,
+    isTruthy,
+} from './lib/identity.js';
+import {
+    quotesFromPokemonTcgCandidate,
+    quotesFromTcgdexCard,
+    aggregateQuotes,
+    priceContextFor,
+    fxStatus,
+} from './lib/pricing.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -37,36 +54,21 @@ const SCRYDEX_TEAM_ID = process.env.SCRYDEX_TEAM_ID || '';
 const JUSTTCG_API_KEY = process.env.JUSTTCG_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════
-//  CONFIG
-// ═══════════════════════════════════════════════════════════════
-
-const HIGH_VALUE_CARDS = [
-    { name: 'Charizard', set: 'Base Set', minValue: 200 },
-    { name: 'Charizard', set: 'Base Set', variant: '1st Edition', minValue: 5000 },
-    { name: 'Charizard', set: 'Base Set', variant: 'Shadowless', minValue: 1000 },
-    { name: 'Blastoise', set: 'Base Set', minValue: 100 },
-    { name: 'Venusaur', set: 'Base Set', minValue: 80 },
-    { name: 'Pikachu Illustrator', set: 'Promo', minValue: 50000 },
-    { name: 'Lugia', set: 'Neo Genesis', minValue: 150 },
-    { name: 'Umbreon', set: 'Evolving Skies', variant: 'Alt Art', minValue: 200 },
-    { name: 'Rayquaza', set: 'Gold Star', minValue: 1500 },
-    { name: 'Mewtwo', set: 'Base Set', minValue: 50 },
-    { name: 'Espeon', set: 'Gold Star', minValue: 2000 },
-    { name: 'Mew', set: 'Gold Star', minValue: 800 },
-];
-
-const RATE_LIMITS = { ebay: 1500, scraper: 2000, priceCheck: 500, justtcg: 300 };
-
-// ═══════════════════════════════════════════════════════════════
 //  DATABASE
 // ═══════════════════════════════════════════════════════════════
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-please-change-in-prod';
 const DB_URL = process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.DATABASE_POSTGRES_URL || 'postgres://localhost:5432/pokesniper';
 
+/** Hosted Postgres needs SSL; a local or explicitly-disabled one must not use it. */
+function shouldUseSsl(url) {
+    if (/sslmode=disable/i.test(url)) return false;
+    return !/@(localhost|127\.0\.0\.1|\[::1\])[:/]/i.test(url);
+}
+
 const pool = new Pool({
     connectionString: DB_URL,
-    ssl: DB_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+    ssl: shouldUseSsl(DB_URL) ? { rejectUnauthorized: false } : false
 });
 
 async function initDB() {
@@ -109,19 +111,90 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS idx_price_history_card ON price_history(card_id, recorded_at DESC);
     `);
 
-    // Add missing columns if they don't exist
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN current_price REAL DEFAULT 0'); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN price_source TEXT DEFAULT \'\''); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN price_source_url TEXT DEFAULT \'\''); } catch {}
-    try { await pool.query('ALTER TABLE price_history ADD COLUMN source_url TEXT DEFAULT \'\''); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN highest_recent_sale REAL DEFAULT 0'); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN highest_recent_sale_source TEXT DEFAULT \'\''); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN highest_recent_sale_url TEXT DEFAULT \'\''); } catch {}
-    // New columns for multi-source pricing + batched cron
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN last_price_check TIMESTAMP'); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN price_sources JSONB DEFAULT \'{}\''); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN best_sold_price REAL DEFAULT 0'); } catch {}
-    try { await pool.query('ALTER TABLE portfolio_cards ADD COLUMN best_sold_source TEXT DEFAULT \'\''); } catch {}
+    await pool.query(`
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS current_price REAL DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_source TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_source_url TEXT DEFAULT '';
+        ALTER TABLE price_history      ADD COLUMN IF NOT EXISTS source_url TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS highest_recent_sale REAL DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS highest_recent_sale_source TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS highest_recent_sale_url TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS last_price_check TIMESTAMP;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_sources JSONB DEFAULT '{}';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS best_sold_price REAL DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS best_sold_source TEXT DEFAULT '';
+
+        -- Identity + pricing provenance
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS variant_key TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS needs_review INTEGER DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_confidence REAL DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_marketplace TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_variant TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_variant_matched INTEGER DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_low REAL DEFAULT 0;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_high REAL DEFAULT 0;
+    `);
+
+    // One row per physical copy. Jack owns three Charizards; that is one card
+    // and three copies, not three cards.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS card_copies (
+            id SERIAL PRIMARY KEY,
+            card_id INTEGER NOT NULL REFERENCES portfolio_cards(id) ON DELETE CASCADE,
+            condition TEXT DEFAULT 'Unknown',
+            grade TEXT DEFAULT '',
+            grader TEXT DEFAULT '',
+            manual_value REAL DEFAULT 0,
+            acquired_price REAL DEFAULT 0,
+            acquired_at TIMESTAMP,
+            notes TEXT DEFAULT '',
+            image_data TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_card_copies_card ON card_copies(card_id);
+        CREATE INDEX IF NOT EXISTS idx_portfolio_variant ON portfolio_cards(user_id, variant_key);
+    `);
+
+    await backfillVariantKeys();
+    await backfillCardCopies();
+}
+
+/**
+ * Fill in variant_key for rows created before the column existed. Computed in
+ * JS so there is exactly one definition of card identity in the codebase.
+ */
+async function backfillVariantKeys() {
+    const res = await pool.query(`
+        SELECT id, card_name, card_set, card_number, holo_type, is_holo, language, is_first_edition
+        FROM portfolio_cards WHERE variant_key IS NULL OR variant_key = ''
+    `);
+    if (!res.rows.length) return;
+    for (const row of res.rows) {
+        await pool.query('UPDATE portfolio_cards SET variant_key = $1 WHERE id = $2', [buildVariantKey(row), row.id]);
+    }
+    console.log(`  [Migrate] Backfilled variant_key for ${res.rows.length} card(s)`);
+}
+
+/**
+ * Give every pre-existing card exactly one copy, carrying over its condition and
+ * photo. Purely additive: no card row is merged or deleted here. Folding actual
+ * duplicates together is a separate, user-confirmed action.
+ */
+async function backfillCardCopies() {
+    const res = await pool.query(`
+        SELECT pc.id, pc.condition, pc.image_data, pc.added_at
+        FROM portfolio_cards pc
+        LEFT JOIN card_copies cc ON cc.card_id = pc.id
+        WHERE cc.id IS NULL
+    `);
+    if (!res.rows.length) return;
+    for (const row of res.rows) {
+        await pool.query(
+            `INSERT INTO card_copies (card_id, condition, image_data, acquired_at) VALUES ($1, $2, $3, $4)`,
+            [row.id, canonicalCondition(row.condition), row.image_data || '', row.added_at || new Date()]
+        );
+    }
+    console.log(`  [Migrate] Created ${res.rows.length} copy record(s) for existing cards`);
 }
 async function ensureDefaultUser() {
     const existing = await pool.query('SELECT id FROM users WHERE id = 1');
@@ -135,50 +208,195 @@ initDB().then(() => ensureDefaultUser()).catch(err => console.error("DB Init Err
 // ── Portfolio DB helpers ──
 async function insertPortfolioCard(card, userId) {
     const res = await pool.query(`
-        INSERT INTO portfolio_cards (user_id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, highest_recent_sale, highest_recent_sale_source, highest_recent_sale_url)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        INSERT INTO portfolio_cards (user_id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         RETURNING id
     `, [
         userId, card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
-        card.condition_estimate || card.condition || 'Unknown', card.is_holographic || card.is_holo ? 1 : 0, card.is_first_edition ? 1 : 0,
+        canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
         card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
         card.year || 0, card.language || 'English', card.holo_type || 'Unknown',
-        card.highest_recent_sale || 0, card.highest_recent_sale_source || '', card.highest_recent_sale_url || ''
+        buildVariantKey(card), card.needs_review ? 1 : 0
     ]);
     return res.rows[0].id;
+}
+
+/** Find an existing card of the same printing, so a re-scan becomes another copy. */
+async function findCardByVariant(variantKey, userId) {
+    if (!variantKey) return null;
+    const res = await pool.query(
+        'SELECT * FROM portfolio_cards WHERE user_id = $1 AND variant_key = $2 ORDER BY id ASC LIMIT 1',
+        [userId, variantKey]
+    );
+    return res.rows[0] || null;
+}
+
+async function addCardCopy(cardId, copy = {}) {
+    const res = await pool.query(`
+        INSERT INTO card_copies (card_id, condition, grade, grader, manual_value, acquired_price, acquired_at, notes, image_data)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8, $9)
+        RETURNING *
+    `, [
+        cardId,
+        canonicalCondition(copy.condition),
+        copy.grade || '',
+        copy.grader || '',
+        Number(copy.manual_value) || 0,
+        Number(copy.acquired_price) || 0,
+        copy.acquired_at || null,
+        copy.notes || '',
+        copy.image_data || '',
+    ]);
+    return res.rows[0];
+}
+
+async function getCardCopies(cardId) {
+    const res = await pool.query(
+        'SELECT id, card_id, condition, grade, grader, manual_value, acquired_price, acquired_at, notes, created_at, (image_data <> \'\') AS has_photo FROM card_copies WHERE card_id = $1 ORDER BY id ASC',
+        [cardId]
+    );
+    return res.rows;
 }
 
 async function updateCardImageUrl(cardId, imageUrl) {
     await pool.query(`UPDATE portfolio_cards SET image_url = $1 WHERE id = $2`, [imageUrl, cardId]);
 }
 
+/**
+ * Persist a resolved market price plus the evidence behind it, so the UI can
+ * explain the number instead of just asserting it.
+ */
 async function updatePortfolioCardMarketData(cardId, marketData = {}) {
     await pool.query(`
         UPDATE portfolio_cards
-        SET
-            current_price = $1,
-            price_source = $2,
-            price_source_url = $3,
-            highest_recent_sale = $4,
-            highest_recent_sale_source = $5,
-            highest_recent_sale_url = $6,
-            last_price_check = NOW(),
-            price_sources = COALESCE($8::jsonb, '{}'::jsonb),
-            best_sold_price = $9,
-            best_sold_source = $10
-        WHERE id = $7
+        SET current_price          = $2,
+            price_source           = $3,
+            price_source_url       = $4,
+            price_confidence       = $5,
+            price_marketplace      = $6,
+            price_variant          = $7,
+            price_variant_matched  = $8,
+            price_low              = $9,
+            price_high             = $10,
+            price_sources          = COALESCE($11::jsonb, '{}'::jsonb),
+            highest_recent_sale    = $10,
+            best_sold_price        = $10,
+            best_sold_source       = $3,
+            last_price_check       = NOW()
+        WHERE id = $1
     `, [
-        marketData.price || 0,
+        cardId,
+        Number(marketData.price) || 0,
         marketData.source || '',
         marketData.url || '',
-        marketData.highestRecentSale || 0,
-        marketData.highestRecentSaleSource || '',
-        marketData.highestRecentSaleUrl || '',
-        cardId,
+        Number(marketData.confidence) || 0,
+        marketData.marketplace || '',
+        marketData.variant || '',
+        marketData.variantMatched ? 1 : 0,
+        Number(marketData.low) || 0,
+        Number(marketData.high) || 0,
         JSON.stringify(marketData.allSourcePrices || {}),
-        marketData.bestSoldPrice || marketData.highestRecentSale || 0,
-        marketData.bestSoldSource || marketData.highestRecentSaleSource || ''
     ]);
+}
+
+/** Marks a card as checked without touching its price — used when a lookup finds nothing. */
+async function markPriceChecked(cardId) {
+    await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [cardId]);
+}
+
+// ── Duplicate consolidation ────────────────────────────────────────────────
+
+/**
+ * Rows that describe the same printing. Reported for review before anything is
+ * touched — merging is destructive and is never done automatically.
+ */
+async function findDuplicateGroups(userId) {
+    const res = await pool.query(`
+        SELECT variant_key,
+               COUNT(*)::int                        AS row_count,
+               MIN(id)                              AS keep_id,
+               ARRAY_AGG(id ORDER BY id)            AS ids,
+               MIN(card_name)                       AS card_name,
+               MIN(card_set)                        AS card_set,
+               MIN(card_number)                     AS card_number,
+               SUM((SELECT COUNT(*) FROM card_copies cc WHERE cc.card_id = pc.id))::int AS copy_count
+        FROM portfolio_cards pc
+        WHERE user_id = $1 AND variant_key <> ''
+        GROUP BY variant_key
+        HAVING COUNT(*) > 1
+        ORDER BY COUNT(*) DESC
+    `, [userId]);
+    return res.rows;
+}
+
+/**
+ * Fold duplicate rows into the oldest row of each group, preserving every copy
+ * and every price point. Runs in a transaction: either a group merges fully or
+ * not at all.
+ */
+async function mergeDuplicateGroups(userId, onlyVariantKeys = null) {
+    const groups = await findDuplicateGroups(userId);
+    const wanted = Array.isArray(onlyVariantKeys) && onlyVariantKeys.length
+        ? groups.filter(g => onlyVariantKeys.includes(g.variant_key))
+        : groups;
+
+    let mergedGroups = 0;
+    let removedRows = 0;
+    let copiesMoved = 0;
+
+    for (const group of wanted) {
+        const keepId = group.keep_id;
+        const dropIds = group.ids.filter(id => id !== keepId);
+        if (!dropIds.length) continue;
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // Any duplicate row still without a copy record contributes one, so a
+            // merge can never reduce how many cards Jack is recorded as owning.
+            await client.query(`
+                INSERT INTO card_copies (card_id, condition, image_data, acquired_at)
+                SELECT pc.id, pc.condition, pc.image_data, pc.added_at
+                FROM portfolio_cards pc
+                LEFT JOIN card_copies cc ON cc.card_id = pc.id
+                WHERE pc.id = ANY($1::int[]) AND cc.id IS NULL
+            `, [dropIds]);
+
+            const moved = await client.query(
+                'UPDATE card_copies SET card_id = $1 WHERE card_id = ANY($2::int[])',
+                [keepId, dropIds]
+            );
+            await client.query(
+                'UPDATE price_history SET card_id = $1 WHERE card_id = ANY($2::int[])',
+                [keepId, dropIds]
+            );
+            // Keep artwork if the surviving row happens to be the one missing it.
+            await client.query(`
+                UPDATE portfolio_cards keep
+                SET image_url = COALESCE(NULLIF(keep.image_url, ''), src.image_url)
+                FROM (
+                    SELECT image_url FROM portfolio_cards
+                    WHERE id = ANY($2::int[]) AND image_url <> '' LIMIT 1
+                ) src
+                WHERE keep.id = $1
+            `, [keepId, dropIds]);
+
+            await client.query('DELETE FROM portfolio_cards WHERE id = ANY($1::int[]) AND user_id = $2', [dropIds, userId]);
+            await client.query('COMMIT');
+
+            mergedGroups++;
+            removedRows += dropIds.length;
+            copiesMoved += moved.rowCount;
+        } catch (err) {
+            await client.query('ROLLBACK');
+            console.error(`  [Merge] Failed for ${group.variant_key}:`, err.message);
+        } finally {
+            client.release();
+        }
+    }
+
+    return { mergedGroups, removedRows, copiesMoved, groupsAvailable: groups.length };
 }
 
 async function insertPricePoint(cardId, price, source, sourceUrl = '') {
@@ -205,10 +423,12 @@ async function getAllPortfolioCards(userId) {
         SELECT pc.id, pc.user_id, pc.card_name, pc.card_set, pc.card_number,
             pc.rarity, pc.condition, pc.is_holo, pc.is_first_edition, pc.confidence,
             pc.image_url, pc.notes, pc.year, pc.language, pc.holo_type,
-            pc.highest_recent_sale, pc.highest_recent_sale_source, pc.highest_recent_sale_url,
+            pc.variant_key, pc.needs_review,
+            pc.price_confidence, pc.price_marketplace, pc.price_variant,
+            pc.price_variant_matched, pc.price_low, pc.price_high,
             pc.added_at, pc.current_price AS card_current_price, pc.price_source AS card_price_source,
             pc.price_source_url AS card_price_source_url,
-            pc.price_sources, pc.best_sold_price, pc.best_sold_source, pc.last_price_check,
+            pc.price_sources, pc.last_price_check,
             CASE WHEN pc.image_data IS NOT NULL AND pc.image_data != '' AND (pc.image_url IS NULL OR pc.image_url = '') THEN true ELSE false END AS has_local_image,
             latest.price AS current_price,
             day_ref.price AS previous_price,
@@ -218,12 +438,19 @@ async function getAllPortfolioCards(userId) {
             latest.source AS price_source,
             latest.source_url AS price_source_url,
             (
-                SELECT json_agg(h) FROM (
-                    SELECT price, recorded_at FROM price_history 
-                    WHERE card_id = pc.id 
-                    ORDER BY recorded_at DESC LIMIT 15
+                SELECT json_agg(h ORDER BY h.recorded_at ASC) FROM (
+                    SELECT price, recorded_at FROM price_history
+                    WHERE card_id = pc.id
+                    ORDER BY recorded_at DESC LIMIT 30
                 ) h
-            ) as price_history
+            ) as price_history,
+            (
+                SELECT json_agg(c ORDER BY c.id ASC) FROM (
+                    SELECT id, condition, grade, grader, manual_value, acquired_price,
+                           acquired_at, notes, (image_data <> '') AS has_photo
+                    FROM card_copies WHERE card_id = pc.id
+                ) c
+            ) as copies
         FROM portfolio_cards pc
         LEFT JOIN LATERAL (
             SELECT ph.price, ph.source, ph.source_url, ph.recorded_at
@@ -254,9 +481,34 @@ async function getAllPortfolioCards(userId) {
             LIMIT 1
         ) month_ref ON true
         WHERE pc.user_id = $1
-        ORDER BY COALESCE(latest.price, 0) DESC
     `, [userId]);
-    return res.rows;
+
+    return res.rows.map(decorateCardRow).sort((a, b) => b.total_value - a.total_value);
+}
+
+/**
+ * Attach the derived numbers the UI needs. Value is summed per physical copy so
+ * three Lightly Played copies are not valued as three Near Mint ones.
+ */
+function decorateCardRow(row) {
+    const copies = Array.isArray(row.copies) && row.copies.length
+        ? row.copies
+        // Defensive: a card should always have at least one copy after migration,
+        // but never report a card Jack owns as owning zero of it.
+        : [{ id: null, condition: row.condition || 'Unknown', grade: '', manual_value: 0, synthetic: true }];
+
+    const unitPrice = Number(row.current_price ?? row.card_current_price ?? 0) || 0;
+    const perCopy = copies.map(c => ({ ...c, value: Number(copyValue(unitPrice, c).toFixed(2)) }));
+    const totalValue = perCopy.reduce((sum, c) => sum + c.value, 0);
+
+    return {
+        ...row,
+        copies: perCopy,
+        quantity: perCopy.length,
+        unit_price: unitPrice,
+        total_value: Number(totalValue.toFixed(2)),
+        has_mixed_conditions: new Set(perCopy.map(c => c.condition || 'Unknown')).size > 1,
+    };
 }
 
 async function getCardPriceHistory(cardId, userId) {
@@ -313,35 +565,45 @@ async function deletePortfolioCard(cardId, userId) {
     await pool.query(`DELETE FROM portfolio_cards WHERE id = $1 AND user_id = $2`, [cardId, userId]);
 }
 
-async function getPortfolioStats(userId) {
-    const cRes = await pool.query('SELECT COUNT(*) as c FROM portfolio_cards WHERE user_id = $1', [userId]);
-    const totalCards = parseInt(cRes.rows[0].c, 10);
-    
-    // Total value based on latest prices for the user
-    const totalRes = await pool.query(`
-        SELECT COALESCE(SUM(latest.price), 0) as total FROM (
-            SELECT ph.price FROM portfolio_cards pc
-            JOIN price_history ph ON ph.card_id = pc.id
-            WHERE pc.user_id = $1 AND ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1)
-        ) latest
-    `, [userId]);
-    const totalValue = parseFloat(totalRes.rows[0].total) || 0;
+/**
+ * Portfolio totals derived from the same decorated rows the UI renders, so the
+ * header total can never disagree with the sum of the list. Counts distinguish
+ * unique printings from physical cards held.
+ */
+function computePortfolioStats(cards) {
+    let totalValue = 0;
+    let prevValue = 0;
+    let totalCopies = 0;
+    let unpriced = 0;
+    let needsReview = 0;
+    let acquiredCost = 0;
 
-    const prevRes = await pool.query(`
-        SELECT COALESCE(SUM(prev.price), 0) as total FROM (
-            SELECT ph.price FROM portfolio_cards pc
-            JOIN price_history ph ON ph.card_id = pc.id
-            WHERE pc.user_id = $1 AND ph.id = (SELECT id FROM price_history WHERE card_id = pc.id ORDER BY recorded_at DESC LIMIT 1 OFFSET 1)
-        ) prev
-    `, [userId]);
-    const prevValue = parseFloat(prevRes.rows[0].total) || 0;
+    for (const card of cards) {
+        totalValue += card.total_value;
+        totalCopies += card.quantity;
+        if (!(card.unit_price > 0)) unpriced += card.quantity;
+        if (card.needs_review) needsReview++;
 
-    return { totalCards, totalValue, prevValue };
-}
+        // Yesterday's value at today's holdings, so a change figure reflects the
+        // market moving rather than Jack adding cards.
+        const prevUnit = Number(card.prev_day_price || 0);
+        prevValue += prevUnit > 0
+            ? card.copies.reduce((sum, c) => sum + copyValue(prevUnit, c), 0)
+            : card.total_value;
 
-// Legacy helpers
-async function getCachedPrice(name, set) {
-    return null; // DB-less fallback or removed entirely to keep things clean.
+        acquiredCost += card.copies.reduce((sum, c) => sum + (Number(c.acquired_price) || 0), 0);
+    }
+
+    return {
+        totalCards: cards.length,
+        totalCopies,
+        duplicateCards: cards.filter(c => c.quantity > 1).length,
+        unpricedCopies: unpriced,
+        needsReview,
+        totalValue: Number(totalValue.toFixed(2)),
+        prevValue: Number(prevValue.toFixed(2)),
+        acquiredCost: Number(acquiredCost.toFixed(2)),
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -459,68 +721,6 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
     }
 }
 
-function extractTcgdexPrice(card, holoType) {
-    const pricing = card?.pricing;
-    if (!pricing) return null;
-
-    const variantKeys = [];
-    const htLower = normalizeText(holoType);
-    if (htLower.includes('reverse')) variantKeys.push('reverse', 'reverseHolo', 'reverseHolofoil');
-    if (htLower.includes('1st edition')) variantKeys.push('firstEdition', '1stEdition');
-    if (htLower === 'holofoil' || htLower === 'cosmos holo') variantKeys.push('holo', 'holofoil');
-    if (htLower === 'non holo' || htLower === 'non-holo') variantKeys.push('normal');
-    variantKeys.push('normal', 'holo', 'reverse', 'unlimited');
-
-    const pickFromTcgplayer = () => {
-        const tcg = pricing.tcgplayer;
-        if (!tcg) return null;
-        for (const key of variantKeys) {
-            const node = tcg[key];
-            if (!node) continue;
-            const marketPrice = node.marketPrice || node.midPrice || node.lowPrice || null;
-            if (marketPrice && marketPrice > 0) {
-                return {
-                    price: marketPrice,
-                    source: 'tcgdex_tcgplayer',
-                    url: '',
-                    highestRecentSale: 0,
-                    highestRecentSaleSource: '',
-                    highestRecentSaleUrl: ''
-                };
-            }
-        }
-        return null;
-    };
-
-    const pickFromCardmarket = () => {
-        const cm = pricing.cardmarket;
-        if (!cm) return null;
-        const variantMap = [
-            ['normal', ['avg30', 'trend', 'avg7', 'avg1', 'avg']],
-            ['holo', ['avg30-holo', 'trend-holo', 'avg7-holo', 'avg1-holo']]
-        ];
-        for (const [kind, keys] of variantMap) {
-            if (kind === 'holo' && !(htLower.includes('holo') || htLower.includes('reverse'))) continue;
-            for (const key of keys) {
-                const value = cm[key];
-                if (value && value > 0) {
-                    return {
-                        price: value,
-                        source: 'tcgdex_cardmarket',
-                        url: '',
-                        highestRecentSale: 0,
-                        highestRecentSaleSource: '',
-                        highestRecentSaleUrl: ''
-                    };
-                }
-            }
-        }
-        return null;
-    };
-
-    return pickFromTcgplayer() || pickFromCardmarket();
-}
-
 // Look up official high-res image from Pokemon TCG API (fallback)
 async function fetchCardImageFromPokemonTCG(cardName, cardSet, cardNumber) {
     if (!cardName) return null;
@@ -599,25 +799,6 @@ function parseAiJson(text) {
     }
 }
 
-function normalizeText(value) {
-    return String(value || '')
-        .normalize('NFKD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, ' ')
-        .trim();
-}
-
-function normalizeCardNumber(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return '';
-    const firstPart = raw.split('/')[0].trim();
-    const letters = firstPart.match(/^[A-Za-z]+/)?.[0] || '';
-    const digits = firstPart.match(/\d+/)?.[0] || '';
-    const cleanedDigits = digits ? String(parseInt(digits, 10)) : '';
-    return `${letters.toUpperCase()}${cleanedDigits}`.trim();
-}
-
 function hasMeaningfulCardName(name) {
     const normalized = normalizeText(name);
     if (!normalized) return false;
@@ -669,73 +850,6 @@ function scorePokemonCardCandidate(card, candidate) {
     if (card.year && candidate?.set?.releaseDate?.startsWith(String(card.year))) score += 1;
 
     return score;
-}
-
-function extractMarketPriceFromPokemonCandidate(candidate, card) {
-    if (!candidate) return null;
-    const holoType = card?.holo_type || 'Unknown';
-    const isFirstEd = card?.is_first_edition === true || card?.is_first_edition === 'true' || card?.is_first_edition === 1;
-    const prices = candidate.tcgplayer?.prices;
-    let price = null;
-    let source = '';
-    let url = candidate.tcgplayer?.url || candidate.cardmarket?.url || '';
-    if (prices) {
-        const htLower = normalizeText(holoType);
-        if (htLower.includes('reverse') && prices.reverseHolofoil?.market) {
-            price = prices.reverseHolofoil.market;
-            source = 'tcgplayer_reverse_holo';
-        } else if (isFirstEd && prices['1stEditionHolofoil']?.market) {
-            price = prices['1stEditionHolofoil'].market;
-            source = 'tcgplayer_1st_edition';
-        } else if (!isFirstEd && prices.unlimitedHolofoil?.market) {
-            price = prices.unlimitedHolofoil.market;
-            source = 'tcgplayer_unlimited_holo';
-        } else if (!isFirstEd && prices.unlimited?.market) {
-            price = prices.unlimited.market;
-            source = 'tcgplayer_unlimited';
-        } else if ((htLower === 'holofoil' || htLower === 'cosmos holo') && prices.holofoil?.market) {
-            price = prices.holofoil.market;
-            source = 'tcgplayer_holo';
-        } else if ((htLower === 'non holo' || htLower === 'non-holo') && prices.normal?.market) {
-            price = prices.normal.market;
-            source = 'tcgplayer_normal';
-        }
-
-        if (!price) {
-            price = prices.holofoil?.market || prices.reverseHolofoil?.market || prices.normal?.market;
-            if (!price) {
-                // If it's 1st edition, prioritize 1st edition fallback. Otherwise prioritize unlimited fallback.
-                if (isFirstEd) {
-                    price = prices['1stEditionHolofoil']?.market || prices['1stEdition']?.market || prices.unlimitedHolofoil?.market || prices.unlimited?.market;
-                } else {
-                    price = prices.unlimitedHolofoil?.market || prices.unlimited?.market || prices['1stEditionHolofoil']?.market || prices['1stEdition']?.market;
-                }
-            }
-            if (!price) {
-                price = prices.holofoil?.mid || prices.normal?.mid || null;
-            }
-            if (price) source = 'pokemon_tcg_api_fallback';
-        }
-    }
-    if (!price && candidate.cardmarket?.prices) {
-        price = candidate.cardmarket.prices.averageSellPrice
-            || candidate.cardmarket.prices.trendPrice
-            || candidate.cardmarket.prices.avg7
-            || null;
-        if (price) {
-            source = 'cardmarket';
-            url = candidate.cardmarket?.url || url;
-        }
-    }
-    if (!price || price <= 0) return null;
-    return {
-        price,
-        source: source || 'pokemon_tcg_api',
-        url,
-        highestRecentSale: price,
-        highestRecentSaleSource: source || 'pokemon_tcg_api',
-        highestRecentSaleUrl: url || ''
-    };
 }
 
 function pickBestPokemonCardCandidate(card, candidates) {
@@ -831,7 +945,9 @@ async function verifyAndCanonicalizeCard(card) {
         image_url: bestCandidate.images?.large || bestCandidate.images?.small || '',
         tcgplayer_url: bestCandidate.tcgplayer?.url || '',
         cardmarket_url: bestCandidate.cardmarket?.url || '',
-        verified_market_data: extractMarketPriceFromPokemonCandidate(bestCandidate, card),
+        // Pricing is deliberately NOT taken from this candidate. It runs through
+        // lookupMarketPrice so a scanned card and a refreshed card are priced by
+        // exactly the same rules.
         confidence: Math.max(Number(card.confidence) || 0, bestScore >= 10 ? 0.98 : bestScore >= 8 ? 0.92 : 0.85)
     };
 }
@@ -910,6 +1026,7 @@ async function analyzeImageBuffer(buffer, mimeType) {
 // ═══════════════════════════════════════════════════════════════
 
 const priceCache = new Map();
+const PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 const uploadDir = join(tmpdir(), 'pokemon-uploads');
 mkdirSync(uploadDir, { recursive: true });
@@ -923,16 +1040,6 @@ const upload = multer({
 });
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function parsePrice(p) { if (typeof p === 'number') return p; return parseFloat((p || '').replace(/[^0-9.]/g, '')) || 0; }
-
-function checkKnownCards(name, set) {
-    const n = (name || '').toLowerCase(), s = (set || '').toLowerCase();
-    for (const c of HIGH_VALUE_CARDS) {
-        if (c.name.toLowerCase() === n && (!c.set || s.includes(c.set.toLowerCase()))) return c.minValue;
-    }
-    return null;
-}
-
 // ═══════════════════════════════════════════════════════════════
 //  SCRYDEX API (primary price + image source)
 // ═══════════════════════════════════════════════════════════════
@@ -1061,433 +1168,113 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  WEB SCRAPERS — Additional price sources
+//  PRICE RESOLUTION
+//
+//  Every source below is queried in parallel and returns "quotes". A quote is
+//  one marketplace's opinion in its own currency. lib/pricing.js normalises,
+//  filters and reduces them to a single USD Near Mint price plus the evidence
+//  behind it. Nothing here is allowed to invent a price: if no source answers,
+//  the card stays unpriced and says so.
 // ═══════════════════════════════════════════════════════════════
 
-async function scrapeTCGplayerPrice(cardName, cardSet, cardNumber) {
-    try {
-        const q = `${cardName} ${cardSet || ''} ${cardNumber || ''}`.trim();
-        const url = `https://www.tcgplayer.com/search/pokemon/product?q=${encodeURIComponent(q)}&view=grid`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        // TCGplayer search results show market prices
-        $('.search-result__market-price, .product-card__market-price').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) {
-            // Try alternative selectors
-            $('[class*="price"]').each((i, el) => {
-                const text = $(el).text();
-                const match = text.match(/Market\s*Price[:\s]*\$([\d,.]+)/i);
-                if (match && !price) {
-                    const p = parsePrice(match[1]);
-                    if (p > 0.10) price = p;
-                }
-            });
-        }
-        if (!price) return null;
-        return { price, source: 'tcgplayer_direct', url };
-    } catch (err) {
-        console.error(`  [TCGplayer-Scrape] Error: ${err.message}`);
-        return null;
-    }
+/** Cache key must include the printing — a reverse holo is not a holo. */
+function priceCacheKey(card) {
+    return buildVariantKey(card);
 }
 
-async function scrapeCardmarketPrice(cardName, cardSet) {
-    try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${encodeURIComponent(q)}`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        // Cardmarket shows trend prices in EUR
-        $('.col-price, .price-container, [class*="trend"]').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/([\d,.]+)\s*€/) || text.match(/€\s*([\d,.]+)/);
-            if (match && !price) {
-                const p = parseFloat(match[1].replace(',', '.'));
-                if (p > 0.05) price = Number((p * 1.08).toFixed(2)); // EUR to USD approx
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'cardmarket_direct', url };
-    } catch (err) {
-        console.error(`  [Cardmarket-Scrape] Error: ${err.message}`);
-        return null;
-    }
+async function collectPokemonTcgQuotes(card, ctx) {
+    const candidates = await fetchPokemonTcgCandidates(card);
+    if (!candidates.length) return [];
+    const { bestCandidate } = pickBestPokemonCardCandidate(card, candidates);
+    if (!bestCandidate) return [];
+    return quotesFromPokemonTcgCandidate(bestCandidate, ctx);
 }
 
-async function scrapeTrollAndToad(cardName, cardSet) {
-    try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.trollandtoad.com/category.php?selected-cat=7061&search-words=${encodeURIComponent(q)}`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        // Troll and Toad shows prices in their product listing
-        $('.product-col .product-info, .result-price, [class*="price"]').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'trollandtoad', url };
-    } catch (err) {
-        console.error(`  [TrollAndToad] Error: ${err.message}`);
-        return null;
-    }
+async function collectTcgdexQuotes(card, ctx) {
+    const tcgdexCard = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number);
+    return quotesFromTcgdexCard(tcgdexCard, ctx);
 }
 
-async function scrapeTCGFish(cardName, cardSet) {
-    try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.tcgfish.com/search?q=${encodeURIComponent(q)}&game=pokemon`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        $('[class*="price"], [class*="Price"]').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'tcgfish', url };
-    } catch (err) {
-        console.error(`  [TCGFish] Error: ${err.message}`);
-        return null;
-    }
+async function collectScrydexQuotes(card, ctx) {
+    if (!SCRYDEX_API_KEY || !SCRYDEX_TEAM_ID) return [];
+    const scrydexCard = await fetchScrydexCard(card.card_name, card.card_set, card.card_number);
+    if (!scrydexCard) return [];
+    // Scrydex mirrors the TCGplayer/Cardmarket shapes, so the same extractors apply.
+    return quotesFromPokemonTcgCandidate(scrydexCard, ctx)
+        .map(q => ({ ...q, source: q.source.replace('pokemontcg', 'scrydex') }));
 }
 
-async function scrapeCardMavin(cardName, cardSet, cardNumber) {
-    try {
-        const q = `${cardName} ${cardNumber || ''} pokemon card`.trim();
-        const url = `https://www.cardmavin.com/search?q=${encodeURIComponent(q)}`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        // Card Mavin shows "Fair Market Value" and eBay sold aggregation
-        $('[class*="price"], [class*="value"], .card-price').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'cardmavin', url };
-    } catch (err) {
-        console.error(`  [CardMavin] Error: ${err.message}`);
-        return null;
-    }
-}
-
-async function scrapeCoolStuffInc(cardName, cardSet) {
-    try {
-        const q = `${cardName} ${cardSet || ''}`.trim();
-        const url = `https://www.coolstuffinc.com/main_search.php?pa=searchOnName&token=${encodeURIComponent(q)}`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        $('.product-price, [class*="price"]').each((i, el) => {
-            const text = $(el).text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'coolstuffinc', url };
-    } catch (err) {
-        console.error(`  [CoolStuffInc] Error: ${err.message}`);
-        return null;
-    }
-}
-
-async function scrapePriceCharting(cardName, cardSet) {
-    try {
-        const q = `${cardName} ${cardSet || ''} pokemon`.trim();
-        const url = `https://www.pricecharting.com/search-products?q=${encodeURIComponent(q)}&type=prices`;
-        const resp = await axios.get(url, { headers: makeHeaders(), timeout: 12000 });
-        const $ = cheerio.load(resp.data);
-
-        let price = null;
-        // PriceCharting shows "ungraded" prices in the search results
-        $('td.price, .js-price, [data-price]').each((i, el) => {
-            const text = $(el).attr('data-price') || $(el).text();
-            const match = text.match(/\$?([\d,.]+)/);
-            if (match && !price) {
-                const p = parsePrice(match[1]);
-                if (p > 0.10) price = p;
-            }
-        });
-        if (!price) return null;
-        return { price, source: 'pricecharting', url };
-    } catch (err) {
-        console.error(`  [PriceCharting] Error: ${err.message}`);
-        return null;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-
-// Rotating user agents
-const USER_AGENTS = [
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
-];
-function randomUA() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
-
-function makeHeaders(extra = {}) {
-    return {
-        'User-Agent': randomUA(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Cache-Control': 'no-cache',
-        ...extra
-    };
-}
-
-function filterComparableListings(listings, cardName, cardSet, cardNumber) {
-    const nameNeedle = normalizeText(cardName);
-    const setNeedle = normalizeText(cardSet);
-    const numberNeedle = normalizeCardNumber(cardNumber);
-    return (listings || []).filter(listing => {
-        const title = normalizeText(listing.title);
-        if (!title || (nameNeedle && !title.includes(nameNeedle))) return false;
-        const compactTitle = title.replace(/\s+/g, '');
-        const compactNumber = numberNeedle.toLowerCase();
-        const hasNumberMatch = compactNumber ? compactTitle.includes(compactNumber) : false;
-        const hasSetMatch = setNeedle ? title.includes(setNeedle) : false;
-        
-        if (numberNeedle && !hasNumberMatch) return false;
-        if (setNeedle && !hasSetMatch) {
-            if (!hasNumberMatch) return false;
-            if (compactNumber.length <= 2) return false; // Too risky to match just "14" across sets
-        }
-        
-        return !['lot', 'bundle', 'psa', 'bgs', 'cgc', 'graded', 'proxy', 'custom', 'orica', 'replica', 'fake', 'repack'].some(kw => title.includes(kw));
-    });
-}
-
-function summarizeComparableSales(listings) {
-    const sorted = [...(listings || [])].filter(l => l.price > 0).sort((a, b) => a.price - b.price);
-    if (!sorted.length) return null;
-    const medianIdx = Math.floor(sorted.length / 2);
-    return {
-        marketPrice: sorted[medianIdx].price,
-        highestRecentSale: sorted[sorted.length - 1].price,
-        sampleSize: sorted.length
-    };
+async function collectJustTcgQuotes(card) {
+    const result = await fetchJustTCGPrice(card.card_name, card.card_set, card.card_number);
+    if (!result?.price) return [];
+    return [{
+        price: result.price,
+        currency: 'USD',
+        marketplace: 'tcgplayer',
+        source: 'justtcg_tcgplayer',
+        variant: result.printing || 'NM',
+        // JustTCG is queried at Near Mint but not per-printing, so it is a
+        // marketplace-level quote rather than a variant-exact one.
+        variantMatched: false,
+        url: result.url || '',
+    }];
 }
 
 async function lookupMarketPrice(card) {
-    const { card_name: cardName, card_set: cardSet, card_number: cardNumber, year, language, holo_type: holoType } = card;
-    if (!cardName) return null;
-    const key = `${cardName}|${cardSet || ''}|${cardNumber || ''}`.toLowerCase();
+    if (!card?.card_name) return null;
 
+    const key = priceCacheKey(card);
     const cached = priceCache.get(key);
-    if (cached && Date.now() - cached.ts < 86400000) return { ...cached };
+    if (cached && Date.now() - cached.ts < PRICE_CACHE_TTL_MS) {
+        const { ts, ...rest } = cached;
+        return { ...rest, cached: true };
+    }
 
+    const ctx = priceContextFor(card);
 
-    // ── Query ALL sources in parallel ────────────────────────────
-    const sourcePromises = [];
+    const collectors = [
+        ['pokemontcg', () => collectPokemonTcgQuotes(card, ctx)],
+        ['tcgdex', () => collectTcgdexQuotes(card, ctx)],
+        ['scrydex', () => collectScrydexQuotes(card, ctx)],
+        ['justtcg', () => collectJustTcgQuotes(card)],
+    ];
 
-    // 1. TCGdex (→ TCGplayer + Cardmarket)
-    sourcePromises.push((async () => {
+    const settled = await Promise.allSettled(collectors.map(async ([name, run]) => {
         try {
-            const tcgdexCard = await fetchTCGdexCard(cardName, cardSet, cardNumber);
-            return extractTcgdexPrice(tcgdexCard, holoType);
-        } catch { return null; }
-    })());
-
-    // 2. PokemonTCG API (always run — most accurate source for TCGplayer market price)
-    if (POKEMON_TCG_KEY) {
-        sourcePromises.push((async () => {
-            try {
-                const candidates = await fetchPokemonTcgCandidates({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year });
-                if (candidates.length) {
-                    const { bestCandidate, bestScore } = pickBestPokemonCardCandidate({ card_name: cardName, card_set: cardSet, card_number: cardNumber, year }, candidates);
-                    if (bestCandidate) {
-                        return extractMarketPriceFromPokemonCandidate(bestCandidate, card);
-                    }
-                }
-                return null;
-            } catch { return null; }
-        })());
-    } else {
-        sourcePromises.push(Promise.resolve(null));
-    }
-
-    // 3. Scrydex API
-    if (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) {
-        sourcePromises.push((async () => {
-            try {
-                const scrydexCard = await fetchScrydexCard(cardName, cardSet, cardNumber);
-                const result = extractScrydexPrice(scrydexCard);
-                if (result) return { ...result, highestRecentSale: result.price, highestRecentSaleSource: result.source, highestRecentSaleUrl: result.url || '' };
-                return null;
-            } catch { return null; }
-        })());
-    } else {
-        sourcePromises.push(Promise.resolve(null));
-    }
-
-    // 4. JustTCG (TCGplayer live pricing)
-    sourcePromises.push((async () => {
-        try { return await fetchJustTCGPrice(cardName, cardSet, cardNumber); }
-        catch { return null; }
-    })());
-
-    // NOTE: All HTML scrapers removed — they returned hallucinated prices.
-    // Price authority order: PokemonTCG API > TCGdex > Scrydex > JustTCG
-
-    // Wait for primary API sources
-    const primaryResults = await Promise.allSettled(sourcePromises);
-
-    // ── Collect all valid prices ────────────────────────────────
-    let validPrices = [];
-    const allSourcePrices = {}; // Per-source price breakdown for the UI
-
-    for (const res of primaryResults) {
-        if (res.status === 'fulfilled' && res.value && res.value.price > 0) {
-            validPrices.push(res.value);
-            allSourcePrices[res.value.source] = {
-                price: res.value.price,
-                url: res.value.url || '',
-                ts: new Date().toISOString()
-            };
+            return await run();
+        } catch (err) {
+            console.error(`  [Pricing] ${name} failed for "${card.card_name}":`, err.message);
+            return [];
         }
-    }
+    }));
 
-    const sourcesChecked = primaryResults.length;
+    const quotes = settled.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+    const result = await aggregateQuotes(quotes, { axios });
 
-    if (validPrices.length > 0) {
-        validPrices.sort((a, b) => a.price - b.price);
-        
-        let refinedPrices = validPrices;
-        
-        if (validPrices.length >= 3) {
-            const median = validPrices[Math.floor(validPrices.length / 2)].price;
-            refinedPrices = validPrices.filter(p => p.price <= median * 3 && p.price >= median * 0.33);
-        } else if (validPrices.length === 2) {
-            // If we only have 2 sources and they wildly disagree, pick the conservative lower price
-            if (validPrices[1].price > validPrices[0].price * 3) {
-                refinedPrices = [validPrices[0]];
-            }
-        }
-
-        if (refinedPrices.length > 0) {
-            const avgPrice = refinedPrices.reduce((sum, p) => sum + p.price, 0) / refinedPrices.length;
-            const bestSource = refinedPrices.find(p => p.url) || refinedPrices[0];
-
-            // Find the best (highest) sold price across all sources
-            const bestSoldPrice = Math.max(...refinedPrices.map(p => p.highestRecentSale || p.price));
-            const bestSoldEntry = refinedPrices.find(p => (p.highestRecentSale || p.price) === bestSoldPrice) || bestSource;
-
-            const finalResult = {
-                price: Number(avgPrice.toFixed(2)),
-                source: refinedPrices.length > 1 ? 'aggregated_market' : bestSource.source,
-                url: bestSource.url || '',
-                highestRecentSale: bestSoldPrice,
-                highestRecentSaleSource: bestSoldEntry.source || 'aggregated_market',
-                highestRecentSaleUrl: bestSoldEntry.url || bestSource.url || '',
-                bestSoldPrice,
-                bestSoldSource: bestSoldEntry.source || '',
-                allSourcePrices,
-                sourcesChecked,
-                sourcesFound: validPrices.length
-            };
-
-            console.log(`  [Pricing] Aggregated for "${cardName}": $${finalResult.price.toFixed(2)} from ${refinedPrices.length}/${sourcesChecked} sources (best sold: $${bestSoldPrice.toFixed(2)})`);
-            priceCache.set(key, { ...finalResult, ts: Date.now() });
-            return finalResult;
-        }
-    }
-
-    if (sourcesChecked >= 5) {
-        console.log(`  [Pricing] No market price found for "${cardName}" (checked ${sourcesChecked} sources). Setting to 0.`);
-        const emptyResult = {
+    if (!result) {
+        console.log(`  [Pricing] No usable quote for "${card.card_name}" (${quotes.length} raw quotes)`);
+        const empty = {
             price: 0,
             source: 'not_found',
             url: '',
-            highestRecentSale: 0,
-            highestRecentSaleSource: '',
-            highestRecentSaleUrl: '',
-            bestSoldPrice: 0,
-            bestSoldSource: '',
+            confidence: 0,
             allSourcePrices: {},
-            sourcesChecked,
-            sourcesFound: 0
+            quotesSeen: quotes.length,
+            quotesUsed: 0,
         };
-        priceCache.set(key, { ...emptyResult, ts: Date.now() });
-        return emptyResult;
+        priceCache.set(key, { ...empty, ts: Date.now() });
+        return empty;
     }
 
-    console.log(`  [Pricing] No market price found for "${cardName}" (checked ${sourcesChecked} sources)`);
-    return null;
+    console.log(
+        `  [Pricing] "${card.card_name}" ${ctx.printing}${ctx.isFirstEdition ? '/1st' : ''} → ` +
+        `$${result.price.toFixed(2)} via ${result.source} ` +
+        `(${result.quotesUsed}/${result.quotesSeen} quotes, confidence ${result.confidence})`
+    );
+
+    priceCache.set(key, { ...result, ts: Date.now() });
+    return result;
 }
-
-// ═══════════════════════════════════════════════════════════════
-//  SCRAPERS (eBay HTML only for price lookups — reliable fallback)
-// ═══════════════════════════════════════════════════════════════
-
-async function scrapeEbayHTML(searchTerm) {
-    const listings = [];
-    try {
-        const encoded = encodeURIComponent(searchTerm);
-        const url = `https://www.ebay.com/sch/i.html?_nkw=${encoded}&LH_Sold=1&LH_Complete=1&_sop=13`;
-        const resp = await axios.get(url, {
-            headers: { 
-                'User-Agent': randomUA(), 
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9'
-            },
-            timeout: 20000,
-        });
-        const $ = cheerio.load(resp.data);
-        $('.s-item__item').each((i, el) => {
-            if (listings.length >= 10) return false;
-            const $el = $(el);
-            const title = $el.find('.s-item__title').text().trim();
-            const text = $el.find('.s-item__price').text();
-            const match = text.match(/\$([\d,.]+)/);
-            if (title && match && !title.includes('Shop on eBay')) {
-                const price = parsePrice(match[1]);
-                if (price > 0.5) listings.push({ title, price });
-            }
-        });
-        return listings;
-    } catch (err) {
-        console.error(`  [eBay-HTML] Error: ${err.message}`);
-        return [];
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════
 //  SSE (Server-Sent Events) for real-time updates
 // ═══════════════════════════════════════════════════════════════
@@ -1526,6 +1313,7 @@ async function refreshBatchPrices(batchSize = 5) {
         const res = await pool.query(`
             SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
             FROM portfolio_cards
+            WHERE COALESCE(needs_review, 0) = 0
             ORDER BY
                 last_price_check ASC NULLS FIRST,
                 CASE WHEN COALESCE(current_price, 0) = 0 THEN 0 ELSE 1 END ASC,
@@ -1548,19 +1336,17 @@ async function refreshBatchPrices(batchSize = 5) {
                 }
 
                 const result = await lookupMarketPrice(card);
-                if (result && result.price >= 0 && result.source) {
-                    if (result.price > 0) {
-                        await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
-                    }
+                if (result && result.price > 0) {
+                    await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
                     await updatePortfolioCardMarketData(card.id, result);
                     updated++;
                 } else {
                     // Still mark as checked so we don't re-check endlessly
-                    await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
+                    await markPriceChecked(card.id);
                 }
             } catch (err) {
                 console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
-                await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
+                await markPriceChecked(card.id);
             }
         }
 
@@ -1581,45 +1367,52 @@ async function refreshAllPrices() {
     console.log('  [PriceRefresh] Starting full price refresh...');
     broadcastActivity('refresh_start', 'Refreshing market prices...');
 
-    const res = await pool.query(`
-        SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
-        FROM portfolio_cards
-        ORDER BY last_price_check ASC NULLS FIRST, id ASC
-    `);
-    const cards = res.rows;
-    let updated = 0;
+    // The flag must be cleared even if the query below throws, or every later
+    // refresh silently short-circuits until the process restarts.
+    try {
+        const res = await pool.query(`
+            SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
+            FROM portfolio_cards
+            WHERE COALESCE(needs_review, 0) = 0
+            ORDER BY last_price_check ASC NULLS FIRST, id ASC
+        `);
+        const cards = res.rows;
+        let updated = 0;
 
-    for (const card of cards) {
-        try {
-            if (!card.image_url || card.image_url.includes('undefined')) {
-                let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
-                if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
-                if (imageUrl) {
-                    await updateCardImageUrl(card.id, imageUrl);
-                    console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
+        for (const card of cards) {
+            try {
+                if (!card.image_url || card.image_url.includes('undefined')) {
+                    let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
+                    if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
+                    if (imageUrl) {
+                        await updateCardImageUrl(card.id, imageUrl);
+                        console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
+                    }
                 }
-            }
 
-            const result = await lookupMarketPrice(card);
-            if (result && result.price > 0) {
-                await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
-                await updatePortfolioCardMarketData(card.id, result);
-                updated++;
-                broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
-            } else {
-                await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [card.id]);
+                const result = await lookupMarketPrice(card);
+                if (result && result.price > 0) {
+                    await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
+                    await updatePortfolioCardMarketData(card.id, result);
+                    updated++;
+                    broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
+                } else {
+                    await markPriceChecked(card.id);
+                }
+                if (!result?.cached) await sleep(1200);
+            } catch (err) {
+                console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
+                await markPriceChecked(card.id).catch(() => {});
             }
-            await sleep(1500);
-        } catch (err) {
-            console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
         }
-    }
 
-    priceRefreshRunning = false;
-    console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
-    broadcastActivity('refresh_complete', `Updated prices for ${updated} cards`);
-    broadcast({ type: 'portfolio_updated' });
-    return { updated, total: cards.length };
+        console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
+        broadcastActivity('refresh_complete', `Updated prices for ${updated} cards`);
+        broadcast({ type: 'portfolio_updated' });
+        return { updated, total: cards.length };
+    } finally {
+        priceRefreshRunning = false;
+    }
 }
 
 // Auto-refresh every 24 hours (only in long-running server mode, not Vercel serverless)
@@ -1685,8 +1478,8 @@ app.get('/api/auth/me', (req, res) => {
 app.get('/api/portfolio', requireAuth, async (req, res) => {
     try {
         const cards = await getAllPortfolioCards(req.user.id);
-        const stats = await getPortfolioStats(req.user.id);
-        res.json({ cards, stats });
+        const stats = computePortfolioStats(cards);
+        res.json({ cards, stats, pricing: { fx: fxStatus(), conditions: CONDITIONS } });
     } catch (err) {
         console.error('Portfolio fetch error:', err);
         res.status(500).json({ error: err.message });
@@ -1730,21 +1523,193 @@ app.delete('/api/portfolio/:id', requireAuth, async (req, res) => {
     }
 });
 
-// Edit card details (set, number, etc)
+/**
+ * Correct a card's identity and immediately re-price it.
+ *
+ * Editing printing fields (holo type, 1st edition, language) matters as much as
+ * the name: they are what selects the price bucket. The previous version called
+ * updatePortfolioCardMarketData with an empty object, which zeroed the price
+ * instead of refreshing it.
+ */
 app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res) => {
+    const cardId = parseInt(req.params.id, 10);
     try {
-        const { card_name, card_set, card_number } = req.body;
-        await pool.query(
-            `UPDATE portfolio_cards SET card_name = $1, card_set = $2, card_number = $3, last_price_check = NULL WHERE id = $4 AND user_id = $5`,
-            [card_name, card_set, card_number, parseInt(req.params.id), req.user.id]
-        );
-        // Delete history so we start fresh with the new card variant
-        await pool.query(`DELETE FROM price_history WHERE card_id = $1`, [parseInt(req.params.id)]);
-        // Trigger a background refresh for this specific card
-        updatePortfolioCardMarketData(parseInt(req.params.id), {}).catch(err => console.error("Edit Refresh Error:", err));
-        res.json({ success: true });
+        const current = await pool.query('SELECT * FROM portfolio_cards WHERE id = $1 AND user_id = $2', [cardId, req.user.id]);
+        if (!current.rows.length) return res.status(404).json({ error: 'Card not found' });
+        const before = current.rows[0];
+
+        const merged = {
+            card_name: req.body.card_name ?? before.card_name,
+            card_set: req.body.card_set ?? before.card_set,
+            card_number: req.body.card_number ?? before.card_number,
+            holo_type: req.body.holo_type ?? before.holo_type,
+            language: req.body.language ?? before.language,
+            rarity: req.body.rarity ?? before.rarity,
+            is_first_edition: req.body.is_first_edition !== undefined
+                ? (req.body.is_first_edition ? 1 : 0)
+                : before.is_first_edition,
+            is_holo: req.body.is_holo !== undefined ? (req.body.is_holo ? 1 : 0) : before.is_holo,
+        };
+        const variantKey = buildVariantKey(merged);
+        const identityChanged = variantKey !== before.variant_key;
+
+        await pool.query(`
+            UPDATE portfolio_cards
+            SET card_name = $2, card_set = $3, card_number = $4, holo_type = $5,
+                language = $6, rarity = $7, is_first_edition = $8, is_holo = $9,
+                variant_key = $10, needs_review = 0, last_price_check = NULL
+            WHERE id = $1 AND user_id = $11
+        `, [
+            cardId, merged.card_name, merged.card_set, merged.card_number, merged.holo_type,
+            merged.language, merged.rarity, merged.is_first_edition, merged.is_holo,
+            variantKey, req.user.id,
+        ]);
+
+        // Price history belongs to the old printing; keep it only if the
+        // identity is unchanged (e.g. a typo fix in the set name).
+        if (identityChanged) {
+            await pool.query('DELETE FROM price_history WHERE card_id = $1', [cardId]);
+        }
+
+        const market = await lookupMarketPrice(merged);
+        if (market && market.price > 0) {
+            await insertPricePoint(cardId, market.price, market.source, market.url || '');
+            await updatePortfolioCardMarketData(cardId, market);
+        } else {
+            await markPriceChecked(cardId);
+        }
+
+        broadcast({ type: 'portfolio_updated' });
+        res.json({
+            success: true,
+            identityChanged,
+            price: market?.price || 0,
+            source: market?.source || 'not_found',
+            confidence: market?.confidence || 0,
+        });
     } catch (err) {
         console.error('Edit error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Copies (duplicates) ──
+
+app.get('/api/portfolio/:id/copies', requireAuth, async (req, res) => {
+    try {
+        res.json({ copies: await getCardCopies(parseInt(req.params.id, 10)) });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/** Record another physical copy of a card already held. */
+app.post('/api/portfolio/:id/copies', requireAuth, express.json(), async (req, res) => {
+    const cardId = parseInt(req.params.id, 10);
+    try {
+        const owned = await pool.query('SELECT id FROM portfolio_cards WHERE id = $1 AND user_id = $2', [cardId, req.user.id]);
+        if (!owned.rows.length) return res.status(404).json({ error: 'Card not found' });
+
+        await addCardCopy(cardId, req.body || {});
+        const copies = await getCardCopies(cardId);
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, copies, quantity: copies.length });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/api/portfolio/copies/:copyId', requireAuth, express.json(), async (req, res) => {
+    const copyId = parseInt(req.params.copyId, 10);
+    try {
+        const owned = await pool.query(
+            `SELECT cc.id, cc.card_id FROM card_copies cc
+             JOIN portfolio_cards pc ON pc.id = cc.card_id
+             WHERE cc.id = $1 AND pc.user_id = $2`,
+            [copyId, req.user.id]
+        );
+        if (!owned.rows.length) return res.status(404).json({ error: 'Copy not found' });
+
+        const b = req.body || {};
+        await pool.query(`
+            UPDATE card_copies
+            SET condition      = COALESCE($2, condition),
+                grade          = COALESCE($3, grade),
+                grader         = COALESCE($4, grader),
+                manual_value   = COALESCE($5, manual_value),
+                acquired_price = COALESCE($6, acquired_price),
+                notes          = COALESCE($7, notes)
+            WHERE id = $1
+        `, [
+            copyId,
+            b.condition !== undefined ? canonicalCondition(b.condition) : null,
+            b.grade !== undefined ? String(b.grade) : null,
+            b.grader !== undefined ? String(b.grader) : null,
+            b.manual_value !== undefined ? Number(b.manual_value) || 0 : null,
+            b.acquired_price !== undefined ? Number(b.acquired_price) || 0 : null,
+            b.notes !== undefined ? String(b.notes) : null,
+        ]);
+
+        const copies = await getCardCopies(owned.rows[0].card_id);
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, copies, quantity: copies.length });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Remove one physical copy. Removing the last copy removes the card itself —
+ * owning zero of something is not a holding.
+ */
+app.delete('/api/portfolio/copies/:copyId', requireAuth, async (req, res) => {
+    const copyId = parseInt(req.params.copyId, 10);
+    try {
+        const owned = await pool.query(
+            `SELECT cc.id, cc.card_id FROM card_copies cc
+             JOIN portfolio_cards pc ON pc.id = cc.card_id
+             WHERE cc.id = $1 AND pc.user_id = $2`,
+            [copyId, req.user.id]
+        );
+        if (!owned.rows.length) return res.status(404).json({ error: 'Copy not found' });
+        const cardId = owned.rows[0].card_id;
+
+        await pool.query('DELETE FROM card_copies WHERE id = $1', [copyId]);
+        const remaining = await getCardCopies(cardId);
+        if (!remaining.length) {
+            await deletePortfolioCard(cardId, req.user.id);
+        }
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, quantity: remaining.length, cardRemoved: remaining.length === 0 });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Duplicate consolidation ──
+
+/**
+ * Cards added before the copies model exist as separate rows. This reports what
+ * would be merged; nothing is changed until POST /merge-duplicates is called.
+ */
+app.get('/api/portfolio/duplicates', requireAuth, async (req, res) => {
+    try {
+        res.json({ groups: await findDuplicateGroups(req.user.id) });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/portfolio/merge-duplicates', requireAuth, express.json(), async (req, res) => {
+    try {
+        if (req.body?.confirm !== true) {
+            return res.status(400).json({ error: 'Refusing to merge without confirm:true' });
+        }
+        const result = await mergeDuplicateGroups(req.user.id, req.body?.variantKeys);
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('Merge error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1752,7 +1717,7 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
 // Manually trigger price refresh
 app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
     try {
-        res.json({ success: true, message: 'Price refresh started (12 sources).' });
+        res.json({ success: true, message: 'Refreshing prices…' });
         if (IS_VERCEL) {
             // On Vercel, do a small batch synchronously
             refreshBatchPrices(5).catch(err => console.error('Manual refresh error:', err));
@@ -1804,14 +1769,25 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
 });
 
 
-// Ensure the `lastInsertRowid` is mapped correctly (sqlite vs pg)
-async function processPortfolioUpload(files, userId) {
+/**
+ * Turn uploaded photos into portfolio entries.
+ *
+ * Two behaviours worth calling out:
+ *
+ * 1. A scan of a card already in the collection adds a *copy*, not a second row.
+ *    Jack has duplicates; the collection should say "x3", not list Charizard
+ *    three times.
+ *
+ * 2. A card the TCG database cannot confirm is no longer thrown away. It is
+ *    saved with needs_review set and the AI's best guess intact, so a photo you
+ *    took never silently vanishes. You confirm or correct it in the app.
+ */
+async function processPortfolioUpload(files, userId, options = {}) {
+    const results = [];
     let totalAdded = 0;
-    const addedCards = [];
 
     broadcastActivity('analyzing', `Scanning ${files.length} photo${files.length > 1 ? 's' : ''} with AI...`);
 
-    // 1. Analyze images sequentially (prevents OOM on Render free tier)
     for (let index = 0; index < files.length; index++) {
         const file = files[index];
         broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
@@ -1821,7 +1797,6 @@ async function processPortfolioUpload(files, userId) {
             buffer = readFileSync(file.path);
             let sendMime = file.mimetype;
 
-            // Immediately convert raw/unsupported formats to JPEG so resizing/AI both work
             if (!GEMINI_SUPPORTED_TYPES.has(sendMime)) {
                 console.log(`  [Vision] Converting ${sendMime} → JPEG for Gemini & Sharp...`);
                 const converted = await convertToJpeg(buffer, file.path);
@@ -1833,7 +1808,6 @@ async function processPortfolioUpload(files, userId) {
 
             analysis = await analyzeImageBuffer(buffer, sendMime);
 
-            // Create thumbnail
             try {
                 const thumbBuffer = await sharp(buffer)
                     .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
@@ -1846,127 +1820,176 @@ async function processPortfolioUpload(files, userId) {
         } catch (err) {
             console.error(`Photo ${index + 1} error:`, err.message);
             try { rmSync(file.path, { force: true }); } catch { }
+            results.push({ status: 'error', reason: 'unreadable', message: 'Could not read that image.' });
             continue;
         }
 
-        if (analysis?.is_pokemon_card === false || !analysis?.cards?.length) {
-            broadcastActivity('info', `No Pokemon card detected in photo ${index + 1}.`);
-            continue;
-        }
-
-        const verifiedCards = [];
-        for (const rawCard of analysis.cards) {
-            const verifiedCard = await verifyAndCanonicalizeCard(rawCard);
-            if (verifiedCard) verifiedCards.push(verifiedCard);
-        }
-
-        if (!verifiedCards.length) {
-            broadcastActivity('info', `Could not confidently verify a Pokemon card in photo ${index + 1}.`);
-            continue;
-        }
-
-        broadcastActivity('found', `Verified ${verifiedCards.length} card(s) in photo ${index + 1}`);
-
-        for (const card of verifiedCards) {
-            // Look up official card image from TCGdex, fallback to Pokemon TCG API
-            let imageUrl = card.image_url || '';
-            try {
-                if (!imageUrl) {
-                    imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
-                }
-                if (!imageUrl) {
-                    imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number) || '';
-                }
-            } catch { /* continue without image */ }
-
-            // Inline synchronous market price fetch
-            let finalPrice = 0;
-            let finalSource = 'unpriced';
-            let finalUrl = '';
-            let finalHighestRecentSale = 0;
-            let finalHighestRecentSaleSource = '';
-            let finalHighestRecentSaleUrl = '';
-            try {
-                const priceResult = card.verified_market_data || await lookupMarketPrice(card);
-                if (priceResult && priceResult.price > 0) {
-                    finalPrice = priceResult.price;
-                    finalSource = priceResult.source;
-                    finalUrl = priceResult.url || '';
-                    finalHighestRecentSale = priceResult.highestRecentSale || priceResult.price || 0;
-                    finalHighestRecentSaleSource = priceResult.highestRecentSaleSource || priceResult.source || '';
-                    finalHighestRecentSaleUrl = priceResult.highestRecentSaleUrl || priceResult.url || '';
-                }
-            } catch (err) {
-                console.error(`  [Pricing] Error fetching inline price for ${card.card_name}:`, err.message);
-            }
-
-            const cardId = await insertPortfolioCard({
-                card_name: card.card_name,
-                card_set: card.card_set || '',
-                card_number: card.card_number || '',
-                rarity: card.rarity || 'Unknown',
-                condition: card.condition_estimate || 'Unknown',
-                is_holo: card.is_holographic || false,
-                is_first_edition: card.is_first_edition || false,
-                confidence: card.confidence || 0,
+        if (!analysis?.cards?.length || analysis?.is_pokemon_card === false) {
+            broadcastActivity('info', `No Pokémon card detected in photo ${index + 1}.`);
+            results.push({
+                status: 'rejected',
+                reason: 'no_card',
+                message: 'No Pokémon card found in the frame. Fill more of the frame with the card and avoid glare.',
                 image_data: thumbDataUrl,
-                image_url: imageUrl,
-                notes: card.notes || '',
-                year: card.year || 0,
-                language: card.language || 'English',
-                holo_type: card.holo_type || 'Unknown',
-                highest_recent_sale: finalHighestRecentSale,
-                highest_recent_sale_source: finalHighestRecentSaleSource,
-                highest_recent_sale_url: finalHighestRecentSaleUrl
-            }, userId);
+            });
+            continue;
+        }
 
-            if (finalPrice > 0) {
-                await insertPricePoint(cardId, finalPrice, finalSource, finalUrl);
-                await updatePortfolioCardMarketData(cardId, {
-                    price: finalPrice,
-                    source: finalSource,
-                    url: finalUrl,
-                    highestRecentSale: finalHighestRecentSale,
-                    highestRecentSaleSource: finalHighestRecentSaleSource,
-                    highestRecentSaleUrl: finalHighestRecentSaleUrl
-                });
+        for (const rawCard of analysis.cards) {
+            const verified = await verifyAndCanonicalizeCard(rawCard);
+            const card = verified || { ...rawCard, needs_review: true };
+
+            if (!verified) {
+                if (!hasMeaningfulCardName(card.card_name)) {
+                    results.push({
+                        status: 'rejected',
+                        reason: 'unreadable_card',
+                        message: 'Could not read the card name. Try again with less glare.',
+                        image_data: thumbDataUrl,
+                    });
+                    continue;
+                }
+                broadcastActivity('info', `Saved "${card.card_name}" for review — could not confirm it in the card database.`);
             }
+
+            const saved = await saveScannedCard(card, {
+                userId,
+                thumbDataUrl,
+                needsReview: !verified,
+                forceSeparate: options.forceSeparate === true,
+            });
 
             totalAdded++;
-
-            const finalCardData = {
-                id: cardId,
-                card_name: card.card_name,
-                card_set: card.card_set || '',
-                card_number: card.card_number || '',
-                rarity: card.rarity || 'Unknown',
-                condition: card.condition_estimate || 'Unknown',
-                is_holo: card.is_holographic || false,
-                is_first_edition: card.is_first_edition || false,
-                confidence: card.confidence || 0,
-                image_url: imageUrl || '',
-                image_data: thumbDataUrl || '',
-                current_price: finalPrice,
-                estimated_value: finalPrice,
-                price_source: finalSource,
-                price_source_url: finalUrl,
-                highest_recent_sale: finalHighestRecentSale,
-                highest_recent_sale_source: finalHighestRecentSaleSource,
-                highest_recent_sale_url: finalHighestRecentSaleUrl,
-            };
-
-            addedCards.push(finalCardData);
-
-            // Stream the newly found card to the frontend immediately!
-            broadcastActivity('card_added_detail', `✅ ${card.card_name}`, finalCardData);
+            results.push(saved);
+            broadcastActivity('card_added_detail', `${saved.is_new_copy ? '➕' : '✅'} ${saved.card_name}`, saved);
             broadcast({ type: 'card_added' });
         }
     }
 
-    broadcastActivity('upload_complete', `Added ${totalAdded} card${totalAdded !== 1 ? 's' : ''} to your portfolio!`);
+    const added = results.filter(r => r.status === 'added');
+    broadcastActivity('upload_complete', `Added ${added.length} card${added.length !== 1 ? 's' : ''} to your collection.`);
 
+    return { totalAdded, cards: added, results };
+}
 
-    return { totalAdded, cards: addedCards };
+/**
+ * Persist one identified card: either as a new printing or as another copy of a
+ * printing already held.
+ */
+async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceSeparate }) {
+    const variantKey = buildVariantKey(card);
+    const existing = forceSeparate ? null : await findCardByVariant(variantKey, userId);
+
+    if (existing) {
+        const copy = await addCardCopy(existing.id, {
+            condition: card.condition_estimate || card.condition,
+            image_data: thumbDataUrl,
+            notes: card.notes || '',
+        });
+        const copies = await getCardCopies(existing.id);
+        const unitPrice = Number(existing.current_price) || 0;
+
+        return {
+            status: 'added',
+            is_new_copy: true,
+            id: existing.id,
+            copy_id: copy.id,
+            quantity: copies.length,
+            card_name: existing.card_name,
+            card_set: existing.card_set,
+            card_number: existing.card_number,
+            rarity: existing.rarity,
+            condition: copy.condition,
+            image_url: existing.image_url || '',
+            image_data: thumbDataUrl || '',
+            current_price: unitPrice,
+            unit_price: unitPrice,
+            total_value: Number(copies.reduce((sum, c) => sum + copyValue(unitPrice, c), 0).toFixed(2)),
+            price_source: existing.price_source || '',
+            price_confidence: Number(existing.price_confidence) || 0,
+            needs_review: Boolean(existing.needs_review),
+            message: `Copy ${copies.length} of ${existing.card_name}`,
+        };
+    }
+
+    let imageUrl = card.image_url || '';
+    try {
+        if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
+        if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number) || '';
+    } catch { /* the scan photo stands in until a refresh finds artwork */ }
+
+    const cardId = await insertPortfolioCard({
+        card_name: card.card_name,
+        card_set: card.card_set || '',
+        card_number: card.card_number || '',
+        rarity: card.rarity || 'Unknown',
+        condition: card.condition_estimate || card.condition,
+        is_holo: card.is_holographic || card.is_holo || false,
+        is_first_edition: card.is_first_edition || false,
+        confidence: card.confidence || 0,
+        image_data: thumbDataUrl,
+        image_url: imageUrl,
+        notes: card.notes || '',
+        year: card.year || 0,
+        language: card.language || 'English',
+        holo_type: card.holo_type || 'Unknown',
+        needs_review: needsReview,
+    }, userId);
+
+    await addCardCopy(cardId, {
+        condition: card.condition_estimate || card.condition,
+        image_data: thumbDataUrl,
+        notes: card.notes || '',
+    });
+
+    // Unverified cards are not priced: without a confirmed printing any number
+    // would be a guess, and a guessed price is worse than no price.
+    let market = null;
+    if (!needsReview) {
+        try {
+            market = await lookupMarketPrice(card);
+        } catch (err) {
+            console.error(`  [Pricing] Inline lookup failed for ${card.card_name}:`, err.message);
+        }
+    }
+
+    if (market && market.price > 0) {
+        await insertPricePoint(cardId, market.price, market.source, market.url || '');
+        await updatePortfolioCardMarketData(cardId, market);
+    } else {
+        await markPriceChecked(cardId);
+    }
+
+    const unitPrice = market?.price || 0;
+    const condition = canonicalCondition(card.condition_estimate || card.condition);
+
+    return {
+        status: 'added',
+        is_new_copy: false,
+        id: cardId,
+        quantity: 1,
+        card_name: card.card_name,
+        card_set: card.card_set || '',
+        card_number: card.card_number || '',
+        rarity: card.rarity || 'Unknown',
+        condition,
+        is_holo: Boolean(card.is_holographic || card.is_holo),
+        is_first_edition: Boolean(card.is_first_edition),
+        confidence: card.confidence || 0,
+        image_url: imageUrl || '',
+        image_data: thumbDataUrl || '',
+        current_price: unitPrice,
+        unit_price: unitPrice,
+        total_value: Number(copyValue(unitPrice, { condition }).toFixed(2)),
+        price_source: market?.source || 'unpriced',
+        price_source_url: market?.url || '',
+        price_confidence: market?.confidence || 0,
+        price_marketplace: market?.marketplace || '',
+        needs_review: Boolean(needsReview),
+        message: needsReview
+            ? `Saved "${card.card_name}" for review — not found in the card database`
+            : undefined,
+    };
 }
 
 
@@ -1999,21 +2022,33 @@ app.get('/api/cron/refresh-prices', async (req, res) => {
     }
 });
 
-// Get per-source price breakdown for a card
+/**
+ * Everything behind a card's price: every quote we received (in its own currency
+ * and in USD), which ones were used, and how confident the result is.
+ */
 app.get('/api/portfolio/:id/prices', requireAuth, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT price_sources, best_sold_price, best_sold_source, current_price, price_source FROM portfolio_cards WHERE id = $1',
-            [parseInt(req.params.id)]
-        );
+        const result = await pool.query(`
+            SELECT price_sources, current_price, price_source, price_source_url,
+                   price_confidence, price_marketplace, price_variant,
+                   price_variant_matched, price_low, price_high, last_price_check
+            FROM portfolio_cards WHERE id = $1 AND user_id = $2
+        `, [parseInt(req.params.id, 10), req.user.id]);
         if (!result.rows.length) return res.status(404).json({ error: 'Card not found' });
         const card = result.rows[0];
         res.json({
             sources: card.price_sources || {},
-            bestSoldPrice: card.best_sold_price || 0,
-            bestSoldSource: card.best_sold_source || '',
-            currentPrice: card.current_price || 0,
-            priceSource: card.price_source || ''
+            currentPrice: Number(card.current_price) || 0,
+            priceSource: card.price_source || '',
+            priceSourceUrl: card.price_source_url || '',
+            confidence: Number(card.price_confidence) || 0,
+            marketplace: card.price_marketplace || '',
+            variant: card.price_variant || '',
+            variantMatched: Boolean(card.price_variant_matched),
+            low: Number(card.price_low) || 0,
+            high: Number(card.price_high) || 0,
+            checkedAt: card.last_price_check,
+            fx: fxStatus(),
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -2027,25 +2062,26 @@ app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
 //  START
 // ═══════════════════════════════════════════════════════════════
 
+const PRICE_SOURCES = [
+    ['Pokemon TCG API', true, POKEMON_TCG_KEY ? 'key loaded' : 'no key (lower rate limit)'],
+    ['TCGdex API', true, 'free, no key required'],
+    ['Scrydex API', Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), 'set SCRYDEX_API_KEY + SCRYDEX_TEAM_ID'],
+    ['JustTCG API', Boolean(JUSTTCG_API_KEY), 'set JUSTTCG_API_KEY'],
+];
+
 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  ⚡ Jack's Pokemon Portfolio Tracker v4          ║
-║  Multi-Source Price Comparison (12 Sources)      ║
+║  ⚡ Jack's Pokemon Portfolio Tracker              ║
 ╚══════════════════════════════════════════════════╝
 `);
-console.log('📊 Price Sources:');
-console.log('   TCGdex API:      ✅ Enabled (free, no key)');
-console.log('   JustTCG API:    ', JUSTTCG_API_KEY ? '✅ Key loaded' : '⚠️  No key — add JUSTTCG_API_KEY');
-console.log('   Pokemon TCG API:', POKEMON_TCG_KEY ? '✅ Key loaded' : '⚠️  No key — add POKEMON_TCG_KEY');
-console.log('   Scrydex API:    ', (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) ? '✅ Enabled' : '⚠️  No credentials');
-console.log('   eBay Scraper:    ✅ Enabled');
-console.log('   TCGplayer:       ✅ Enabled (scraper)');
-console.log('   Cardmarket:      ✅ Enabled (scraper)');
-console.log('   Troll and Toad:  ✅ Enabled (scraper)');
-console.log('   TCGFish:         ✅ Enabled (scraper)');
-console.log('   Card Mavin:      ✅ Enabled (scraper)');
-console.log('   CoolStuffInc:    ✅ Enabled (scraper)');
-console.log('   PriceCharting:   ✅ Enabled (scraper)');
+console.log('📊 Price sources (all quotes normalised to USD, Near Mint):');
+for (const [name, enabled, note] of PRICE_SOURCES) {
+    console.log(`   ${name.padEnd(16)} ${enabled ? '✅' : '⚠️ '} ${note}`);
+}
+const liveSources = PRICE_SOURCES.filter(([, enabled]) => enabled).length;
+if (liveSources < 2) {
+    console.log('   ⚠️  Only one price source is live — prices will have low confidence.');
+}
 
 // Only start listening in non-Vercel (long-running server) mode
 if (!IS_VERCEL) {

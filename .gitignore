@@ -1,5 +1,9 @@
 node_modules
 .env
+.env.*
+!.env.example
 data/
 *.db
 .vercel
+vars.txt
+*.secrets

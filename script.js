@@ -16,6 +16,7 @@ const state = {
   query: '',
   openCardId: null,
   chartDays: 30,
+  heroRange: 30,
   scanQueue: 0,
   scanned: [],
 };
@@ -188,7 +189,7 @@ document.querySelectorAll('[data-theme-set]').forEach((b) => {
 
 // ── NAVIGATION ───────────────────────────────────────────────────
 
-const VIEW_TITLES = { collection: 'Collection', review: 'Needs review', settings: 'Settings' };
+const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Needs review', settings: 'Settings' };
 
 function showView(name) {
   if (name === 'scan') { openScanner(); return; }
@@ -205,6 +206,7 @@ document.querySelectorAll('[data-view]').forEach((b) => {
   b.addEventListener('click', () => showView(b.dataset.view));
 });
 $('railScanBtn').addEventListener('click', openScanner);
+$('lensBtn').addEventListener('click', openScanner);
 
 // ── SEARCH / SORT / LAYOUT ───────────────────────────────────────
 
@@ -263,12 +265,17 @@ function render() {
   renderStats();
   renderCounts();
   if (state.view === 'review') renderReview();
+  else if (state.view === 'sets') renderSets();
   else renderCollection();
 }
 
 function renderCounts() {
   const reviewCount = state.cards.filter((c) => c.needs_review).length;
   $('navCollectionCount').textContent = state.stats.totalCopies ?? 0;
+
+  const setCount = new Set(state.cards.filter(c => !c.needs_review).map(c => c.card_set || 'Unknown set')).size;
+  const navSets = $('navSetsCount');
+  if (navSets) navSets.textContent = setCount;
 
   const navReview = $('navReviewCount');
   navReview.hidden = reviewCount === 0;
@@ -294,23 +301,6 @@ function renderCounts() {
 
 function renderStats() {
   const s = state.stats;
-  const change = pct(s.totalValue, s.prevValue);
-  const delta = (s.totalValue || 0) - (s.prevValue || 0);
-
-  const tiles = [
-    // The total stays monochrome; only the movement is coloured. A four-figure
-    // number in red every time the market dips down 0.2% reads as an alarm.
-    {
-      label: 'Collection value',
-      value: moneyShort(s.totalValue || 0),
-      sub: s.prevValue ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta)).slice(1)} today` : 'Tracking from today',
-      subCls: s.prevValue ? trendClass(change) : undefined,
-    },
-    { label: 'Cards held', value: String(s.totalCopies || 0), sub: `${s.totalCards || 0} unique printing${s.totalCards === 1 ? '' : 's'}` },
-    { label: 'Duplicates', value: String(s.duplicateCards || 0), sub: s.duplicateCards ? 'owned more than once' : 'no repeats yet' },
-    { label: 'Unpriced', value: String(s.unpricedCopies || 0), sub: s.unpricedCopies ? 'no market data found' : 'every card is priced', cls: s.unpricedCopies ? 'flat' : undefined },
-  ];
-
   const unverified = s.unverifiedPrices || 0;
   const banner = $('unverifiedBanner');
   banner.hidden = unverified === 0;
@@ -320,18 +310,173 @@ function renderStats() {
     $('unverifiedBannerText').textContent =
       'These were set by an earlier version that did not record where the number came from. Re-pricing checks them against the marketplaces and shows the evidence.';
   }
+  renderHero();
+}
 
-  const wrap = $('stats');
-  wrap.innerHTML = '';
-  for (const t of tiles) {
-    const tile = el('div', 'stat glass');
-    tile.append(el('div', 'stat-label', t.label));
-    tile.append(el('div', `stat-value ${t.cls || ''}`.trim(), t.value));
-    tile.append(el('div', `stat-sub ${t.subCls || ''}`.trim(), t.sub));
-    wrap.appendChild(tile);
+/**
+ * Reconstruct what the whole collection was worth on each of the last N days.
+ *
+ * Each card only records a price when it is checked, so for any given day we
+ * take the most recent price at or before that day and value every copy of the
+ * card at it. A card is worth nothing to the total before its first recorded
+ * price — otherwise adding a card would look like the market moving.
+ */
+function portfolioSeries(days) {
+  const priced = state.cards.filter(c => (c.price_history || []).length);
+  if (!priced.length) return [];
+
+  // Rather than repeat the condition table here, derive each card's multiplier
+  // from figures the server already sent: copies priced off the market scale
+  // with it, copies with a hand-set value do not.
+  const prepared = priced.map(card => {
+    const unit = Number(card.unit_price) || 0;
+    const copies = card.copies || [];
+    const fixed = copies.filter(c => Number(c.manual_value) > 0)
+      .reduce((sum, c) => sum + Number(c.value || 0), 0);
+    const scaling = copies.filter(c => !(Number(c.manual_value) > 0))
+      .reduce((sum, c) => sum + Number(c.value || 0), 0);
+    return {
+      fixed,
+      factor: unit > 0 ? scaling / unit : 0,
+      points: (card.price_history || [])
+        .map(h => ({ t: new Date(h.recorded_at).getTime(), v: Number(h.price) }))
+        .filter(p => p.v > 0 && Number.isFinite(p.t))
+        .sort((a, b) => a.t - b.t),
+    };
+  }).filter(c => c.points.length);
+
+  const earliest = Math.min(...prepared.map(c => c.points[0].t));
+  const now = Date.now();
+  const span = days > 0 ? Math.min(days, Math.ceil((now - earliest) / 86400000) + 1) : Math.ceil((now - earliest) / 86400000) + 1;
+  const buckets = Math.min(Math.max(span, 2), 120);
+  const step = Math.max((now - Math.max(earliest, now - span * 86400000)) / (buckets - 1), 1);
+  const from = now - step * (buckets - 1);
+
+  const series = [];
+  for (let i = 0; i < buckets; i++) {
+    const t = from + step * i;
+    let total = 0;
+    for (const card of prepared) {
+      // Before a card's first recorded price, value it at that first price.
+      // The chart answers "how has what Jack owns moved?" — if cards blinked
+      // into existence as they were scanned, the line would show him adding
+      // cards and call it a 4,000% gain.
+      let unit = card.points[0].v;
+      for (const p of card.points) {
+        if (p.t <= t) unit = p.v; else break;
+      }
+      total += unit * card.factor + card.fixed;
+    }
+    series.push({ t, v: Number(total.toFixed(2)) });
+  }
+  return series.filter(p => p.v > 0);
+}
+
+function renderHero() {
+  const s = state.stats;
+  $('heroValue').textContent = money(s.totalValue || 0);
+
+  const series = portfolioSeries(state.heroRange);
+  const first = series.length ? series[0].v : null;
+  const last = series.length ? series[series.length - 1].v : null;
+  const windowChange = first && last ? ((last - first) / first) * 100 : null;
+  const windowDelta = first && last ? last - first : null;
+
+  const changeEl = $('heroChange');
+  changeEl.innerHTML = '';
+  if (windowChange === null) {
+    changeEl.append(el('span', 'muted', 'Tracking starts as prices are recorded'));
+  } else {
+    const label = state.heroRange === 0 ? 'all time' : `past ${state.heroRange} days`;
+    changeEl.append(
+      el('span', trendClass(windowChange), `${windowDelta >= 0 ? '+' : '−'}${money(Math.abs(windowDelta)).slice(1)}`),
+      el('span', trendClass(windowChange), trendText(windowChange)),
+      el('span', 'muted', label),
+    );
   }
 
+  const chartHost = $('heroChart');
+  chartHost.innerHTML = '';
+  chartHost.appendChild(series.length >= 2
+    ? areaChart(series, windowChange === null || windowChange >= 0)
+    : el('div', 'empty-note', 'The value chart fills in as daily prices are recorded.'));
+
+  const facts = $('heroFacts');
+  facts.innerHTML = '';
+  const items = [
+    [String(s.totalCopies || 0), `card${s.totalCopies === 1 ? '' : 's'}`, false],
+    [String(s.totalCards || 0), 'unique', false],
+    [String(s.duplicateCards || 0), 'duplicated', false],
+  ];
+  if (s.unpricedCopies) items.push([String(s.unpricedCopies), 'unpriced', true]);
+  if (s.needsReview) items.push([String(s.needsReview), 'to review', true]);
+
+  for (const [value, label, alert] of items) {
+    const fact = el('div', `hero-fact${alert ? ' alert' : ''}`);
+    fact.append(el('b', null, value), el('span', null, label));
+    facts.appendChild(fact);
+  }
 }
+
+/** Wide area chart for the hero. Emphasised endpoint, no axes — the figure
+ *  above carries the number; the chart carries the shape. */
+function areaChart(points, rising) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const W = 700, H = 92;
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  const values = points.map(p => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || Math.max(max * 0.08, 1);
+  const x = (i) => (i / (points.length - 1)) * W;
+  const y = (v) => 10 + (1 - (v - min) / range) * (H - 22);
+
+  const stroke = rising ? 'var(--up)' : 'var(--down)';
+  const id = `h${Math.random().toString(36).slice(2, 8)}`;
+
+  const defs = document.createElementNS(NS, 'defs');
+  const grad = document.createElementNS(NS, 'linearGradient');
+  grad.setAttribute('id', id);
+  grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+  grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+  const s1 = document.createElementNS(NS, 'stop');
+  s1.setAttribute('offset', '0%'); s1.setAttribute('stop-color', stroke); s1.setAttribute('stop-opacity', '0.22');
+  const s2 = document.createElementNS(NS, 'stop');
+  s2.setAttribute('offset', '100%'); s2.setAttribute('stop-color', stroke); s2.setAttribute('stop-opacity', '0');
+  grad.append(s1, s2);
+  defs.appendChild(grad);
+  svg.appendChild(defs);
+
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(' ');
+
+  const area = document.createElementNS(NS, 'path');
+  area.setAttribute('d', `${line} L${W} ${H} L0 ${H} Z`);
+  area.setAttribute('fill', `url(#${id})`);
+  svg.appendChild(area);
+
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', line);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', stroke);
+  path.setAttribute('stroke-width', '2');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('vector-effect', 'non-scaling-stroke');
+  svg.appendChild(path);
+
+  return svg;
+}
+
+document.querySelectorAll('#heroRanges button').forEach((b) => {
+  b.addEventListener('click', () => {
+    state.heroRange = Number(b.dataset.range);
+    document.querySelectorAll('#heroRanges button').forEach(x => x.classList.toggle('active', x === b));
+    renderHero();
+  });
+});
 
 /**
  * The merge banner only appears when there is actually something to merge.
@@ -493,7 +638,9 @@ function gridOf(cards) {
     const body = el('div', 'card-body');
     body.append(
       el('div', 'card-name', card.card_name || 'Unknown'),
-      el('div', 'card-meta', [card.card_set, card.card_number].filter(Boolean).join(' · ') || '—'),
+      // Number first: it is short and it identifies the printing, so when the
+      // line truncates the useful half survives.
+      el('div', 'card-meta', [card.card_number, card.card_set].filter(Boolean).join(' · ') || '—'),
     );
 
     const priceRow = el('div', 'card-price-row');
@@ -548,6 +695,88 @@ function listOf(cards) {
     list.appendChild(row);
   }
   return list;
+}
+
+/**
+ * The collection grouped by set — the closest thing here to a Pokédex page.
+ * Tapping a set searches for it, which reuses the filtering the grid already
+ * does rather than inventing a second way to narrow the collection.
+ */
+function renderSets() {
+  const host = $('setsBody');
+  host.innerHTML = '';
+
+  const groups = new Map();
+  for (const card of state.cards) {
+    if (card.needs_review) continue;
+    const name = card.card_set || 'Unknown set';
+    if (!groups.has(name)) groups.set(name, { name, cards: [], copies: 0, value: 0 });
+    const g = groups.get(name);
+    g.cards.push(card);
+    g.copies += card.quantity;
+    g.value += card.total_value;
+  }
+
+  let sets = [...groups.values()].sort((a, b) => b.value - a.value);
+  if (state.query) sets = sets.filter(g => g.name.toLowerCase().includes(state.query));
+
+  if (state.query && !sets.length) {
+    host.appendChild(emptyState(icon('search'), 'No sets match that', `Nothing matches “${state.query}”.`));
+    return;
+  }
+
+  if (!sets.length) {
+    host.appendChild(emptyState(icon('card'), 'No sets yet',
+      'Scan a few cards and they will be grouped by the set they came from.',
+      'Scan a card', openScanner));
+    return;
+  }
+
+  const wrap = el('div', 'sets');
+  for (const g of sets) {
+    const row = el('button', 'set glass glass-tap');
+    row.addEventListener('click', () => {
+      state.query = g.name.toLowerCase();
+      $('searchInput').value = g.name;
+      showView('collection');
+    });
+
+    // Three highest-value cards, fanned like cards in a sleeve.
+    const stack = el('div', 'set-stack');
+    for (const card of [...g.cards].sort((a, b) => b.total_value - a.total_value).slice(0, 3)) {
+      const chip = el('div', 'chip');
+      if (card.image_url) {
+        const img = el('img');
+        img.loading = 'lazy';
+        img.alt = '';
+        img.src = card.image_url;
+        img.addEventListener('error', () => img.remove(), { once: true });
+        chip.appendChild(img);
+      }
+      stack.appendChild(chip);
+    }
+    row.appendChild(stack);
+
+    const body = el('div', 'set-body');
+    body.append(
+      el('div', 'set-name', g.name),
+      el('div', 'set-meta', `${g.cards.length} unique · ${g.copies} card${g.copies === 1 ? '' : 's'} held`),
+    );
+    row.appendChild(body);
+
+    const figures = el('div', 'set-figures');
+    figures.append(
+      el('div', 'set-value', money(g.value)),
+      el('div', 'set-count', `${((g.value / (state.stats.totalValue || 1)) * 100).toFixed(0)}% of value`),
+    );
+    row.appendChild(figures);
+
+    wrap.appendChild(row);
+  }
+  host.appendChild(wrap);
+
+  const navSets = $('navSetsCount');
+  if (navSets) navSets.textContent = sets.length;
 }
 
 function renderReview() {

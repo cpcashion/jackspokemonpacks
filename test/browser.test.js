@@ -118,8 +118,78 @@ if (!BASE || !chromium) {
         p.on('pageerror', (e) => errors.push(e.message));
         p.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('ERR_')) errors.push(m.text()); });
         await p.goto(BASE, { waitUntil: 'networkidle' });
-        await p.waitForSelector('.stat');
+        await p.waitForSelector('.hero-value');
         assert.deepEqual(errors, []);
+        await p.close();
+    });
+
+    /**
+     * The tab bar previously appeared to change spacing as the selection moved,
+     * because the active state altered each tab's footprint. These pin the fix:
+     * tabs are evenly distributed and identically sized in every state.
+     */
+    test('tab bar: tabs stay evenly spaced whichever one is selected', async () => {
+        const phone = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true });
+        const p = await phone.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.tabbar');
+
+        const measure = () => p.$$eval('.tabbar .tab', (tabs) =>
+            tabs.map((t) => { const r = t.getBoundingClientRect(); return { w: Math.round(r.width), cx: Math.round(r.left + r.width / 2) }; }));
+
+        const before = await measure();
+        assert.equal(before.length, 4, 'four destinations');
+
+        const widths = new Set(before.map((t) => t.w));
+        assert.equal(widths.size, 1, `all tabs equal width, got ${[...widths]}`);
+
+        await p.click('.tab[data-view="review"]');
+        await p.waitForTimeout(300);
+        const after = await measure();
+
+        assert.deepEqual(after, before, 'selecting a tab must not move or resize any tab');
+        await phone.close();
+    });
+
+    test('tab bar: the scan action is centred and is not a destination', async () => {
+        const phone = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true });
+        const p = await phone.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.tabbar');
+
+        const lens = await p.$eval('.lens', (n) => {
+            const r = n.getBoundingClientRect();
+            return { cx: r.left + r.width / 2, hasViewAttr: n.hasAttribute('data-view'), label: n.getAttribute('aria-label') };
+        });
+        const barWidth = await p.$eval('.tabbar', (n) => n.getBoundingClientRect().width);
+
+        assert.ok(Math.abs(lens.cx - barWidth / 2) < 2, `lens should be centred, off by ${Math.abs(lens.cx - barWidth / 2)}px`);
+        assert.equal(lens.hasViewAttr, false, 'the action must not be wired as a navigation destination');
+        assert.ok(lens.label, 'the icon-only action needs an accessible name');
+
+        // Two destinations either side of it.
+        const order = await p.$$eval('.tabbar > *', (ns) => ns.map((n) => (n.classList.contains('lens') ? 'lens' : 'tab')));
+        assert.deepEqual(order, ['tab', 'tab', 'lens', 'tab', 'tab']);
+        await phone.close();
+    });
+
+    test('the sets view groups the collection and totals each set', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.hero-value');
+        await p.click('.nav-item[data-view="sets"]');
+        await p.waitForSelector('.set');
+
+        const sets = await p.$$eval('.set', (ns) => ns.map((n) => ({
+            name: n.querySelector('.set-name').textContent,
+            value: n.querySelector('.set-value').textContent,
+        })));
+        assert.ok(sets.length > 0, 'sets are listed');
+        assert.ok(sets.every((s) => /^\$/.test(s.value)), 'every set shows a total');
+
+        // Sorted by value, most valuable first.
+        const numbers = sets.map((s) => Number(s.value.replace(/[^0-9.]/g, '')));
+        assert.deepEqual(numbers, [...numbers].sort((a, b) => b - a));
         await p.close();
     });
 }

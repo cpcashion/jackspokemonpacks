@@ -173,6 +173,76 @@ if (!BASE || !chromium) {
         await phone.close();
     });
 
+    /**
+     * A browser holding a cached script.js from one build while loading
+     * index.html from another produced a half-updated app that died on
+     * startup. Asset URLs carry the build id so a cache, which is keyed by
+     * exact URL, can never satisfy the new HTML with the old file.
+     */
+    test('asset URLs are build-stamped so a cache cannot mix builds', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'domcontentloaded' });
+
+        const build = await p.getAttribute('meta[name="app-build"]', 'content');
+        assert.match(build || '', /^[a-f0-9]{8}$/, 'the page declares which build it is');
+
+        const assets = await p.$$eval('link[rel="stylesheet"], script[src]',
+            (ns) => ns.map((n) => n.getAttribute('href') || n.getAttribute('src')));
+        const local = assets.filter((u) => u && !u.startsWith('http'));
+        assert.ok(local.length >= 2, 'stylesheet and script are both linked');
+        for (const url of local) {
+            assert.ok(url.includes(`v=${build}`), `${url} must carry the build id`);
+        }
+        await p.close();
+    });
+
+    test('a stale cached copy of the old script is never served to new markup', async () => {
+        const p = await browser.newPage();
+        let staleServed = 0;
+
+        // An HTTP cache can only answer the exact URL it stored — the plain
+        // path, with no query. Requests carrying ?v= miss it entirely.
+        await p.route((u) => {
+            const url = new URL(u);
+            return (url.pathname === '/script.js' || url.pathname === '/styles.css') && !url.search;
+        }, (route) => {
+            staleServed++;
+            route.fulfill({ status: 200, contentType: 'application/javascript', body: 'window.__STALE__ = true;' });
+        });
+
+        const errors = [];
+        p.on('pageerror', (e) => errors.push(e.message));
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.hero-value');
+
+        assert.equal(staleServed, 0, 'nothing requested the unversioned path');
+        assert.equal(await p.evaluate(() => window.__STALE__), undefined, 'the stale file never executed');
+        assert.deepEqual(errors, []);
+        await p.close();
+    });
+
+    test('a page from an older build reloads itself once', async () => {
+        const p = await browser.newPage();
+        let loads = 0;
+
+        await p.route((u) => new URL(u).pathname === '/', async (route) => {
+            loads++;
+            const res = await route.fetch();
+            let body = await res.text();
+            // First load claims a build the server does not have.
+            if (loads === 1) body = body.replace(/content="[a-f0-9]{8}"/, 'content="deadbeef"');
+            route.fulfill({ status: 200, contentType: 'text/html; charset=UTF-8', body });
+        });
+
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForTimeout(2200);
+
+        assert.equal(loads, 2, 'the mismatch triggered exactly one reload');
+        const build = await p.getAttribute('meta[name="app-build"]', 'content');
+        assert.notEqual(build, 'deadbeef', 'the page is now on the served build');
+        await p.close();
+    });
+
     test('the sets view groups the collection and totals each set', async () => {
         const p = await browser.newPage();
         await p.goto(BASE, { waitUntil: 'networkidle' });

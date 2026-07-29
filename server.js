@@ -1603,6 +1603,31 @@ const BUILD_ID = computeBuildId();
 const BUILD_COMMIT = (process.env.RAILWAY_GIT_COMMIT_SHA || process.env.SOURCE_COMMIT || '').slice(0, 7);
 const BOOTED_AT = new Date().toISOString();
 
+/**
+ * index.html, with its asset URLs stamped with the build id.
+ *
+ * Without this, a browser can hold a cached script.js from one build while
+ * fetching index.html from another — and a half-updated app is worse than an
+ * old one, because the old script looks for elements the new markup no longer
+ * has and the whole page dies. Versioned URLs make that combination
+ * impossible: a given index.html can only ever load the exact pair it shipped
+ * with.
+ */
+function sendIndex(res) {
+    try {
+        const html = readFileSync(join(__dirname, 'index.html'), 'utf8')
+            .replace('href="styles.css"', `href="/styles.css?v=${BUILD_ID}"`)
+            .replace('src="script.js"', `src="/script.js?v=${BUILD_ID}"`)
+            .replace('</head>', `  <meta name="app-build" content="${BUILD_ID}" />\n</head>`);
+        res.setHeader('Content-Type', 'text/html; charset=UTF-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(html);
+    } catch (err) {
+        console.error('Failed to serve index.html:', err.message);
+        res.status(500).send('Application unavailable');
+    }
+}
+
 /** The service worker is served with its cache name stamped to this build. */
 function sendServiceWorker(res) {
     try {
@@ -1673,8 +1698,17 @@ app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return next();
     const isPublic = PUBLIC_FILES.has(req.path) || req.path.startsWith('/icons/');
     if (!isPublic) return next();
+
     if (req.path === '/sw.js') return sendServiceWorker(res);
-    if (PUBLIC_FILES.has(req.path)) res.setHeader('Cache-Control', 'no-cache');
+    if (req.path === '/index.html') return sendIndex(res);
+
+    // A ?v= URL names one exact build, so it can be cached hard and forever.
+    // The same file without one might be anything, so it must be revalidated.
+    if (req.path === '/styles.css' || req.path === '/script.js') {
+        res.setHeader('Cache-Control', req.query.v ? 'public, max-age=31536000, immutable' : 'no-cache');
+    } else if (PUBLIC_FILES.has(req.path)) {
+        res.setHeader('Cache-Control', 'no-cache');
+    }
     return staticHandler(req, res, next);
 });
 
@@ -2391,7 +2425,8 @@ app.get('/api/portfolio/:id/prices', requireAuth, async (req, res) => {
 });
 
 // Fallback to index.html
-app.get('*', (req, res) => { res.sendFile(join(__dirname, 'index.html')); });
+// Everything else is the app shell, served with build-stamped asset URLs.
+app.get('*', (req, res) => sendIndex(res));
 
 // ═══════════════════════════════════════════════════════════════
 //  START

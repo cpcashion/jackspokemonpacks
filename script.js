@@ -141,16 +141,30 @@ async function api(path, options) {
 }
 
 async function loadCollection() {
+  let data;
   try {
-    const data = await api('/api/portfolio');
-    state.cards = data.cards || [];
-    state.stats = data.stats || {};
-    state.pricing = data.pricing || state.pricing;
-    render();
-    checkForSplitRows();
+    data = await api('/api/portfolio');
   } catch (err) {
-    toast(`Could not load your collection: ${err.message}`, 'error');
+    toast(`Could not reach the server: ${err.message}`, 'error');
+    return;
   }
+
+  state.cards = data.cards || [];
+  state.stats = data.stats || {};
+  state.pricing = data.pricing || state.pricing;
+
+  // Drawing is separate from loading. A rendering fault is a bug in the app,
+  // not a problem with the collection, and saying so sends you looking in the
+  // wrong place.
+  try {
+    render();
+  } catch (err) {
+    console.error('Render failed:', err);
+    toast('Something went wrong drawing the page — reloading', 'error', 2500);
+    ensureFreshBuild();
+    return;
+  }
+  checkForSplitRows();
 }
 
 // ── THEME ────────────────────────────────────────────────────────
@@ -2076,9 +2090,13 @@ if ('serviceWorker' in navigator) {
         });
       });
 
+      // On a first visit there is no controller yet, so the worker claiming the
+      // page is not an update — reloading there would just make the app flash
+      // for every new visitor. Only reload when one controller replaces another.
+      const hadController = Boolean(navigator.serviceWorker.controller);
       let reloading = false;
       navigator.serviceWorker.addEventListener('controllerchange', () => {
-        if (reloading) return;
+        if (!hadController || reloading) return;
         reloading = true;
         window.location.reload();
       });
@@ -2092,6 +2110,34 @@ if ('serviceWorker' in navigator) {
       /* offline shell is optional */
     }
   });
+}
+
+/**
+ * If the page on screen was built from a different set of files than the
+ * server is now serving, the two can disagree about what elements exist and
+ * the app breaks in confusing ways. Detect that and reload once, cleanly,
+ * rather than leaving a half-updated app running.
+ */
+async function ensureFreshBuild() {
+  const pageBuild = document.querySelector('meta[name="app-build"]')?.content;
+  if (!pageBuild) return;
+  try {
+    const v = await api('/api/version');
+    if (v.build === pageBuild) return;
+
+    // Only ever reload once per deploy, so a mismatch can never become a loop.
+    const alreadyTried = sessionStorage.getItem('reloaded-for-build');
+    if (alreadyTried === v.build) return;
+    sessionStorage.setItem('reloaded-for-build', v.build);
+
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+    window.location.reload();
+  } catch {
+    /* offline; the running page is the best available */
+  }
 }
 
 /** Which build is on screen. Shown in Settings so "did the deploy land?" is answerable. */
@@ -2110,6 +2156,7 @@ async function loadVersion() {
 // ── BOOT ─────────────────────────────────────────────────────────
 
 syncThemeButtons();
+ensureFreshBuild();
 loadCollection();
 connectEvents();
 window.addEventListener('resize', () => { if (state.cards.length) render(); });

@@ -82,9 +82,9 @@ const sourceLabel = (key) => {
 // ── TOASTS ───────────────────────────────────────────────────────
 
 function toast(message, kind = 'info', ms = 3600) {
-  const node = el('div', 'toast glass glass-lg');
-  const icons = { success: '✅', error: '⚠️', info: '💬', dupe: '➕' };
-  node.append(el('span', null, icons[kind] || icons.info), el('span', null, message));
+  const node = el('div', 'toast');
+  node.append(el('span', null, message));
+  node.dataset.kind = kind;
   $('toasts').appendChild(node);
   setTimeout(() => {
     node.classList.add('out');
@@ -93,6 +93,39 @@ function toast(message, kind = 'info', ms = 3600) {
 }
 
 const buzz = (ms) => { try { navigator.vibrate?.(ms); } catch { /* unsupported */ } };
+
+// ── ICONS ────────────────────────────────────────────────────────
+// Line icons rather than emoji: emoji are colourful, inconsistent between
+// platforms, and fight a monochrome interface.
+
+const ICON_PATHS = {
+  card: '<rect x="4" y="2.5" width="16" height="19" rx="2.5"/><path d="M8 8h8M8 12h5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+};
+
+/** Returns an <svg> element; callers treat it like any other node. */
+function icon(name, size = 22) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', size);
+  svg.setAttribute('height', size);
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.6');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.innerHTML = ICON_PATHS[name] || ICON_PATHS.card;
+  return svg;
+}
+
+function cardPlaceholder() {
+  const wrap = el('div', 'ph');
+  wrap.appendChild(icon('card', 22));
+  return wrap;
+}
 
 // ── API ──────────────────────────────────────────────────────────
 
@@ -265,9 +298,16 @@ function renderStats() {
   const delta = (s.totalValue || 0) - (s.prevValue || 0);
 
   const tiles = [
-    { label: 'Collection value', value: moneyShort(s.totalValue || 0), sub: s.prevValue ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta)).slice(1)} today` : 'Tracking from today', cls: trendClass(change) },
+    // The total stays monochrome; only the movement is coloured. A four-figure
+    // number in red every time the market dips down 0.2% reads as an alarm.
+    {
+      label: 'Collection value',
+      value: moneyShort(s.totalValue || 0),
+      sub: s.prevValue ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta)).slice(1)} today` : 'Tracking from today',
+      subCls: s.prevValue ? trendClass(change) : undefined,
+    },
     { label: 'Cards held', value: String(s.totalCopies || 0), sub: `${s.totalCards || 0} unique printing${s.totalCards === 1 ? '' : 's'}` },
-    { label: 'Duplicates', value: String(s.duplicateCards || 0), sub: s.duplicateCards ? 'cards you own more than one of' : 'no repeats yet' },
+    { label: 'Duplicates', value: String(s.duplicateCards || 0), sub: s.duplicateCards ? 'owned more than once' : 'no repeats yet' },
     { label: 'Unpriced', value: String(s.unpricedCopies || 0), sub: s.unpricedCopies ? 'no market data found' : 'every card is priced', cls: s.unpricedCopies ? 'flat' : undefined },
   ];
 
@@ -287,7 +327,7 @@ function renderStats() {
     const tile = el('div', 'stat glass');
     tile.append(el('div', 'stat-label', t.label));
     tile.append(el('div', `stat-value ${t.cls || ''}`.trim(), t.value));
-    tile.append(el('div', 'stat-sub', t.sub));
+    tile.append(el('div', `stat-sub ${t.subCls || ''}`.trim(), t.sub));
     wrap.appendChild(tile);
   }
 
@@ -330,7 +370,7 @@ function cardArt(card, cls) {
     img.decoding = 'async';
     img.alt = card.card_name || 'Card';
     img.src = card.image_url;
-    img.addEventListener('error', () => { img.replaceWith(el('div', 'ph', '🃏')); }, { once: true });
+    img.addEventListener('error', () => { img.replaceWith(cardPlaceholder()); }, { once: true });
     wrap.appendChild(img);
   } else if (card.has_local_image) {
     const img = el('img');
@@ -339,7 +379,7 @@ function cardArt(card, cls) {
     img.dataset.localFor = card.id;
     wrap.appendChild(img);
   } else {
-    wrap.appendChild(el('div', 'ph', '🃏'));
+    wrap.appendChild(cardPlaceholder());
   }
   return wrap;
 }
@@ -351,8 +391,8 @@ function hydrateLocalImages(root) {
     img.dataset.hydrated = '1';
     fetch(`/api/portfolio/${img.dataset.localFor}/image`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(el('div', 'ph', '🃏')); })
-      .catch(() => img.replaceWith(el('div', 'ph', '🃏')));
+      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(cardPlaceholder()); })
+      .catch(() => img.replaceWith(cardPlaceholder()));
   });
 }
 
@@ -401,7 +441,7 @@ function renderCollection() {
 
   if (!state.cards.length) {
     host.appendChild(emptyState(
-      '🃏',
+      icon('card'),
       'No cards yet',
       'Point your camera at a card and it will be identified, priced and added in a couple of seconds.',
       'Scan your first card',
@@ -411,7 +451,7 @@ function renderCollection() {
   }
 
   if (!cards.length) {
-    host.appendChild(emptyState('🔍', 'Nothing matches that', `No cards match “${state.query}”.`));
+    host.appendChild(emptyState(icon('search'), 'Nothing matches that', `No cards match “${state.query}”.`));
     return;
   }
 
@@ -419,9 +459,11 @@ function renderCollection() {
   hydrateLocalImages(host);
 }
 
-function emptyState(icon, title, text, actionLabel, onAction) {
+function emptyState(glyph, title, text, actionLabel, onAction) {
   const box = el('div', 'empty glass');
-  box.append(el('div', 'empty-icon', icon), el('h2', null, title), el('p', null, text));
+  const iconWrap = el('div', 'empty-icon');
+  iconWrap.appendChild(glyph);
+  box.append(iconWrap, el('h2', null, title), el('p', null, text));
   if (actionLabel) {
     const btn = el('button', 'btn btn-primary', actionLabel);
     btn.addEventListener('click', onAction);
@@ -440,10 +482,12 @@ function gridOf(cards) {
     const art = cardArt(card, 'card-art');
     if (card.quantity > 1) art.appendChild(el('div', 'qty', `×${card.quantity}`));
 
+    // Only traits that single a card out. Nearly every card in a collection is
+    // holo, so a "Holo" badge on all of them says nothing and just adds noise —
+    // the printing is on the card's detail sheet where it matters.
     const flags = el('div', 'card-flags');
     if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Review'));
     if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
-    if (card.is_holo && !card.is_first_edition) flags.appendChild(el('span', 'flag flag-holo', 'Holo'));
     if (flags.children.length) art.appendChild(flags);
 
     const body = el('div', 'card-body');
@@ -511,7 +555,7 @@ function renderReview() {
   host.innerHTML = '';
   const cards = visibleCards();
   if (!cards.length) {
-    host.appendChild(emptyState('✅', 'Nothing to review', 'Every card we scanned was matched to the card database.'));
+    host.appendChild(emptyState(icon('check'), 'Nothing to review', 'Every card we scanned was matched to the card database.'));
     return;
   }
   host.appendChild(gridOf(cards));
@@ -1338,7 +1382,7 @@ $('scannerCloseBtn').addEventListener('click', closeScanner);
 async function startCamera() {
   hideScannerMessage();
   if (!navigator.mediaDevices?.getUserMedia) {
-    showScannerMessage('📷', 'Live camera not supported',
+    showScannerMessage(icon('camera'), 'Live camera not supported',
       'This browser cannot open a live viewfinder. You can still use your phone’s camera app or pick a photo.');
     return;
   }
@@ -1365,7 +1409,7 @@ async function startCamera() {
   } catch (err) {
     const denied = err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError';
     showScannerMessage(
-      denied ? '🔒' : '📷',
+      denied ? icon('lock') : icon('camera'),
       denied ? 'Camera access blocked' : 'No camera available',
       denied
         ? 'Allow camera access for this site in your browser settings, or use your phone’s camera app instead.'
@@ -1385,8 +1429,10 @@ function stopCamera() {
   $('torchBtn').classList.remove('active');
 }
 
-function showScannerMessage(icon, title, text) {
-  $('scannerMsgIcon').textContent = icon;
+function showScannerMessage(glyph, title, text) {
+  const iconHost = $('scannerMsgIcon');
+  iconHost.innerHTML = '';
+  iconHost.appendChild(glyph);
   $('scannerMsgTitle').textContent = title;
   $('scannerMsgText').textContent = text;
   $('scannerMsg').classList.add('show');

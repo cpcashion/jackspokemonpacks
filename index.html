@@ -12,8 +12,8 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Jack's Cards" />
-  <meta name="theme-color" content="#eef1f6" media="(prefers-color-scheme: light)" />
-  <meta name="theme-color" content="#070912" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#fbfbfb" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#08090a" media="(prefers-color-scheme: dark)" />
   <link rel="apple-touch-icon" href="/icons/icon-180.png" />
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
 
@@ -36,7 +36,9 @@
   <!-- ── DESKTOP RAIL ──────────────────────────────────────── -->
   <aside class="rail">
     <div class="brand">
-      <div class="brand-mark">⚡</div>
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M13.5 2 4 13.6h6.1L9.3 22 20 9.9h-6.6z"/></svg>
+      </div>
       <div class="brand-text">
         <span class="brand-name">Jack's Cards</span>
         <span class="brand-sub">Pokémon collection</span>
@@ -99,7 +101,7 @@
       <div class="stats" id="stats"></div>
 
       <div class="banner glass" id="unverifiedBanner" hidden>
-        <span class="banner-icon">🕓</span>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
         <div class="banner-body">
           <div class="banner-title" id="unverifiedBannerTitle">Some prices are not verified</div>
           <div class="banner-text" id="unverifiedBannerText"></div>
@@ -108,7 +110,7 @@
       </div>
 
       <div class="banner glass" id="dupeBanner" hidden>
-        <span class="banner-icon">🗂️</span>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="13" height="14" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-3"/></svg></span>
         <div class="banner-body">
           <div class="banner-title" id="dupeBannerTitle">Duplicate cards found</div>
           <div class="banner-text" id="dupeBannerText"></div>
@@ -149,7 +151,7 @@
     <!-- ── REVIEW ── -->
     <section class="view" id="view-review">
       <div class="banner glass">
-        <span class="banner-icon">🔎</span>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
         <div class="banner-body">
           <div class="banner-title">Cards we could not confirm</div>
           <div class="banner-text">These were saved from your scans but not found in the card database, so they are not priced. Correct the name, set or number and they will price themselves.</div>

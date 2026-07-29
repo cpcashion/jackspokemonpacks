@@ -14,6 +14,7 @@ import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdirSync, readFileSync, rmSync } from 'fs';
+import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -36,6 +37,7 @@ import {
     CONDITIONS,
     isTruthy,
 } from './lib/identity.js';
+import { auditHistoryRows } from './lib/history.js';
 import {
     quotesFromPokemonTcgCandidate,
     quotesFromTcgdexCard,
@@ -151,10 +153,56 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS idx_card_copies_card ON card_copies(card_id);
         CREATE INDEX IF NOT EXISTS idx_portfolio_variant ON portfolio_cards(user_id, variant_key);
+
+        -- Records one-time migrations so they cannot run twice.
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT '',
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     `);
 
     await backfillVariantKeys();
     await backfillCardCopies();
+    await queueLegacyPricesForRecheck();
+}
+
+async function hasRun(key) {
+    const res = await pool.query('SELECT 1 FROM app_meta WHERE key = $1', [key]);
+    return res.rows.length > 0;
+}
+
+async function markRun(key, value = '') {
+    await pool.query(
+        'INSERT INTO app_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+        [key, String(value)]
+    );
+}
+
+/**
+ * Cards priced by the old pipeline carry a price but no provenance — no
+ * confidence, no marketplace, no record of which printing was used. They are
+ * not wrong so much as unverified, and the UI cannot tell the difference.
+ *
+ * Clearing last_price_check puts them at the front of the refresh queue so the
+ * current engine re-prices them and fills in the evidence. Guarded by app_meta
+ * because a card that genuinely cannot be priced would otherwise be re-queued
+ * on every boot forever.
+ */
+async function queueLegacyPricesForRecheck() {
+    const KEY = 'requeue_unverified_prices_v1';
+    if (await hasRun(KEY)) return;
+
+    const res = await pool.query(`
+        UPDATE portfolio_cards
+        SET last_price_check = NULL
+        WHERE COALESCE(price_confidence, 0) = 0
+          AND COALESCE(current_price, 0) > 0
+    `);
+    await markRun(KEY, res.rowCount);
+    if (res.rowCount) {
+        console.log(`  [Migrate] Queued ${res.rowCount} card(s) priced by the old engine for re-pricing`);
+    }
 }
 
 /**
@@ -300,6 +348,19 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
 /** Marks a card as checked without touching its price — used when a lookup finds nothing. */
 async function markPriceChecked(cardId) {
     await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [cardId]);
+}
+
+// ── Fabricated price history ───────────────────────────────────────────────
+
+/** See lib/history.js for how generated points are told apart from real ones. */
+async function auditSyntheticHistory() {
+    const res = await pool.query(`
+        SELECT ph.id, ph.card_id, ph.recorded_at, pc.card_name
+        FROM price_history ph
+        JOIN portfolio_cards pc ON pc.id = ph.card_id
+        ORDER BY ph.card_id, ph.recorded_at ASC
+    `);
+    return auditHistoryRows(res.rows);
 }
 
 // ── Duplicate consolidation ────────────────────────────────────────────────
@@ -575,12 +636,15 @@ function computePortfolioStats(cards) {
     let unpriced = 0;
     let needsReview = 0;
     let acquiredCost = 0;
+    let unverified = 0;
 
     for (const card of cards) {
         totalValue += card.total_value;
         totalCopies += card.quantity;
         if (!(card.unit_price > 0)) unpriced += card.quantity;
         if (card.needs_review) needsReview++;
+        // Priced, but by the old engine — no confidence or source was recorded.
+        if (card.unit_price > 0 && !(Number(card.price_confidence) > 0)) unverified++;
 
         // Yesterday's value at today's holdings, so a change figure reflects the
         // market moving rather than Jack adding cards.
@@ -597,6 +661,7 @@ function computePortfolioStats(cards) {
         totalCopies,
         duplicateCards: cards.filter(c => c.quantity > 1).length,
         unpricedCopies: unpriced,
+        unverifiedPrices: unverified,
         needsReview,
         totalValue: Number(totalValue.toFixed(2)),
         prevValue: Number(prevValue.toFixed(2)),
@@ -1438,22 +1503,130 @@ async function refreshAllPrices() {
     }
 }
 
-// Auto-refresh every 24 hours (only in long-running server mode, not Vercel serverless)
+// ═══════════════════════════════════════════════════════════════
+//  SCHEDULED REFRESH
+//
+//  This used to be a plain setInterval(24h). The timer resets whenever the
+//  process restarts, and a host restarts on every deploy — so on an app that
+//  gets deployed every day or two, the refresh could go weeks without ever
+//  firing. That is the difference between "prices update daily" and "prices
+//  are from whenever the card was added".
+//
+//  Instead: remember when the last refresh finished, check often, and run when
+//  it is actually due. A restart cannot lose the schedule.
+// ═══════════════════════════════════════════════════════════════
+
 const IS_VERCEL = !!process.env.VERCEL;
+
+/** How often to re-check every card. Days, so it can be tuned without a deploy. */
+const REFRESH_EVERY_DAYS = Math.max(0.25, Number(process.env.PRICE_REFRESH_DAYS) || 1);
+const REFRESH_EVERY_MS = REFRESH_EVERY_DAYS * 24 * 60 * 60 * 1000;
+const SCHEDULER_TICK_MS = 15 * 60 * 1000;
+const LAST_REFRESH_KEY = 'last_full_refresh';
+
+async function getLastRefreshAt() {
+    try {
+        const res = await pool.query('SELECT value FROM app_meta WHERE key = $1', [LAST_REFRESH_KEY]);
+        const ts = res.rows[0]?.value ? Number(res.rows[0].value) : 0;
+        return Number.isFinite(ts) ? ts : 0;
+    } catch {
+        return 0;
+    }
+}
+
+async function setLastRefreshAt(ts) {
+    await pool.query(`
+        INSERT INTO app_meta (key, value, applied_at) VALUES ($1, $2, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, applied_at = NOW()
+    `, [LAST_REFRESH_KEY, String(ts)]);
+}
+
+export async function refreshSchedule() {
+    const last = await getLastRefreshAt();
+    const dueAt = last ? last + REFRESH_EVERY_MS : 0;
+    return {
+        everyDays: REFRESH_EVERY_DAYS,
+        lastRefreshAt: last || null,
+        nextRefreshAt: dueAt || null,
+        overdue: Date.now() >= dueAt,
+        running: priceRefreshRunning,
+    };
+}
+
+async function runScheduledRefreshIfDue() {
+    if (priceRefreshRunning) return;
+    try {
+        const last = await getLastRefreshAt();
+        if (last && Date.now() - last < REFRESH_EVERY_MS) return;
+
+        console.log(`  [Schedule] Price refresh is due (every ${REFRESH_EVERY_DAYS} day(s)) — starting.`);
+        await refreshAllPrices();
+        await setLastRefreshAt(Date.now());
+    } catch (err) {
+        console.error('  [Schedule] Refresh failed:', err.message);
+    }
+}
+
 if (!IS_VERCEL) {
-    const REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
-    setInterval(() => {
-        refreshAllPrices().catch(err => console.error('[AutoRefresh] Error:', err.message));
-    }, REFRESH_INTERVAL);
+    // A short delay on boot so a restart storm does not stampede the APIs.
+    setTimeout(() => { runScheduledRefreshIfDue(); }, 60 * 1000);
+    setInterval(() => { runScheduledRefreshIfDue(); }, SCHEDULER_TICK_MS);
 }
 
 // ═══════════════════════════════════════════════════════════════
 //  EXPRESS SERVER
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  BUILD IDENTITY
+//
+//  "Did the deploy actually go out?" should never need a git log to answer.
+//  The build id is a hash of the three files the browser is actually served,
+//  so it cannot disagree with what is running. It names the service worker's
+//  cache, which means a new build automatically discards the old one instead
+//  of leaving somebody pinned to a stale copy of the app.
+// ═══════════════════════════════════════════════════════════════
+
+function computeBuildId() {
+    try {
+        const hash = createHash('sha256');
+        for (const file of ['index.html', 'script.js', 'styles.css']) {
+            hash.update(readFileSync(join(__dirname, file)));
+        }
+        return hash.digest('hex').slice(0, 8);
+    } catch {
+        return 'unknown';
+    }
+}
+
+const BUILD_ID = computeBuildId();
+const BUILD_COMMIT = (process.env.RAILWAY_GIT_COMMIT_SHA || process.env.SOURCE_COMMIT || '').slice(0, 7);
+const BOOTED_AT = new Date().toISOString();
+
+/** The service worker is served with its cache name stamped to this build. */
+function sendServiceWorker(res) {
+    try {
+        // replaceAll, not replace: the token also appears in the file's own
+        // comment, and replacing only the first occurrence would stamp the
+        // comment and leave the constant as the literal placeholder.
+        const source = readFileSync(join(__dirname, 'sw.js'), 'utf8').replaceAll('__BUILD_ID__', BUILD_ID);
+        res.setHeader('Content-Type', 'application/javascript; charset=UTF-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(source);
+    } catch (err) {
+        res.status(500).send('// service worker unavailable');
+    }
+}
+
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
+
+/** Cheap, unauthenticated: lets you confirm a deploy landed without logging in. */
+app.get('/api/version', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ build: BUILD_ID, commit: BUILD_COMMIT || null, bootedAt: BOOTED_AT });
+});
 
 // Compress all responses to reduce bandwidth
 app.use((req, res, next) => {
@@ -1487,16 +1660,21 @@ app.use((req, res, next) => {
  * The previous `express.static(__dirname)` published the whole project
  * directory — server.js, package.json, lib/ and test/ were all downloadable.
  * Only the files the browser actually needs are served now.
+ *
+ * The app's own three files are sent with `no-cache`: not "never store", but
+ * "always revalidate". A 304 still costs nothing, and it means a deploy is
+ * visible on the next load instead of up to an hour later. Icons, which change
+ * about never, keep a long cache.
  */
 const PUBLIC_FILES = new Set(['/index.html', '/styles.css', '/script.js', '/sw.js', '/manifest.webmanifest']);
-const staticHandler = express.static(__dirname, { index: false, dotfiles: 'ignore', maxAge: '1h' });
+const staticHandler = express.static(__dirname, { index: false, dotfiles: 'ignore', maxAge: '1h', etag: true });
 
 app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return next();
     const isPublic = PUBLIC_FILES.has(req.path) || req.path.startsWith('/icons/');
     if (!isPublic) return next();
-    // A cached service worker would pin users to an old build.
-    if (req.path === '/sw.js') res.setHeader('Cache-Control', 'no-cache');
+    if (req.path === '/sw.js') return sendServiceWorker(res);
+    if (PUBLIC_FILES.has(req.path)) res.setHeader('Cache-Control', 'no-cache');
     return staticHandler(req, res, next);
 });
 
@@ -1753,6 +1931,74 @@ app.post('/api/portfolio/merge-duplicates', requireAuth, express.json(), async (
     }
 });
 
+/**
+ * Re-price one card immediately and return the result, so a card showing an
+ * unverified price can be fixed on the spot instead of waiting for the next
+ * full refresh.
+ */
+app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
+    const cardId = parseInt(req.params.id, 10);
+    try {
+        const owned = await pool.query('SELECT * FROM portfolio_cards WHERE id = $1 AND user_id = $2', [cardId, req.user.id]);
+        if (!owned.rows.length) return res.status(404).json({ error: 'Card not found' });
+        const card = owned.rows[0];
+
+        // Bypass the cache: the point of asking is to get a fresh answer.
+        priceCache.delete(buildVariantKey(card));
+
+        const market = await lookupMarketPrice(card);
+        if (market && market.price > 0) {
+            await insertPricePoint(cardId, market.price, market.source, market.url || '');
+            await updatePortfolioCardMarketData(cardId, market);
+        } else {
+            await markPriceChecked(cardId);
+        }
+
+        broadcast({ type: 'portfolio_updated' });
+        res.json({
+            success: true,
+            price: market?.price || 0,
+            source: market?.source || 'not_found',
+            confidence: market?.confidence || 0,
+            quotesUsed: market?.quotesUsed || 0,
+            quotesSeen: market?.quotesSeen || 0,
+        });
+    } catch (err) {
+        console.error('Reprice error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Report price-history points that were fabricated by the old backfill scripts
+ * rather than observed. Read-only; purging is a separate confirmed action.
+ */
+app.get('/api/portfolio/history-audit', requireAuth, async (req, res) => {
+    try {
+        const audit = await auditSyntheticHistory();
+        res.json({ cards: audit.cards, pointCount: audit.pointCount, totalPoints: audit.totalPoints });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/portfolio/purge-synthetic-history', requireAuth, express.json(), async (req, res) => {
+    try {
+        if (req.body?.confirm !== true) {
+            return res.status(400).json({ error: 'Refusing to delete history without confirm:true' });
+        }
+        const audit = await auditSyntheticHistory();
+        if (!audit.ids.length) return res.json({ success: true, deleted: 0 });
+
+        const result = await pool.query('DELETE FROM price_history WHERE id = ANY($1::int[])', [audit.ids]);
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, deleted: result.rowCount, cardsAffected: audit.cards.length });
+    } catch (err) {
+        console.error('Purge error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Manually trigger price refresh
 app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
     try {
@@ -1761,8 +2007,49 @@ app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
             // On Vercel, do a small batch synchronously
             refreshBatchPrices(5).catch(err => console.error('Manual refresh error:', err));
         } else {
-            refreshAllPrices().catch(err => console.error('Manual refresh error:', err));
+            // A manual refresh also resets the schedule — no point re-running an
+            // hour later just because the clock said so.
+            refreshAllPrices()
+                .then(() => setLastRefreshAt(Date.now()))
+                .catch(err => console.error('Manual refresh error:', err));
         }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Everything needed to answer "is this app actually keeping prices current?"
+ * without reading logs: which sources are live, when prices last refreshed,
+ * when the next one is due, and how much of the collection is verified.
+ */
+app.get('/api/health', requireAuth, async (req, res) => {
+    try {
+        const cards = await getAllPortfolioCards(req.user.id);
+        const stats = computePortfolioStats(cards);
+        const schedule = await refreshSchedule();
+
+        const checked = cards.map(c => c.last_price_check).filter(Boolean).map(d => new Date(d).getTime());
+
+        res.json({
+            sources: [
+                { name: 'Pokémon TCG API', live: true, detail: POKEMON_TCG_KEY ? 'API key set' : 'no key — rate limited', key: 'POKEMON_TCG_KEY' },
+                { name: 'TCGdex', live: true, detail: 'free, no key needed', key: null },
+                { name: 'Scrydex', live: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), detail: 'needs SCRYDEX_API_KEY + SCRYDEX_TEAM_ID', key: 'SCRYDEX_API_KEY' },
+                { name: 'JustTCG', live: Boolean(JUSTTCG_API_KEY), detail: 'needs JUSTTCG_API_KEY', key: 'JUSTTCG_API_KEY' },
+            ],
+            schedule,
+            cards: {
+                total: stats.totalCards,
+                verified: stats.totalCards - stats.unverifiedPrices - stats.needsReview,
+                unverified: stats.unverifiedPrices,
+                needsReview: stats.needsReview,
+                unpriced: stats.unpricedCopies,
+            },
+            oldestPriceCheck: checked.length ? new Date(Math.min(...checked)).toISOString() : null,
+            newestPriceCheck: checked.length ? new Date(Math.max(...checked)).toISOString() : null,
+            fx: fxStatus(),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -2060,7 +2347,9 @@ app.get('/api/cron/refresh-prices', async (req, res) => {
     }
     try {
         // Kick off the refresh asynchronously so we don't timeout the HTTP response
-        refreshAllPrices().catch(err => console.error('[Cron] Refresh error:', err.message));
+        refreshAllPrices()
+            .then(() => setLastRefreshAt(Date.now()))
+            .catch(err => console.error('[Cron] Refresh error:', err.message));
         res.json({ success: true, message: "Background refresh started" });
     } catch (err) {
         console.error('[Cron] Refresh error:', err.message);

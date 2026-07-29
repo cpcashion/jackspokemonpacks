@@ -16,6 +16,7 @@ const state = {
   query: '',
   openCardId: null,
   chartDays: 30,
+  heroRange: 30,
   scanQueue: 0,
   scanned: [],
 };
@@ -82,9 +83,9 @@ const sourceLabel = (key) => {
 // ── TOASTS ───────────────────────────────────────────────────────
 
 function toast(message, kind = 'info', ms = 3600) {
-  const node = el('div', 'toast glass glass-lg');
-  const icons = { success: '✅', error: '⚠️', info: '💬', dupe: '➕' };
-  node.append(el('span', null, icons[kind] || icons.info), el('span', null, message));
+  const node = el('div', 'toast');
+  node.append(el('span', null, message));
+  node.dataset.kind = kind;
   $('toasts').appendChild(node);
   setTimeout(() => {
     node.classList.add('out');
@@ -93,6 +94,39 @@ function toast(message, kind = 'info', ms = 3600) {
 }
 
 const buzz = (ms) => { try { navigator.vibrate?.(ms); } catch { /* unsupported */ } };
+
+// ── ICONS ────────────────────────────────────────────────────────
+// Line icons rather than emoji: emoji are colourful, inconsistent between
+// platforms, and fight a monochrome interface.
+
+const ICON_PATHS = {
+  card: '<rect x="4" y="2.5" width="16" height="19" rx="2.5"/><path d="M8 8h8M8 12h5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+};
+
+/** Returns an <svg> element; callers treat it like any other node. */
+function icon(name, size = 22) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', size);
+  svg.setAttribute('height', size);
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.6');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.innerHTML = ICON_PATHS[name] || ICON_PATHS.card;
+  return svg;
+}
+
+function cardPlaceholder() {
+  const wrap = el('div', 'ph');
+  wrap.appendChild(icon('card', 22));
+  return wrap;
+}
 
 // ── API ──────────────────────────────────────────────────────────
 
@@ -155,7 +189,7 @@ document.querySelectorAll('[data-theme-set]').forEach((b) => {
 
 // ── NAVIGATION ───────────────────────────────────────────────────
 
-const VIEW_TITLES = { collection: 'Collection', review: 'Needs review', settings: 'Settings' };
+const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Needs review', settings: 'Settings' };
 
 function showView(name) {
   if (name === 'scan') { openScanner(); return; }
@@ -165,12 +199,14 @@ function showView(name) {
   $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
   window.scrollTo({ top: 0 });
   render();
+  if (name === 'settings') { loadHealth(); loadVersion(); }
 }
 
 document.querySelectorAll('[data-view]').forEach((b) => {
   b.addEventListener('click', () => showView(b.dataset.view));
 });
 $('railScanBtn').addEventListener('click', openScanner);
+$('lensBtn').addEventListener('click', openScanner);
 
 // ── SEARCH / SORT / LAYOUT ───────────────────────────────────────
 
@@ -229,12 +265,17 @@ function render() {
   renderStats();
   renderCounts();
   if (state.view === 'review') renderReview();
+  else if (state.view === 'sets') renderSets();
   else renderCollection();
 }
 
 function renderCounts() {
   const reviewCount = state.cards.filter((c) => c.needs_review).length;
   $('navCollectionCount').textContent = state.stats.totalCopies ?? 0;
+
+  const setCount = new Set(state.cards.filter(c => !c.needs_review).map(c => c.card_set || 'Unknown set')).size;
+  const navSets = $('navSetsCount');
+  if (navSets) navSets.textContent = setCount;
 
   const navReview = $('navReviewCount');
   navReview.hidden = reviewCount === 0;
@@ -260,27 +301,182 @@ function renderCounts() {
 
 function renderStats() {
   const s = state.stats;
-  const change = pct(s.totalValue, s.prevValue);
-  const delta = (s.totalValue || 0) - (s.prevValue || 0);
+  const unverified = s.unverifiedPrices || 0;
+  const banner = $('unverifiedBanner');
+  banner.hidden = unverified === 0;
+  if (unverified) {
+    $('unverifiedBannerTitle').textContent =
+      `${unverified} price${unverified === 1 ? '' : 's'} not verified`;
+    $('unverifiedBannerText').textContent =
+      'These were set by an earlier version that did not record where the number came from. Re-pricing checks them against the marketplaces and shows the evidence.';
+  }
+  renderHero();
+}
 
-  const tiles = [
-    { label: 'Collection value', value: moneyShort(s.totalValue || 0), sub: s.prevValue ? `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta)).slice(1)} today` : 'Tracking from today', cls: trendClass(change) },
-    { label: 'Cards held', value: String(s.totalCopies || 0), sub: `${s.totalCards || 0} unique printing${s.totalCards === 1 ? '' : 's'}` },
-    { label: 'Duplicates', value: String(s.duplicateCards || 0), sub: s.duplicateCards ? 'cards you own more than one of' : 'no repeats yet' },
-    { label: 'Unpriced', value: String(s.unpricedCopies || 0), sub: s.unpricedCopies ? 'no market data found' : 'every card is priced', cls: s.unpricedCopies ? 'flat' : undefined },
-  ];
+/**
+ * Reconstruct what the whole collection was worth on each of the last N days.
+ *
+ * Each card only records a price when it is checked, so for any given day we
+ * take the most recent price at or before that day and value every copy of the
+ * card at it. A card is worth nothing to the total before its first recorded
+ * price — otherwise adding a card would look like the market moving.
+ */
+function portfolioSeries(days) {
+  const priced = state.cards.filter(c => (c.price_history || []).length);
+  if (!priced.length) return [];
 
-  const wrap = $('stats');
-  wrap.innerHTML = '';
-  for (const t of tiles) {
-    const tile = el('div', 'stat glass');
-    tile.append(el('div', 'stat-label', t.label));
-    tile.append(el('div', `stat-value ${t.cls || ''}`.trim(), t.value));
-    tile.append(el('div', 'stat-sub', t.sub));
-    wrap.appendChild(tile);
+  // Rather than repeat the condition table here, derive each card's multiplier
+  // from figures the server already sent: copies priced off the market scale
+  // with it, copies with a hand-set value do not.
+  const prepared = priced.map(card => {
+    const unit = Number(card.unit_price) || 0;
+    const copies = card.copies || [];
+    const fixed = copies.filter(c => Number(c.manual_value) > 0)
+      .reduce((sum, c) => sum + Number(c.value || 0), 0);
+    const scaling = copies.filter(c => !(Number(c.manual_value) > 0))
+      .reduce((sum, c) => sum + Number(c.value || 0), 0);
+    return {
+      fixed,
+      factor: unit > 0 ? scaling / unit : 0,
+      points: (card.price_history || [])
+        .map(h => ({ t: new Date(h.recorded_at).getTime(), v: Number(h.price) }))
+        .filter(p => p.v > 0 && Number.isFinite(p.t))
+        .sort((a, b) => a.t - b.t),
+    };
+  }).filter(c => c.points.length);
+
+  const earliest = Math.min(...prepared.map(c => c.points[0].t));
+  const now = Date.now();
+  const span = days > 0 ? Math.min(days, Math.ceil((now - earliest) / 86400000) + 1) : Math.ceil((now - earliest) / 86400000) + 1;
+  const buckets = Math.min(Math.max(span, 2), 120);
+  const step = Math.max((now - Math.max(earliest, now - span * 86400000)) / (buckets - 1), 1);
+  const from = now - step * (buckets - 1);
+
+  const series = [];
+  for (let i = 0; i < buckets; i++) {
+    const t = from + step * i;
+    let total = 0;
+    for (const card of prepared) {
+      // Before a card's first recorded price, value it at that first price.
+      // The chart answers "how has what Jack owns moved?" — if cards blinked
+      // into existence as they were scanned, the line would show him adding
+      // cards and call it a 4,000% gain.
+      let unit = card.points[0].v;
+      for (const p of card.points) {
+        if (p.t <= t) unit = p.v; else break;
+      }
+      total += unit * card.factor + card.fixed;
+    }
+    series.push({ t, v: Number(total.toFixed(2)) });
+  }
+  return series.filter(p => p.v > 0);
+}
+
+function renderHero() {
+  const s = state.stats;
+  $('heroValue').textContent = money(s.totalValue || 0);
+
+  const series = portfolioSeries(state.heroRange);
+  const first = series.length ? series[0].v : null;
+  const last = series.length ? series[series.length - 1].v : null;
+  const windowChange = first && last ? ((last - first) / first) * 100 : null;
+  const windowDelta = first && last ? last - first : null;
+
+  const changeEl = $('heroChange');
+  changeEl.innerHTML = '';
+  if (windowChange === null) {
+    changeEl.append(el('span', 'muted', 'Tracking starts as prices are recorded'));
+  } else {
+    const label = state.heroRange === 0 ? 'all time' : `past ${state.heroRange} days`;
+    changeEl.append(
+      el('span', trendClass(windowChange), `${windowDelta >= 0 ? '+' : '−'}${money(Math.abs(windowDelta)).slice(1)}`),
+      el('span', trendClass(windowChange), trendText(windowChange)),
+      el('span', 'muted', label),
+    );
   }
 
+  const chartHost = $('heroChart');
+  chartHost.innerHTML = '';
+  chartHost.appendChild(series.length >= 2
+    ? areaChart(series, windowChange === null || windowChange >= 0)
+    : el('div', 'empty-note', 'The value chart fills in as daily prices are recorded.'));
+
+  const facts = $('heroFacts');
+  facts.innerHTML = '';
+  const items = [
+    [String(s.totalCopies || 0), `card${s.totalCopies === 1 ? '' : 's'}`, false],
+    [String(s.totalCards || 0), 'unique', false],
+    [String(s.duplicateCards || 0), 'duplicated', false],
+  ];
+  if (s.unpricedCopies) items.push([String(s.unpricedCopies), 'unpriced', true]);
+  if (s.needsReview) items.push([String(s.needsReview), 'to review', true]);
+
+  for (const [value, label, alert] of items) {
+    const fact = el('div', `hero-fact${alert ? ' alert' : ''}`);
+    fact.append(el('b', null, value), el('span', null, label));
+    facts.appendChild(fact);
+  }
 }
+
+/** Wide area chart for the hero. Emphasised endpoint, no axes — the figure
+ *  above carries the number; the chart carries the shape. */
+function areaChart(points, rising) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const W = 700, H = 92;
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  const values = points.map(p => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || Math.max(max * 0.08, 1);
+  const x = (i) => (i / (points.length - 1)) * W;
+  const y = (v) => 10 + (1 - (v - min) / range) * (H - 22);
+
+  const stroke = rising ? 'var(--up)' : 'var(--down)';
+  const id = `h${Math.random().toString(36).slice(2, 8)}`;
+
+  const defs = document.createElementNS(NS, 'defs');
+  const grad = document.createElementNS(NS, 'linearGradient');
+  grad.setAttribute('id', id);
+  grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+  grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+  const s1 = document.createElementNS(NS, 'stop');
+  s1.setAttribute('offset', '0%'); s1.setAttribute('stop-color', stroke); s1.setAttribute('stop-opacity', '0.22');
+  const s2 = document.createElementNS(NS, 'stop');
+  s2.setAttribute('offset', '100%'); s2.setAttribute('stop-color', stroke); s2.setAttribute('stop-opacity', '0');
+  grad.append(s1, s2);
+  defs.appendChild(grad);
+  svg.appendChild(defs);
+
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(' ');
+
+  const area = document.createElementNS(NS, 'path');
+  area.setAttribute('d', `${line} L${W} ${H} L0 ${H} Z`);
+  area.setAttribute('fill', `url(#${id})`);
+  svg.appendChild(area);
+
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', line);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', stroke);
+  path.setAttribute('stroke-width', '2');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('vector-effect', 'non-scaling-stroke');
+  svg.appendChild(path);
+
+  return svg;
+}
+
+document.querySelectorAll('#heroRanges button').forEach((b) => {
+  b.addEventListener('click', () => {
+    state.heroRange = Number(b.dataset.range);
+    document.querySelectorAll('#heroRanges button').forEach(x => x.classList.toggle('active', x === b));
+    renderHero();
+  });
+});
 
 /**
  * The merge banner only appears when there is actually something to merge.
@@ -319,7 +515,7 @@ function cardArt(card, cls) {
     img.decoding = 'async';
     img.alt = card.card_name || 'Card';
     img.src = card.image_url;
-    img.addEventListener('error', () => { img.replaceWith(el('div', 'ph', '🃏')); }, { once: true });
+    img.addEventListener('error', () => { img.replaceWith(cardPlaceholder()); }, { once: true });
     wrap.appendChild(img);
   } else if (card.has_local_image) {
     const img = el('img');
@@ -328,7 +524,7 @@ function cardArt(card, cls) {
     img.dataset.localFor = card.id;
     wrap.appendChild(img);
   } else {
-    wrap.appendChild(el('div', 'ph', '🃏'));
+    wrap.appendChild(cardPlaceholder());
   }
   return wrap;
 }
@@ -340,8 +536,8 @@ function hydrateLocalImages(root) {
     img.dataset.hydrated = '1';
     fetch(`/api/portfolio/${img.dataset.localFor}/image`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(el('div', 'ph', '🃏')); })
-      .catch(() => img.replaceWith(el('div', 'ph', '🃏')));
+      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(cardPlaceholder()); })
+      .catch(() => img.replaceWith(cardPlaceholder()));
   });
 }
 
@@ -390,7 +586,7 @@ function renderCollection() {
 
   if (!state.cards.length) {
     host.appendChild(emptyState(
-      '🃏',
+      icon('card'),
       'No cards yet',
       'Point your camera at a card and it will be identified, priced and added in a couple of seconds.',
       'Scan your first card',
@@ -400,7 +596,7 @@ function renderCollection() {
   }
 
   if (!cards.length) {
-    host.appendChild(emptyState('🔍', 'Nothing matches that', `No cards match “${state.query}”.`));
+    host.appendChild(emptyState(icon('search'), 'Nothing matches that', `No cards match “${state.query}”.`));
     return;
   }
 
@@ -408,9 +604,11 @@ function renderCollection() {
   hydrateLocalImages(host);
 }
 
-function emptyState(icon, title, text, actionLabel, onAction) {
+function emptyState(glyph, title, text, actionLabel, onAction) {
   const box = el('div', 'empty glass');
-  box.append(el('div', 'empty-icon', icon), el('h2', null, title), el('p', null, text));
+  const iconWrap = el('div', 'empty-icon');
+  iconWrap.appendChild(glyph);
+  box.append(iconWrap, el('h2', null, title), el('p', null, text));
   if (actionLabel) {
     const btn = el('button', 'btn btn-primary', actionLabel);
     btn.addEventListener('click', onAction);
@@ -429,16 +627,20 @@ function gridOf(cards) {
     const art = cardArt(card, 'card-art');
     if (card.quantity > 1) art.appendChild(el('div', 'qty', `×${card.quantity}`));
 
+    // Only traits that single a card out. Nearly every card in a collection is
+    // holo, so a "Holo" badge on all of them says nothing and just adds noise —
+    // the printing is on the card's detail sheet where it matters.
     const flags = el('div', 'card-flags');
     if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Review'));
     if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
-    if (card.is_holo && !card.is_first_edition) flags.appendChild(el('span', 'flag flag-holo', 'Holo'));
     if (flags.children.length) art.appendChild(flags);
 
     const body = el('div', 'card-body');
     body.append(
       el('div', 'card-name', card.card_name || 'Unknown'),
-      el('div', 'card-meta', [card.card_set, card.card_number].filter(Boolean).join(' · ') || '—'),
+      // Number first: it is short and it identifies the printing, so when the
+      // line truncates the useful half survives.
+      el('div', 'card-meta', [card.card_number, card.card_set].filter(Boolean).join(' · ') || '—'),
     );
 
     const priceRow = el('div', 'card-price-row');
@@ -495,12 +697,94 @@ function listOf(cards) {
   return list;
 }
 
+/**
+ * The collection grouped by set — the closest thing here to a Pokédex page.
+ * Tapping a set searches for it, which reuses the filtering the grid already
+ * does rather than inventing a second way to narrow the collection.
+ */
+function renderSets() {
+  const host = $('setsBody');
+  host.innerHTML = '';
+
+  const groups = new Map();
+  for (const card of state.cards) {
+    if (card.needs_review) continue;
+    const name = card.card_set || 'Unknown set';
+    if (!groups.has(name)) groups.set(name, { name, cards: [], copies: 0, value: 0 });
+    const g = groups.get(name);
+    g.cards.push(card);
+    g.copies += card.quantity;
+    g.value += card.total_value;
+  }
+
+  let sets = [...groups.values()].sort((a, b) => b.value - a.value);
+  if (state.query) sets = sets.filter(g => g.name.toLowerCase().includes(state.query));
+
+  if (state.query && !sets.length) {
+    host.appendChild(emptyState(icon('search'), 'No sets match that', `Nothing matches “${state.query}”.`));
+    return;
+  }
+
+  if (!sets.length) {
+    host.appendChild(emptyState(icon('card'), 'No sets yet',
+      'Scan a few cards and they will be grouped by the set they came from.',
+      'Scan a card', openScanner));
+    return;
+  }
+
+  const wrap = el('div', 'sets');
+  for (const g of sets) {
+    const row = el('button', 'set glass glass-tap');
+    row.addEventListener('click', () => {
+      state.query = g.name.toLowerCase();
+      $('searchInput').value = g.name;
+      showView('collection');
+    });
+
+    // Three highest-value cards, fanned like cards in a sleeve.
+    const stack = el('div', 'set-stack');
+    for (const card of [...g.cards].sort((a, b) => b.total_value - a.total_value).slice(0, 3)) {
+      const chip = el('div', 'chip');
+      if (card.image_url) {
+        const img = el('img');
+        img.loading = 'lazy';
+        img.alt = '';
+        img.src = card.image_url;
+        img.addEventListener('error', () => img.remove(), { once: true });
+        chip.appendChild(img);
+      }
+      stack.appendChild(chip);
+    }
+    row.appendChild(stack);
+
+    const body = el('div', 'set-body');
+    body.append(
+      el('div', 'set-name', g.name),
+      el('div', 'set-meta', `${g.cards.length} unique · ${g.copies} card${g.copies === 1 ? '' : 's'} held`),
+    );
+    row.appendChild(body);
+
+    const figures = el('div', 'set-figures');
+    figures.append(
+      el('div', 'set-value', money(g.value)),
+      el('div', 'set-count', `${((g.value / (state.stats.totalValue || 1)) * 100).toFixed(0)}% of value`),
+    );
+    row.appendChild(figures);
+
+    wrap.appendChild(row);
+  }
+  host.appendChild(wrap);
+
+  const navSets = $('navSetsCount');
+  if (navSets) navSets.textContent = sets.length;
+}
+
 function renderReview() {
   const host = $('reviewBody');
   host.innerHTML = '';
   const cards = visibleCards();
   if (!cards.length) {
-    host.appendChild(emptyState('✅', 'Nothing to review', 'Every card we scanned was matched to the card database.'));
+    host.appendChild(emptyState(icon('check'), 'Nothing to review', 'Every card we scanned was matched to the card database.'));
     return;
   }
   host.appendChild(gridOf(cards));
@@ -513,6 +797,34 @@ const sheet = $('sheet');
 const scrim = $('scrim');
 
 function cardById(id) { return state.cards.find((c) => c.id === id); }
+
+/**
+ * A card carrying a price but no confidence was priced by the old engine, which
+ * recorded no provenance. The price may well be right; we simply cannot show
+ * where it came from until it is re-priced.
+ */
+function isUnverifiedPrice(card) {
+  return card.unit_price > 0 && !(Number(card.price_confidence) > 0);
+}
+
+async function repriceCard(cardId, button) {
+  const original = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Checking market…'; }
+  try {
+    const result = await api(`/api/portfolio/${cardId}/reprice`, { method: 'POST' });
+    if (result.price > 0) {
+      toast(`${money(result.price)} from ${result.quotesUsed} source${result.quotesUsed === 1 ? '' : 's'}`, 'success');
+    } else {
+      toast('No marketplace has a price for this printing right now', 'info', 5000);
+    }
+    await loadCollection();
+    if (state.openCardId === cardId) renderSheetBody();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    if (button) { button.disabled = false; button.textContent = original; }
+  }
+}
 
 function openSheet(id) {
   const card = cardById(id);
@@ -577,19 +889,32 @@ function renderSheetBody() {
 
   const pills = el('div', 'figure-pills');
   const conf = Number(card.price_confidence) || 0;
+
   if (card.unit_price > 0) {
-    const level = conf >= 0.8 ? 'good' : conf >= 0.55 ? 'warn' : 'bad';
-    const pill = el('span', `pill pill-${level}`);
-    pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
-    pills.appendChild(pill);
-    if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
-    if (card.price_variant_matched === false || card.price_variant_matched === 0) {
-      pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
+    if (isUnverifiedPrice(card)) {
+      // A price with no recorded provenance came from the old pipeline. It is
+      // unverified, not zero-confidence — saying "0%" about a real price is a
+      // lie in the other direction.
+      pills.appendChild(el('span', 'pill pill-warn', 'Not verified yet'));
+    } else {
+      const level = conf >= 0.8 ? 'good' : conf >= 0.55 ? 'warn' : 'bad';
+      const pill = el('span', `pill pill-${level}`);
+      pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
+      pills.appendChild(pill);
+      if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
+      if (!card.price_variant_matched) pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
     }
   }
   if (card.needs_review) pills.appendChild(el('span', 'pill pill-warn', 'Unconfirmed card'));
   if (card.has_mixed_conditions) pills.appendChild(el('span', 'pill', 'Mixed conditions'));
   if (pills.children.length) figures.appendChild(pills);
+
+  if (isUnverifiedPrice(card) || card.unit_price === 0) {
+    const repriceBtn = el('button', 'btn btn-glass btn-sm', 'Re-price now');
+    repriceBtn.style.marginTop = '10px';
+    repriceBtn.addEventListener('click', () => repriceCard(card.id, repriceBtn));
+    figures.appendChild(repriceBtn);
+  }
 
   hero.appendChild(figures);
   body.appendChild(hero);
@@ -1121,6 +1446,157 @@ async function refreshPrices(button) {
 
 $('refreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('settingsRefreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+$('unverifiedBannerBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+
+// ── TRACKING STATUS ──────────────────────────────────────────────
+
+const whenFrom = (ts) => {
+  if (!ts) return 'never';
+  const diff = new Date(ts).getTime() - Date.now();
+  const hours = Math.round(Math.abs(diff) / 3600000);
+  const label = hours < 48 ? `${hours}h` : `${Math.round(hours / 24)} days`;
+  return diff > 0 ? `in ${label}` : `${label} ago`;
+};
+
+async function loadHealth() {
+  const host = $('healthBody');
+  if (!host) return;
+  try {
+    const h = await api('/api/health');
+    host.innerHTML = '';
+    host.className = '';
+
+    const live = h.sources.filter((s) => s.live);
+    const rows = [
+      ['Price sources live', `${live.length} of ${h.sources.length} — ${live.map((s) => s.name).join(', ')}`,
+        live.length >= 3 ? 'good' : 'warn'],
+      ['Prices last refreshed', h.schedule.lastRefreshAt ? whenFrom(h.schedule.lastRefreshAt) : 'not yet — first run is due',
+        h.schedule.lastRefreshAt ? 'good' : 'warn'],
+      ['Next automatic refresh', h.schedule.running ? 'running now'
+        : h.schedule.overdue ? 'due — starts within 15 minutes'
+        : whenFrom(h.schedule.nextRefreshAt), 'good'],
+      ['Refresh frequency', `every ${h.schedule.everyDays} day${h.schedule.everyDays === 1 ? '' : 's'}`, 'good'],
+      ['Cards with a verified price', `${h.cards.verified} of ${h.cards.total}`,
+        h.cards.verified === h.cards.total ? 'good' : 'warn'],
+    ];
+
+    // Label above value: these values are sentences, not figures, and squeezing
+    // them into a right-aligned column truncates the labels on a phone.
+    for (const [label, value, tone] of rows) {
+      const row = el('div', 'health-row');
+      row.append(el('div', 'health-label', label));
+      const v = el('div', 'health-value', value);
+      if (tone === 'warn') v.classList.add('warn');
+      row.appendChild(v);
+      host.appendChild(row);
+    }
+
+    const missing = h.sources.filter((s) => !s.live);
+    if (missing.length) {
+      const note = el('div', 'field-hint');
+      note.style.marginTop = '10px';
+      note.textContent =
+        `More sources make each price more reliable. Still to add: ${missing.map((s) => s.key).join(', ')} ` +
+        '— set them as environment variables on your host and redeploy.';
+      host.appendChild(note);
+    }
+  } catch (err) {
+    host.textContent = `Could not load tracking status: ${err.message}`;
+  }
+}
+
+// ── PRICE HISTORY AUDIT ──────────────────────────────────────────
+
+/** Last resort: drop every cache and reload from the server. */
+$('forceUpdateBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  try {
+    const before = state.build;
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.update().catch(() => {})));
+    }
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+    const v = await api('/api/version');
+    if (v.build !== before) {
+      toast('New build found — reloading', 'success', 1500);
+      setTimeout(() => window.location.reload(), 700);
+    } else {
+      toast(`Already on the latest build (${v.build})`, 'info');
+      loadVersion();
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Check for updates';
+  }
+});
+
+$('auditHistoryBtn').addEventListener('click', openAuditModal);
+
+async function openAuditModal() {
+  openModal('auditModal');
+  const body = $('auditBody');
+  body.innerHTML = '';
+  $('auditIntro').textContent = 'Checking…';
+  $('auditPurgeBtn').disabled = true;
+
+  try {
+    const audit = await api('/api/portfolio/history-audit');
+    body.innerHTML = '';
+
+    if (!audit.pointCount) {
+      $('auditIntro').textContent =
+        `All ${audit.totalPoints} recorded prices look genuine. Nothing to clean up.`;
+      return;
+    }
+
+    $('auditIntro').textContent =
+      `${audit.pointCount} of ${audit.totalPoints} recorded prices were invented rather than observed — ` +
+      'they sit exactly 24 hours apart, which is the signature of the old backfill script. ' +
+      'Deleting them leaves only real prices, so charts will look sparse until they fill in again.';
+
+    for (const c of audit.cards) {
+      const row = el('div', 'dupe-group');
+      const info = el('div', 'dupe-group-body');
+      info.append(el('div', 'dupe-group-name', c.card_name || 'Unknown'));
+      info.append(el('div', 'dupe-group-meta', `${c.total} recorded prices`));
+      row.append(info, el('div', 'dupe-group-count', `${c.fabricated} invented`));
+      body.appendChild(row);
+    }
+
+    $('auditPurgeBtn').disabled = false;
+  } catch (err) {
+    $('auditIntro').textContent = `Could not check price history: ${err.message}`;
+  }
+}
+
+$('auditPurgeBtn').addEventListener('click', async () => {
+  if (!confirm('Delete every invented price point? Charts will only show prices actually recorded from here on.')) return;
+  const btn = $('auditPurgeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  try {
+    const result = await api('/api/portfolio/purge-synthetic-history', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    });
+    closeModals();
+    toast(`Removed ${result.deleted} invented price points`, 'success');
+    await loadCollection();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Delete invented points';
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 //  SCANNER
@@ -1166,7 +1642,7 @@ $('scannerCloseBtn').addEventListener('click', closeScanner);
 async function startCamera() {
   hideScannerMessage();
   if (!navigator.mediaDevices?.getUserMedia) {
-    showScannerMessage('📷', 'Live camera not supported',
+    showScannerMessage(icon('camera'), 'Live camera not supported',
       'This browser cannot open a live viewfinder. You can still use your phone’s camera app or pick a photo.');
     return;
   }
@@ -1193,7 +1669,7 @@ async function startCamera() {
   } catch (err) {
     const denied = err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError';
     showScannerMessage(
-      denied ? '🔒' : '📷',
+      denied ? icon('lock') : icon('camera'),
       denied ? 'Camera access blocked' : 'No camera available',
       denied
         ? 'Allow camera access for this site in your browser settings, or use your phone’s camera app instead.'
@@ -1213,8 +1689,10 @@ function stopCamera() {
   $('torchBtn').classList.remove('active');
 }
 
-function showScannerMessage(icon, title, text) {
-  $('scannerMsgIcon').textContent = icon;
+function showScannerMessage(glyph, title, text) {
+  const iconHost = $('scannerMsgIcon');
+  iconHost.innerHTML = '';
+  iconHost.appendChild(glyph);
   $('scannerMsgTitle').textContent = title;
   $('scannerMsgText').textContent = text;
   $('scannerMsg').classList.add('show');
@@ -1580,9 +2058,53 @@ function connectEvents() {
 // ── SERVICE WORKER ───────────────────────────────────────────────
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is optional */ });
+  window.addEventListener('load', async () => {
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+
+      // A worker waiting to take over means a newer build is already
+      // downloaded. Activate it rather than leaving the old app on screen.
+      const takeOver = (worker) => {
+        if (!worker) return;
+        worker.postMessage('skip-waiting');
+      };
+      if (reg.waiting) takeOver(reg.waiting);
+      reg.addEventListener('updatefound', () => {
+        const installing = reg.installing;
+        installing?.addEventListener('statechange', () => {
+          if (installing.state === 'installed' && navigator.serviceWorker.controller) takeOver(installing);
+        });
+      });
+
+      let reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (reloading) return;
+        reloading = true;
+        window.location.reload();
+      });
+
+      // Check for a new build when the app is reopened, not only on cold start —
+      // a home-screen app can stay alive for days.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    } catch {
+      /* offline shell is optional */
+    }
   });
+}
+
+/** Which build is on screen. Shown in Settings so "did the deploy land?" is answerable. */
+async function loadVersion() {
+  const host = $('buildInfo');
+  if (!host) return;
+  try {
+    const v = await api('/api/version');
+    state.build = v.build;
+    host.textContent = `Build ${v.build}${v.commit ? ` · commit ${v.commit}` : ''} · running since ${timeAgo(v.bootedAt)}`;
+  } catch {
+    host.textContent = 'Could not read the build version.';
+  }
 }
 
 // ── BOOT ─────────────────────────────────────────────────────────

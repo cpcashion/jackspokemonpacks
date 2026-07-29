@@ -12,8 +12,8 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Jack's Cards" />
-  <meta name="theme-color" content="#eef1f6" media="(prefers-color-scheme: light)" />
-  <meta name="theme-color" content="#070912" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#fbfbfb" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#08090a" media="(prefers-color-scheme: dark)" />
   <link rel="apple-touch-icon" href="/icons/icon-180.png" />
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
 
@@ -36,7 +36,9 @@
   <!-- ── DESKTOP RAIL ──────────────────────────────────────── -->
   <aside class="rail">
     <div class="brand">
-      <div class="brand-mark">⚡</div>
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M13.5 2 4 13.6h6.1L9.3 22 20 9.9h-6.6z"/></svg>
+      </div>
       <div class="brand-text">
         <span class="brand-name">Jack's Cards</span>
         <span class="brand-sub">Pokémon collection</span>
@@ -49,9 +51,10 @@
         Collection
         <span class="nav-count" id="navCollectionCount">0</span>
       </button>
-      <button class="nav-item" data-view="scan">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.2"/></svg>
-        Scan a card
+      <button class="nav-item" data-view="sets">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="16" rx="2"/><path d="M7 4v16M21 7v11a2 2 0 0 1-2 2"/></svg>
+        Sets
+        <span class="nav-count" id="navSetsCount">0</span>
       </button>
       <button class="nav-item" data-view="review">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
@@ -96,10 +99,36 @@
     <!-- ── COLLECTION ── -->
     <section class="view active" id="view-collection">
 
-      <div class="stats" id="stats"></div>
+      <!-- One figure that matters, with the collection's own history behind it. -->
+      <section class="hero glass" id="hero">
+        <div class="hero-head">
+          <div>
+            <div class="hero-label">Collection value</div>
+            <div class="hero-value" id="heroValue">$0.00</div>
+            <div class="hero-change" id="heroChange"></div>
+          </div>
+          <div class="hero-ranges" id="heroRanges">
+            <button data-range="7" >7D</button>
+            <button data-range="30" class="active">30D</button>
+            <button data-range="90">90D</button>
+            <button data-range="0">All</button>
+          </div>
+        </div>
+        <div class="hero-chart" id="heroChart"></div>
+        <div class="hero-facts" id="heroFacts"></div>
+      </section>
+
+      <div class="banner glass" id="unverifiedBanner" hidden>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+        <div class="banner-body">
+          <div class="banner-title" id="unverifiedBannerTitle">Some prices are not verified</div>
+          <div class="banner-text" id="unverifiedBannerText"></div>
+        </div>
+        <button class="btn btn-glass btn-sm" id="unverifiedBannerBtn">Re-price them</button>
+      </div>
 
       <div class="banner glass" id="dupeBanner" hidden>
-        <span class="banner-icon">🗂️</span>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="13" height="14" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-3"/></svg></span>
         <div class="banner-body">
           <div class="banner-title" id="dupeBannerTitle">Duplicate cards found</div>
           <div class="banner-text" id="dupeBannerText"></div>
@@ -137,10 +166,15 @@
       <div id="collectionBody"></div>
     </section>
 
+    <!-- ── SETS ── -->
+    <section class="view" id="view-sets">
+      <div id="setsBody"></div>
+    </section>
+
     <!-- ── REVIEW ── -->
     <section class="view" id="view-review">
       <div class="banner glass">
-        <span class="banner-icon">🔎</span>
+        <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
         <div class="banner-body">
           <div class="banner-title">Cards we could not confirm</div>
           <div class="banner-text">These were saved from your scans but not found in the card database, so they are not priced. Correct the name, set or number and they will price themselves.</div>
@@ -177,6 +211,18 @@
           </div>
           <button class="btn btn-glass btn-sm" id="settingsRefreshBtn">Refresh</button>
         </div>
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Check price history</div>
+            <div class="setting-desc">An earlier version filled the charts with invented daily prices. This finds those points and can remove them, leaving only prices that were really observed.</div>
+          </div>
+          <button class="btn btn-glass btn-sm" id="auditHistoryBtn">Check</button>
+        </div>
+      </div>
+
+      <div class="panel glass" id="healthPanel">
+        <div class="section-title" style="margin-bottom: 12px;">Price tracking status</div>
+        <div id="healthBody" class="chart-empty" style="height:auto; padding: 8px 0;">Checking…</div>
       </div>
 
       <div class="panel glass">
@@ -194,29 +240,46 @@
         </p>
         <div id="fxNote" style="font-size: 12px; color: var(--text-3); margin-top: 12px;"></div>
       </div>
+
+      <div class="panel glass">
+        <div class="section-title" style="margin-bottom: 8px;">This build</div>
+        <div id="buildInfo" style="font-family: var(--font-mono); font-size: 12px; color: var(--text-2);">Checking…</div>
+        <button class="btn btn-glass btn-sm" id="forceUpdateBtn" style="margin-top: 11px;">Check for updates</button>
+      </div>
     </section>
 
   </main>
 </div>
 
-<!-- ── MOBILE TAB BAR ──────────────────────────────────────── -->
-<nav class="tabbar glass glass-lg">
+<!-- ── MOBILE TAB BAR ────────────────────────────────────────
+     Four destinations on a five-column grid with the scan action occupying
+     the middle column. Every tab therefore has an identical footprint, and
+     the active state changes only colour and icon fill — never size — so
+     the spacing cannot appear to shift when you move between them.        -->
+<nav class="tabbar">
   <button class="tab active" data-view="collection">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-    Collection
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+    <span>Collection</span>
   </button>
-  <button class="tab tab-scan" data-view="scan">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.2"/></svg>
-    Scan
+  <button class="tab" data-view="sets">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="16" rx="2"/><path d="M7 4v16M21 7v11a2 2 0 0 1-2 2"/></svg>
+    <span>Sets</span>
   </button>
+
+  <!-- The lens. An action, not a place — so it is round, raised, and the
+       only coloured thing down here. -->
+  <button class="lens" id="lensBtn" aria-label="Scan a card">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5V6a2 2 0 0 1 2-2h2.5M16.5 4H19a2 2 0 0 1 2 2v2.5M21 15.5V18a2 2 0 0 1-2 2h-2.5M7.5 20H5a2 2 0 0 1-2-2v-2.5"/><circle cx="12" cy="12" r="3.4"/></svg>
+  </button>
+
   <button class="tab" data-view="review">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
-    Review
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+    <span>Review</span>
     <span class="tab-badge" id="tabReviewBadge" hidden>0</span>
   </button>
   <button class="tab" data-view="settings">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-    Settings
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    <span>Settings</span>
   </button>
 </nav>
 
@@ -407,6 +470,19 @@
   <div class="modal-foot">
     <button class="btn btn-quiet" data-close-modal>Cancel</button>
     <button class="btn btn-primary" id="copySaveBtn">Save</button>
+  </div>
+</div>
+
+<!-- ── HISTORY AUDIT MODAL ─────────────────────────────────── -->
+<div class="modal glass glass-lg" id="auditModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3>Invented price history</h3>
+    <p id="auditIntro">Checking…</p>
+  </div>
+  <div class="modal-body" id="auditBody"></div>
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Close</button>
+    <button class="btn btn-primary" id="auditPurgeBtn" disabled>Delete invented points</button>
   </div>
 </div>
 

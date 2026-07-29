@@ -98,6 +98,15 @@
 
       <div class="stats" id="stats"></div>
 
+      <div class="banner glass" id="unverifiedBanner" hidden>
+        <span class="banner-icon">🕓</span>
+        <div class="banner-body">
+          <div class="banner-title" id="unverifiedBannerTitle">Some prices are not verified</div>
+          <div class="banner-text" id="unverifiedBannerText"></div>
+        </div>
+        <button class="btn btn-glass btn-sm" id="unverifiedBannerBtn">Re-price them</button>
+      </div>
+
       <div class="banner glass" id="dupeBanner" hidden>
         <span class="banner-icon">🗂️</span>
         <div class="banner-body">
@@ -176,6 +185,13 @@
             <div class="setting-desc">Re-checks every card against the market APIs. Takes a while for a large collection.</div>
           </div>
           <button class="btn btn-glass btn-sm" id="settingsRefreshBtn">Refresh</button>
+        </div>
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Check price history</div>
+            <div class="setting-desc">An earlier version filled the charts with invented daily prices. This finds those points and can remove them, leaving only prices that were really observed.</div>
+          </div>
+          <button class="btn btn-glass btn-sm" id="auditHistoryBtn">Check</button>
         </div>
       </div>
 
@@ -407,6 +423,19 @@
   <div class="modal-foot">
     <button class="btn btn-quiet" data-close-modal>Cancel</button>
     <button class="btn btn-primary" id="copySaveBtn">Save</button>
+  </div>
+</div>
+
+<!-- ── HISTORY AUDIT MODAL ─────────────────────────────────── -->
+<div class="modal glass glass-lg" id="auditModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3>Invented price history</h3>
+    <p id="auditIntro">Checking…</p>
+  </div>
+  <div class="modal-body" id="auditBody"></div>
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Close</button>
+    <button class="btn btn-primary" id="auditPurgeBtn" disabled>Delete invented points</button>
   </div>
 </div>
 

@@ -36,6 +36,7 @@ import {
     CONDITIONS,
     isTruthy,
 } from './lib/identity.js';
+import { auditHistoryRows } from './lib/history.js';
 import {
     quotesFromPokemonTcgCandidate,
     quotesFromTcgdexCard,
@@ -151,10 +152,56 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS idx_card_copies_card ON card_copies(card_id);
         CREATE INDEX IF NOT EXISTS idx_portfolio_variant ON portfolio_cards(user_id, variant_key);
+
+        -- Records one-time migrations so they cannot run twice.
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT '',
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     `);
 
     await backfillVariantKeys();
     await backfillCardCopies();
+    await queueLegacyPricesForRecheck();
+}
+
+async function hasRun(key) {
+    const res = await pool.query('SELECT 1 FROM app_meta WHERE key = $1', [key]);
+    return res.rows.length > 0;
+}
+
+async function markRun(key, value = '') {
+    await pool.query(
+        'INSERT INTO app_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+        [key, String(value)]
+    );
+}
+
+/**
+ * Cards priced by the old pipeline carry a price but no provenance — no
+ * confidence, no marketplace, no record of which printing was used. They are
+ * not wrong so much as unverified, and the UI cannot tell the difference.
+ *
+ * Clearing last_price_check puts them at the front of the refresh queue so the
+ * current engine re-prices them and fills in the evidence. Guarded by app_meta
+ * because a card that genuinely cannot be priced would otherwise be re-queued
+ * on every boot forever.
+ */
+async function queueLegacyPricesForRecheck() {
+    const KEY = 'requeue_unverified_prices_v1';
+    if (await hasRun(KEY)) return;
+
+    const res = await pool.query(`
+        UPDATE portfolio_cards
+        SET last_price_check = NULL
+        WHERE COALESCE(price_confidence, 0) = 0
+          AND COALESCE(current_price, 0) > 0
+    `);
+    await markRun(KEY, res.rowCount);
+    if (res.rowCount) {
+        console.log(`  [Migrate] Queued ${res.rowCount} card(s) priced by the old engine for re-pricing`);
+    }
 }
 
 /**
@@ -300,6 +347,19 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
 /** Marks a card as checked without touching its price — used when a lookup finds nothing. */
 async function markPriceChecked(cardId) {
     await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [cardId]);
+}
+
+// ── Fabricated price history ───────────────────────────────────────────────
+
+/** See lib/history.js for how generated points are told apart from real ones. */
+async function auditSyntheticHistory() {
+    const res = await pool.query(`
+        SELECT ph.id, ph.card_id, ph.recorded_at, pc.card_name
+        FROM price_history ph
+        JOIN portfolio_cards pc ON pc.id = ph.card_id
+        ORDER BY ph.card_id, ph.recorded_at ASC
+    `);
+    return auditHistoryRows(res.rows);
 }
 
 // ── Duplicate consolidation ────────────────────────────────────────────────
@@ -575,12 +635,15 @@ function computePortfolioStats(cards) {
     let unpriced = 0;
     let needsReview = 0;
     let acquiredCost = 0;
+    let unverified = 0;
 
     for (const card of cards) {
         totalValue += card.total_value;
         totalCopies += card.quantity;
         if (!(card.unit_price > 0)) unpriced += card.quantity;
         if (card.needs_review) needsReview++;
+        // Priced, but by the old engine — no confidence or source was recorded.
+        if (card.unit_price > 0 && !(Number(card.price_confidence) > 0)) unverified++;
 
         // Yesterday's value at today's holdings, so a change figure reflects the
         // market moving rather than Jack adding cards.
@@ -597,6 +660,7 @@ function computePortfolioStats(cards) {
         totalCopies,
         duplicateCards: cards.filter(c => c.quantity > 1).length,
         unpricedCopies: unpriced,
+        unverifiedPrices: unverified,
         needsReview,
         totalValue: Number(totalValue.toFixed(2)),
         prevValue: Number(prevValue.toFixed(2)),
@@ -1749,6 +1813,74 @@ app.post('/api/portfolio/merge-duplicates', requireAuth, express.json(), async (
         res.json({ success: true, ...result });
     } catch (err) {
         console.error('Merge error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Re-price one card immediately and return the result, so a card showing an
+ * unverified price can be fixed on the spot instead of waiting for the next
+ * full refresh.
+ */
+app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
+    const cardId = parseInt(req.params.id, 10);
+    try {
+        const owned = await pool.query('SELECT * FROM portfolio_cards WHERE id = $1 AND user_id = $2', [cardId, req.user.id]);
+        if (!owned.rows.length) return res.status(404).json({ error: 'Card not found' });
+        const card = owned.rows[0];
+
+        // Bypass the cache: the point of asking is to get a fresh answer.
+        priceCache.delete(buildVariantKey(card));
+
+        const market = await lookupMarketPrice(card);
+        if (market && market.price > 0) {
+            await insertPricePoint(cardId, market.price, market.source, market.url || '');
+            await updatePortfolioCardMarketData(cardId, market);
+        } else {
+            await markPriceChecked(cardId);
+        }
+
+        broadcast({ type: 'portfolio_updated' });
+        res.json({
+            success: true,
+            price: market?.price || 0,
+            source: market?.source || 'not_found',
+            confidence: market?.confidence || 0,
+            quotesUsed: market?.quotesUsed || 0,
+            quotesSeen: market?.quotesSeen || 0,
+        });
+    } catch (err) {
+        console.error('Reprice error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Report price-history points that were fabricated by the old backfill scripts
+ * rather than observed. Read-only; purging is a separate confirmed action.
+ */
+app.get('/api/portfolio/history-audit', requireAuth, async (req, res) => {
+    try {
+        const audit = await auditSyntheticHistory();
+        res.json({ cards: audit.cards, pointCount: audit.pointCount, totalPoints: audit.totalPoints });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/portfolio/purge-synthetic-history', requireAuth, express.json(), async (req, res) => {
+    try {
+        if (req.body?.confirm !== true) {
+            return res.status(400).json({ error: 'Refusing to delete history without confirm:true' });
+        }
+        const audit = await auditSyntheticHistory();
+        if (!audit.ids.length) return res.json({ success: true, deleted: 0 });
+
+        const result = await pool.query('DELETE FROM price_history WHERE id = ANY($1::int[])', [audit.ids]);
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, deleted: result.rowCount, cardsAffected: audit.cards.length });
+    } catch (err) {
+        console.error('Purge error:', err);
         res.status(500).json({ error: err.message });
     }
 });

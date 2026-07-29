@@ -270,6 +270,16 @@ function renderStats() {
     { label: 'Unpriced', value: String(s.unpricedCopies || 0), sub: s.unpricedCopies ? 'no market data found' : 'every card is priced', cls: s.unpricedCopies ? 'flat' : undefined },
   ];
 
+  const unverified = s.unverifiedPrices || 0;
+  const banner = $('unverifiedBanner');
+  banner.hidden = unverified === 0;
+  if (unverified) {
+    $('unverifiedBannerTitle').textContent =
+      `${unverified} price${unverified === 1 ? '' : 's'} not verified`;
+    $('unverifiedBannerText').textContent =
+      'These were set by an earlier version that did not record where the number came from. Re-pricing checks them against the marketplaces and shows the evidence.';
+  }
+
   const wrap = $('stats');
   wrap.innerHTML = '';
   for (const t of tiles) {
@@ -514,6 +524,34 @@ const scrim = $('scrim');
 
 function cardById(id) { return state.cards.find((c) => c.id === id); }
 
+/**
+ * A card carrying a price but no confidence was priced by the old engine, which
+ * recorded no provenance. The price may well be right; we simply cannot show
+ * where it came from until it is re-priced.
+ */
+function isUnverifiedPrice(card) {
+  return card.unit_price > 0 && !(Number(card.price_confidence) > 0);
+}
+
+async function repriceCard(cardId, button) {
+  const original = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Checking market…'; }
+  try {
+    const result = await api(`/api/portfolio/${cardId}/reprice`, { method: 'POST' });
+    if (result.price > 0) {
+      toast(`${money(result.price)} from ${result.quotesUsed} source${result.quotesUsed === 1 ? '' : 's'}`, 'success');
+    } else {
+      toast('No marketplace has a price for this printing right now', 'info', 5000);
+    }
+    await loadCollection();
+    if (state.openCardId === cardId) renderSheetBody();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    if (button) { button.disabled = false; button.textContent = original; }
+  }
+}
+
 function openSheet(id) {
   const card = cardById(id);
   if (!card) return;
@@ -577,19 +615,32 @@ function renderSheetBody() {
 
   const pills = el('div', 'figure-pills');
   const conf = Number(card.price_confidence) || 0;
+
   if (card.unit_price > 0) {
-    const level = conf >= 0.8 ? 'good' : conf >= 0.55 ? 'warn' : 'bad';
-    const pill = el('span', `pill pill-${level}`);
-    pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
-    pills.appendChild(pill);
-    if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
-    if (card.price_variant_matched === false || card.price_variant_matched === 0) {
-      pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
+    if (isUnverifiedPrice(card)) {
+      // A price with no recorded provenance came from the old pipeline. It is
+      // unverified, not zero-confidence — saying "0%" about a real price is a
+      // lie in the other direction.
+      pills.appendChild(el('span', 'pill pill-warn', 'Not verified yet'));
+    } else {
+      const level = conf >= 0.8 ? 'good' : conf >= 0.55 ? 'warn' : 'bad';
+      const pill = el('span', `pill pill-${level}`);
+      pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
+      pills.appendChild(pill);
+      if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
+      if (!card.price_variant_matched) pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
     }
   }
   if (card.needs_review) pills.appendChild(el('span', 'pill pill-warn', 'Unconfirmed card'));
   if (card.has_mixed_conditions) pills.appendChild(el('span', 'pill', 'Mixed conditions'));
   if (pills.children.length) figures.appendChild(pills);
+
+  if (isUnverifiedPrice(card) || card.unit_price === 0) {
+    const repriceBtn = el('button', 'btn btn-glass btn-sm', 'Re-price now');
+    repriceBtn.style.marginTop = '10px';
+    repriceBtn.addEventListener('click', () => repriceCard(card.id, repriceBtn));
+    figures.appendChild(repriceBtn);
+  }
 
   hero.appendChild(figures);
   body.appendChild(hero);
@@ -1121,6 +1172,69 @@ async function refreshPrices(button) {
 
 $('refreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('settingsRefreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+$('unverifiedBannerBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+
+// ── PRICE HISTORY AUDIT ──────────────────────────────────────────
+
+$('auditHistoryBtn').addEventListener('click', openAuditModal);
+
+async function openAuditModal() {
+  openModal('auditModal');
+  const body = $('auditBody');
+  body.innerHTML = '';
+  $('auditIntro').textContent = 'Checking…';
+  $('auditPurgeBtn').disabled = true;
+
+  try {
+    const audit = await api('/api/portfolio/history-audit');
+    body.innerHTML = '';
+
+    if (!audit.pointCount) {
+      $('auditIntro').textContent =
+        `All ${audit.totalPoints} recorded prices look genuine. Nothing to clean up.`;
+      return;
+    }
+
+    $('auditIntro').textContent =
+      `${audit.pointCount} of ${audit.totalPoints} recorded prices were invented rather than observed — ` +
+      'they sit exactly 24 hours apart, which is the signature of the old backfill script. ' +
+      'Deleting them leaves only real prices, so charts will look sparse until they fill in again.';
+
+    for (const c of audit.cards) {
+      const row = el('div', 'dupe-group');
+      const info = el('div', 'dupe-group-body');
+      info.append(el('div', 'dupe-group-name', c.card_name || 'Unknown'));
+      info.append(el('div', 'dupe-group-meta', `${c.total} recorded prices`));
+      row.append(info, el('div', 'dupe-group-count', `${c.fabricated} invented`));
+      body.appendChild(row);
+    }
+
+    $('auditPurgeBtn').disabled = false;
+  } catch (err) {
+    $('auditIntro').textContent = `Could not check price history: ${err.message}`;
+  }
+}
+
+$('auditPurgeBtn').addEventListener('click', async () => {
+  if (!confirm('Delete every invented price point? Charts will only show prices actually recorded from here on.')) return;
+  const btn = $('auditPurgeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  try {
+    const result = await api('/api/portfolio/purge-synthetic-history', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    });
+    closeModals();
+    toast(`Removed ${result.deleted} invented price points`, 'success');
+    await loadCollection();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Delete invented points';
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 //  SCANNER

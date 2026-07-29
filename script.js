@@ -165,6 +165,7 @@ function showView(name) {
   $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
   window.scrollTo({ top: 0 });
   render();
+  if (name === 'settings') loadHealth();
 }
 
 document.querySelectorAll('[data-view]').forEach((b) => {
@@ -1173,6 +1174,63 @@ async function refreshPrices(button) {
 $('refreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('settingsRefreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('unverifiedBannerBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
+
+// ── TRACKING STATUS ──────────────────────────────────────────────
+
+const whenFrom = (ts) => {
+  if (!ts) return 'never';
+  const diff = new Date(ts).getTime() - Date.now();
+  const hours = Math.round(Math.abs(diff) / 3600000);
+  const label = hours < 48 ? `${hours}h` : `${Math.round(hours / 24)} days`;
+  return diff > 0 ? `in ${label}` : `${label} ago`;
+};
+
+async function loadHealth() {
+  const host = $('healthBody');
+  if (!host) return;
+  try {
+    const h = await api('/api/health');
+    host.innerHTML = '';
+    host.className = '';
+
+    const live = h.sources.filter((s) => s.live);
+    const rows = [
+      ['Price sources live', `${live.length} of ${h.sources.length} — ${live.map((s) => s.name).join(', ')}`,
+        live.length >= 3 ? 'good' : 'warn'],
+      ['Prices last refreshed', h.schedule.lastRefreshAt ? whenFrom(h.schedule.lastRefreshAt) : 'not yet — first run is due',
+        h.schedule.lastRefreshAt ? 'good' : 'warn'],
+      ['Next automatic refresh', h.schedule.running ? 'running now'
+        : h.schedule.overdue ? 'due — starts within 15 minutes'
+        : whenFrom(h.schedule.nextRefreshAt), 'good'],
+      ['Refresh frequency', `every ${h.schedule.everyDays} day${h.schedule.everyDays === 1 ? '' : 's'}`, 'good'],
+      ['Cards with a verified price', `${h.cards.verified} of ${h.cards.total}`,
+        h.cards.verified === h.cards.total ? 'good' : 'warn'],
+    ];
+
+    // Label above value: these values are sentences, not figures, and squeezing
+    // them into a right-aligned column truncates the labels on a phone.
+    for (const [label, value, tone] of rows) {
+      const row = el('div', 'health-row');
+      row.append(el('div', 'health-label', label));
+      const v = el('div', 'health-value', value);
+      if (tone === 'warn') v.classList.add('warn');
+      row.appendChild(v);
+      host.appendChild(row);
+    }
+
+    const missing = h.sources.filter((s) => !s.live);
+    if (missing.length) {
+      const note = el('div', 'field-hint');
+      note.style.marginTop = '10px';
+      note.textContent =
+        `More sources make each price more reliable. Still to add: ${missing.map((s) => s.key).join(', ')} ` +
+        '— set them as environment variables on your host and redeploy.';
+      host.appendChild(note);
+    }
+  } catch (err) {
+    host.textContent = `Could not load tracking status: ${err.message}`;
+  }
+}
 
 // ── PRICE HISTORY AUDIT ──────────────────────────────────────────
 

@@ -712,6 +712,14 @@ body::before {
 .detail-k { font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.04em; }
 .detail-v { font-size: 13.5px; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
 
+/* Tracking status: label above value, so long values wrap instead of
+   squeezing the label into an ellipsis. */
+.health-row { padding: 9px 0; border-bottom: 1px solid var(--hairline); }
+.health-row:last-of-type { border-bottom: none; }
+.health-label { font-size: 11.5px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.045em; }
+.health-value { font-size: 14px; font-weight: 600; margin-top: 3px; line-height: 1.4; overflow-wrap: anywhere; }
+.health-value.warn { color: var(--warn); }
+
 .sources { display: flex; flex-direction: column; gap: 6px; }
 .source-row { display: flex; align-items: center; gap: 9px; font-size: 12.5px; padding: 7px 10px; border-radius: var(--r-xs); background: var(--glass-fill); }
 .source-row.unused { opacity: 0.55; }

@@ -1502,13 +1502,74 @@ async function refreshAllPrices() {
     }
 }
 
-// Auto-refresh every 24 hours (only in long-running server mode, not Vercel serverless)
+// ═══════════════════════════════════════════════════════════════
+//  SCHEDULED REFRESH
+//
+//  This used to be a plain setInterval(24h). The timer resets whenever the
+//  process restarts, and a host restarts on every deploy — so on an app that
+//  gets deployed every day or two, the refresh could go weeks without ever
+//  firing. That is the difference between "prices update daily" and "prices
+//  are from whenever the card was added".
+//
+//  Instead: remember when the last refresh finished, check often, and run when
+//  it is actually due. A restart cannot lose the schedule.
+// ═══════════════════════════════════════════════════════════════
+
 const IS_VERCEL = !!process.env.VERCEL;
+
+/** How often to re-check every card. Days, so it can be tuned without a deploy. */
+const REFRESH_EVERY_DAYS = Math.max(0.25, Number(process.env.PRICE_REFRESH_DAYS) || 1);
+const REFRESH_EVERY_MS = REFRESH_EVERY_DAYS * 24 * 60 * 60 * 1000;
+const SCHEDULER_TICK_MS = 15 * 60 * 1000;
+const LAST_REFRESH_KEY = 'last_full_refresh';
+
+async function getLastRefreshAt() {
+    try {
+        const res = await pool.query('SELECT value FROM app_meta WHERE key = $1', [LAST_REFRESH_KEY]);
+        const ts = res.rows[0]?.value ? Number(res.rows[0].value) : 0;
+        return Number.isFinite(ts) ? ts : 0;
+    } catch {
+        return 0;
+    }
+}
+
+async function setLastRefreshAt(ts) {
+    await pool.query(`
+        INSERT INTO app_meta (key, value, applied_at) VALUES ($1, $2, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, applied_at = NOW()
+    `, [LAST_REFRESH_KEY, String(ts)]);
+}
+
+export async function refreshSchedule() {
+    const last = await getLastRefreshAt();
+    const dueAt = last ? last + REFRESH_EVERY_MS : 0;
+    return {
+        everyDays: REFRESH_EVERY_DAYS,
+        lastRefreshAt: last || null,
+        nextRefreshAt: dueAt || null,
+        overdue: Date.now() >= dueAt,
+        running: priceRefreshRunning,
+    };
+}
+
+async function runScheduledRefreshIfDue() {
+    if (priceRefreshRunning) return;
+    try {
+        const last = await getLastRefreshAt();
+        if (last && Date.now() - last < REFRESH_EVERY_MS) return;
+
+        console.log(`  [Schedule] Price refresh is due (every ${REFRESH_EVERY_DAYS} day(s)) — starting.`);
+        await refreshAllPrices();
+        await setLastRefreshAt(Date.now());
+    } catch (err) {
+        console.error('  [Schedule] Refresh failed:', err.message);
+    }
+}
+
 if (!IS_VERCEL) {
-    const REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
-    setInterval(() => {
-        refreshAllPrices().catch(err => console.error('[AutoRefresh] Error:', err.message));
-    }, REFRESH_INTERVAL);
+    // A short delay on boot so a restart storm does not stampede the APIs.
+    setTimeout(() => { runScheduledRefreshIfDue(); }, 60 * 1000);
+    setInterval(() => { runScheduledRefreshIfDue(); }, SCHEDULER_TICK_MS);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1893,8 +1954,49 @@ app.post('/api/portfolio/refresh-prices', requireAuth, async (req, res) => {
             // On Vercel, do a small batch synchronously
             refreshBatchPrices(5).catch(err => console.error('Manual refresh error:', err));
         } else {
-            refreshAllPrices().catch(err => console.error('Manual refresh error:', err));
+            // A manual refresh also resets the schedule — no point re-running an
+            // hour later just because the clock said so.
+            refreshAllPrices()
+                .then(() => setLastRefreshAt(Date.now()))
+                .catch(err => console.error('Manual refresh error:', err));
         }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Everything needed to answer "is this app actually keeping prices current?"
+ * without reading logs: which sources are live, when prices last refreshed,
+ * when the next one is due, and how much of the collection is verified.
+ */
+app.get('/api/health', requireAuth, async (req, res) => {
+    try {
+        const cards = await getAllPortfolioCards(req.user.id);
+        const stats = computePortfolioStats(cards);
+        const schedule = await refreshSchedule();
+
+        const checked = cards.map(c => c.last_price_check).filter(Boolean).map(d => new Date(d).getTime());
+
+        res.json({
+            sources: [
+                { name: 'Pokémon TCG API', live: true, detail: POKEMON_TCG_KEY ? 'API key set' : 'no key — rate limited', key: 'POKEMON_TCG_KEY' },
+                { name: 'TCGdex', live: true, detail: 'free, no key needed', key: null },
+                { name: 'Scrydex', live: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), detail: 'needs SCRYDEX_API_KEY + SCRYDEX_TEAM_ID', key: 'SCRYDEX_API_KEY' },
+                { name: 'JustTCG', live: Boolean(JUSTTCG_API_KEY), detail: 'needs JUSTTCG_API_KEY', key: 'JUSTTCG_API_KEY' },
+            ],
+            schedule,
+            cards: {
+                total: stats.totalCards,
+                verified: stats.totalCards - stats.unverifiedPrices - stats.needsReview,
+                unverified: stats.unverifiedPrices,
+                needsReview: stats.needsReview,
+                unpriced: stats.unpricedCopies,
+            },
+            oldestPriceCheck: checked.length ? new Date(Math.min(...checked)).toISOString() : null,
+            newestPriceCheck: checked.length ? new Date(Math.max(...checked)).toISOString() : null,
+            fx: fxStatus(),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -2192,7 +2294,9 @@ app.get('/api/cron/refresh-prices', async (req, res) => {
     }
     try {
         // Kick off the refresh asynchronously so we don't timeout the HTTP response
-        refreshAllPrices().catch(err => console.error('[Cron] Refresh error:', err.message));
+        refreshAllPrices()
+            .then(() => setLastRefreshAt(Date.now()))
+            .catch(err => console.error('[Cron] Refresh error:', err.message));
         res.json({ success: true, message: "Background refresh started" });
     } catch (err) {
         console.error('[Cron] Refresh error:', err.message);

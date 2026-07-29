@@ -24,12 +24,29 @@ app with the scanner one tap away.
 | `POKEMON_TCG_KEY` | recommended | Raises the Pokémon TCG API rate limit. Works without a key, slower |
 | `SCRYDEX_API_KEY` + `SCRYDEX_TEAM_ID` | optional | An extra price source |
 | `JUSTTCG_API_KEY` | optional | An extra price source |
+| `PRICE_REFRESH_DAYS` | no | How often every card is re-checked. Defaults to 1 (daily) |
 | `PORT` | no | Defaults to 3000 |
 | `CRON_SECRET` | no | Guards `/api/cron/refresh-prices` |
 
 **More price sources means better prices.** Each card's price is the median of
 the sources that agree, so with only one source live every price is a single
 opinion — the app says so, per card, rather than pretending otherwise.
+
+## Keeping prices current
+
+The server re-checks every card on a schedule — daily by default, tunable with
+`PRICE_REFRESH_DAYS`. The time of the last completed refresh is stored in the
+database, not held in memory, so a deploy or restart cannot lose the schedule:
+on restart it works out whether a refresh is due and runs it if so.
+
+This needs a host that keeps a process running. It will not work on a
+static host such as GitHub Pages, which serves files and nothing else — there
+would be no server to check prices while the app is closed, and nowhere to
+store the collection.
+
+Settings → **Price tracking status** shows which sources are live, when prices
+last refreshed, when the next refresh is due, and how many cards carry a
+verified price.
 
 ## How pricing works
 

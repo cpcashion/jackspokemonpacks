@@ -199,7 +199,7 @@ function showView(name) {
   $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
   window.scrollTo({ top: 0 });
   render();
-  if (name === 'settings') loadHealth();
+  if (name === 'settings') { loadHealth(); loadVersion(); }
 }
 
 document.querySelectorAll('[data-view]').forEach((b) => {
@@ -1507,6 +1507,37 @@ async function loadHealth() {
 
 // ── PRICE HISTORY AUDIT ──────────────────────────────────────────
 
+/** Last resort: drop every cache and reload from the server. */
+$('forceUpdateBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Checking…';
+  try {
+    const before = state.build;
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.update().catch(() => {})));
+    }
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+    const v = await api('/api/version');
+    if (v.build !== before) {
+      toast('New build found — reloading', 'success', 1500);
+      setTimeout(() => window.location.reload(), 700);
+    } else {
+      toast(`Already on the latest build (${v.build})`, 'info');
+      loadVersion();
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Check for updates';
+  }
+});
+
 $('auditHistoryBtn').addEventListener('click', openAuditModal);
 
 async function openAuditModal() {
@@ -2027,9 +2058,53 @@ function connectEvents() {
 // ── SERVICE WORKER ───────────────────────────────────────────────
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is optional */ });
+  window.addEventListener('load', async () => {
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+
+      // A worker waiting to take over means a newer build is already
+      // downloaded. Activate it rather than leaving the old app on screen.
+      const takeOver = (worker) => {
+        if (!worker) return;
+        worker.postMessage('skip-waiting');
+      };
+      if (reg.waiting) takeOver(reg.waiting);
+      reg.addEventListener('updatefound', () => {
+        const installing = reg.installing;
+        installing?.addEventListener('statechange', () => {
+          if (installing.state === 'installed' && navigator.serviceWorker.controller) takeOver(installing);
+        });
+      });
+
+      let reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (reloading) return;
+        reloading = true;
+        window.location.reload();
+      });
+
+      // Check for a new build when the app is reopened, not only on cold start —
+      // a home-screen app can stay alive for days.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    } catch {
+      /* offline shell is optional */
+    }
   });
+}
+
+/** Which build is on screen. Shown in Settings so "did the deploy land?" is answerable. */
+async function loadVersion() {
+  const host = $('buildInfo');
+  if (!host) return;
+  try {
+    const v = await api('/api/version');
+    state.build = v.build;
+    host.textContent = `Build ${v.build}${v.commit ? ` · commit ${v.commit}` : ''} · running since ${timeAgo(v.bootedAt)}`;
+  } catch {
+    host.textContent = 'Could not read the build version.';
+  }
 }
 
 // ── BOOT ─────────────────────────────────────────────────────────

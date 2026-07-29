@@ -14,6 +14,7 @@ import express from 'express';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdirSync, readFileSync, rmSync } from 'fs';
+import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import pkg from 'pg';
 const { Pool } = pkg;
@@ -1576,9 +1577,56 @@ if (!IS_VERCEL) {
 //  EXPRESS SERVER
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  BUILD IDENTITY
+//
+//  "Did the deploy actually go out?" should never need a git log to answer.
+//  The build id is a hash of the three files the browser is actually served,
+//  so it cannot disagree with what is running. It names the service worker's
+//  cache, which means a new build automatically discards the old one instead
+//  of leaving somebody pinned to a stale copy of the app.
+// ═══════════════════════════════════════════════════════════════
+
+function computeBuildId() {
+    try {
+        const hash = createHash('sha256');
+        for (const file of ['index.html', 'script.js', 'styles.css']) {
+            hash.update(readFileSync(join(__dirname, file)));
+        }
+        return hash.digest('hex').slice(0, 8);
+    } catch {
+        return 'unknown';
+    }
+}
+
+const BUILD_ID = computeBuildId();
+const BUILD_COMMIT = (process.env.RAILWAY_GIT_COMMIT_SHA || process.env.SOURCE_COMMIT || '').slice(0, 7);
+const BOOTED_AT = new Date().toISOString();
+
+/** The service worker is served with its cache name stamped to this build. */
+function sendServiceWorker(res) {
+    try {
+        // replaceAll, not replace: the token also appears in the file's own
+        // comment, and replacing only the first occurrence would stamp the
+        // comment and leave the constant as the literal placeholder.
+        const source = readFileSync(join(__dirname, 'sw.js'), 'utf8').replaceAll('__BUILD_ID__', BUILD_ID);
+        res.setHeader('Content-Type', 'application/javascript; charset=UTF-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(source);
+    } catch (err) {
+        res.status(500).send('// service worker unavailable');
+    }
+}
+
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
+
+/** Cheap, unauthenticated: lets you confirm a deploy landed without logging in. */
+app.get('/api/version', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ build: BUILD_ID, commit: BUILD_COMMIT || null, bootedAt: BOOTED_AT });
+});
 
 // Compress all responses to reduce bandwidth
 app.use((req, res, next) => {
@@ -1612,16 +1660,21 @@ app.use((req, res, next) => {
  * The previous `express.static(__dirname)` published the whole project
  * directory — server.js, package.json, lib/ and test/ were all downloadable.
  * Only the files the browser actually needs are served now.
+ *
+ * The app's own three files are sent with `no-cache`: not "never store", but
+ * "always revalidate". A 304 still costs nothing, and it means a deploy is
+ * visible on the next load instead of up to an hour later. Icons, which change
+ * about never, keep a long cache.
  */
 const PUBLIC_FILES = new Set(['/index.html', '/styles.css', '/script.js', '/sw.js', '/manifest.webmanifest']);
-const staticHandler = express.static(__dirname, { index: false, dotfiles: 'ignore', maxAge: '1h' });
+const staticHandler = express.static(__dirname, { index: false, dotfiles: 'ignore', maxAge: '1h', etag: true });
 
 app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return next();
     const isPublic = PUBLIC_FILES.has(req.path) || req.path.startsWith('/icons/');
     if (!isPublic) return next();
-    // A cached service worker would pin users to an old build.
-    if (req.path === '/sw.js') res.setHeader('Cache-Control', 'no-cache');
+    if (req.path === '/sw.js') return sendServiceWorker(res);
+    if (PUBLIC_FILES.has(req.path)) res.setHeader('Cache-Control', 'no-cache');
     return staticHandler(req, res, next);
 });
 

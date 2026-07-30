@@ -947,7 +947,7 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber, opts = {}) {
         const firstDetail = await loadDetail(results[0]);
         return firstDetail;
     } catch (err) {
-        const failure = describeAxiosError(err);
+        const failure = describeAxiosError(err, { usesKey: false });
         noteSource('tcgdex', failure);
         console.error(`  [TCGdex] Error looking up market card "${cardName}": ${failure.message}`);
         if (strict) throw err;
@@ -1174,14 +1174,63 @@ function noteSource(name, outcome) {
     sourceHealth.set(name, { ...outcome, at: new Date().toISOString() });
 }
 
-function describeAxiosError(err) {
+/**
+ * Signatures of an outbound-network policy refusing the request, rather than
+ * the API refusing it. Both arrive as a 403, and telling them apart matters:
+ * one is fixed by a new key, the other by an egress rule, and reporting the
+ * wrong one sends you off rotating a key that was never the problem.
+ */
+const NETWORK_BLOCK_PATTERNS = [
+    /host not permitted/i,
+    /request rejected/i,
+    /tunneling socket could not be established/i,
+    /blocked by .*(policy|firewall|proxy)/i,
+    /forbidden by (proxy|gateway)/i,
+];
+
+function looksLikeNetworkBlock(err) {
+    const body = err?.response?.data;
+    const text = typeof body === 'string' ? body : '';
+    const haystack = `${text} ${err?.message || ''}`;
+    // A real API answers 403 with JSON and its own headers; a proxy answers
+    // with a short plaintext refusal and almost nothing else.
+    return NETWORK_BLOCK_PATTERNS.some(p => p.test(haystack));
+}
+
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.usesKey] whether this source authenticates at all.
+ *   TCGdex needs no key, so "check the API key" is meaningless advice for it.
+ */
+function describeAxiosError(err, { usesKey = true } = {}) {
     const status = err?.response?.status;
+
+    if (looksLikeNetworkBlock(err)) {
+        return {
+            ok: false, status, kind: 'blocked',
+            message: 'Blocked before it left this server — an outbound network rule, not an API key',
+        };
+    }
     if (status === 429) return { ok: false, status, kind: 'rate_limited', message: 'Rate limited' };
-    if (status === 401 || status === 403) return { ok: false, status, kind: 'auth', message: 'Rejected — check the API key' };
+    if (status === 401 || status === 403) {
+        return {
+            ok: false, status, kind: 'auth',
+            message: usesKey ? 'Rejected — check the API key' : `Refused the request (HTTP ${status})`,
+        };
+    }
     if (status) return { ok: false, status, kind: 'http', message: `HTTP ${status}` };
     if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) return { ok: false, kind: 'timeout', message: 'Timed out' };
     return { ok: false, kind: 'network', message: err?.message || 'Unreachable' };
 }
+
+/** Which sources authenticate, for the message above. */
+const SOURCE_USES_KEY = {
+    pokemontcg: true,   // optional, but a key is what raises the rate limit
+    tcgdex: false,
+    scrydex: true,
+    justtcg: true,
+    fx: false,
+};
 
 /**
  * A collector that cannot reach its source must say so rather than return an
@@ -1973,7 +2022,9 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
             report({ name, label, state: quotes.length ? 'answered' : 'empty', quotes: quotes.length, ms: Date.now() - startedAt });
             return quotes;
         } catch (err) {
-            const failure = err instanceof SourceUnavailable ? err.failure : describeAxiosError(err);
+            const failure = err instanceof SourceUnavailable
+                ? err.failure
+                : describeAxiosError(err, { usesKey: SOURCE_USES_KEY[name] !== false });
             noteSource(name, failure);
             report({ name, label, state: 'failed', quotes: 0, ms: Date.now() - startedAt, reason: failure.message, kind: failure.kind });
             console.error(`  [Pricing] ${name} failed for "${card.card_name}":`, err.message);
@@ -2062,6 +2113,38 @@ function scanReporter(scanId) {
 
 let priceRefreshRunning = false;
 let reviewRecheckRunning = false;
+
+/**
+ * How long to wait between cards during a bulk refresh.
+ *
+ * The Pokémon TCG API allows far more requests with a key than without, and
+ * the old fixed 1.2s gap was calibrated for neither: each card issues one or
+ * two requests, so 1.2s put a keyless run at 50–100 requests a minute against
+ * a limit of roughly 30. The refresh was rate-limiting itself, and a
+ * rate-limited lookup returns nothing, which is indistinguishable from a card
+ * having no price. Pacing to the tier we are actually on is the fix.
+ */
+const REFRESH_PACE_MS = POKEMON_TCG_KEY ? 700 : 2500;
+
+/**
+ * Wait out a rate-limit cooldown rather than burning cards against it.
+ *
+ * Without this, hitting a limit mid-run marked five cards unreachable in quick
+ * succession and aborted the whole refresh. A limit is a "come back shortly",
+ * not a failure, so the run pauses and continues.
+ */
+async function pacePriceRequests() {
+    const cooling = sourceCooldownRemaining('pokemontcg');
+    if (cooling > 0) {
+        const wait = Math.min(cooling, 90 * 1000);
+        console.log(`  [PriceRefresh] Rate limited — pausing ${Math.ceil(wait / 1000)}s before continuing.`);
+        broadcastActivity('info', `Rate limited by the card database — pausing ${Math.ceil(wait / 1000)}s.`);
+        await sleep(wait);
+        return;
+    }
+    await sleep(REFRESH_PACE_MS);
+}
+
 
 // Batched refresh: process N cards (for Vercel cron, N=5 to fit in 10s timeout)
 async function refreshBatchPrices(batchSize = 5) {
@@ -2191,7 +2274,7 @@ async function refreshAllPrices() {
                     break;
                 }
 
-                if (!result?.cached) await sleep(1200);
+                if (!result?.cached) await pacePriceRequests();
             } catch (err) {
                 console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
                 await markPriceChecked(card.id).catch(() => {});
@@ -2441,8 +2524,17 @@ app.get('/api/diagnostics', requireAuth, async (req, res) => {
             const detail = await fn();
             return { name, label, ok: true, ms: Date.now() - started, detail };
         } catch (err) {
-            const info = describeAxiosError(err);
-            return { name, label, ok: false, ms: Date.now() - started, detail: info.message, kind: info.kind, hint };
+            const info = describeAxiosError(err, { usesKey: SOURCE_USES_KEY[name] !== false });
+            return {
+                name, label, ok: false, ms: Date.now() - started,
+                detail: info.message, kind: info.kind,
+                // A request stopped before it left the building is not a
+                // credentials problem, and saying "check the key" would send
+                // you to rotate one that was working fine.
+                hint: info.kind === 'blocked'
+                    ? 'This host is being refused by an outbound network rule. Allow it in the platform\'s egress settings — no key change will help.'
+                    : hint,
+            };
         }
     };
 
@@ -2468,7 +2560,9 @@ app.get('/api/diagnostics', requireAuth, async (req, res) => {
             const hit = r.data?.data?.[0];
             return hit ? `Found ${hit.name} (${hit.set?.name})${POKEMON_TCG_KEY ? '' : ' — no API key, rate limited'}`
                        : 'Reachable but returned no results';
-        }, 'Set POKEMON_TCG_KEY — without one this API rate limits quickly and every lookup fails'),
+        }, POKEMON_TCG_KEY
+            ? 'A key is set. If this is rejected, the key is wrong or revoked — get a new one at https://pokemontcg.io'
+            : 'Set POKEMON_TCG_KEY — without one this API rate limits quickly and every lookup fails'),
 
         probe('tcgdex', 'Card prices (TCGdex)', async () => {
             const r = await axios.get('https://api.tcgdex.net/v2/en/cards', {
@@ -3002,7 +3096,7 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
                     done: i + 1, total: rows.length, confirmed, priced, stillUnknown,
                     card_name: card.card_name,
                 });
-                await sleep(600);
+                await pacePriceRequests();
             }
 
             broadcastActivity('recheck_complete',

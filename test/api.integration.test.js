@@ -481,6 +481,37 @@ if (!DB) {
         }
     });
 
+    /**
+     * A 403 from an egress rule and a 403 from an API mean opposite things:
+     * one is fixed by an allowlist, the other by a new key. Reporting the wrong
+     * one sends you off rotating a credential that was working fine.
+     */
+    test('a network block is not reported as a bad API key', async () => {
+        const { body } = await api('/api/diagnostics');
+        const byName = Object.fromEntries(body.checks.map(c => [c.name, c]));
+
+        for (const name of ['pokemontcg', 'tcgdex']) {
+            const check = byName[name];
+            if (!check || check.ok) continue;
+            if (check.kind === 'blocked') {
+                assert.doesNotMatch(check.detail, /check the API key/i,
+                    'a blocked request must not send you to check a key');
+                assert.match(check.hint, /network|egress/i,
+                    'and the hint must point at the network rule');
+                assert.doesNotMatch(check.hint, /Set POKEMON_TCG_KEY|Check .*_API_KEY/,
+                    'nor should the hint');
+            }
+        }
+
+        // TCGdex authenticates with nothing at all, so no failure of any kind
+        // may advise checking its key.
+        const tcgdex = byName.tcgdex;
+        if (tcgdex && !tcgdex.ok) {
+            assert.doesNotMatch(tcgdex.detail, /check the API key/i,
+                'TCGdex has no key to check');
+        }
+    });
+
     test('the bulk re-check walks every card in review and reports itself', async () => {
         for (const n of ['Xerneas', 'Rabsca']) {
             const id = await seedLegacyCard({ card_name: n, card_set: '', card_number: '064/132', needs_review: 1 });

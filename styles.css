@@ -463,6 +463,9 @@ a { color: inherit; text-decoration: none; }
 }
 .flag-1st { background: var(--gold); color: #241a00; }
 .flag-review { background: var(--ember); color: #fff; }
+/* Informational rather than a warning: a Japanese card is not a problem, it is
+   simply a different card from its English counterpart. */
+.flag-lang { background: var(--water); color: #fff; }
 
 .card-body { padding: 8px 9px 10px; display: flex; flex-direction: column; gap: 1px; }
 .card-name { font-size: 13px; font-weight: 550; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -787,6 +790,17 @@ a { color: inherit; text-decoration: none; }
 .step-mark svg { width: 13px; height: 13px; }
 .step-text { min-width: 0; overflow-wrap: anywhere; }
 .step-note { font-family: var(--font-mono); font-size: 10.5px; color: rgba(255, 255, 255, 0.4); white-space: nowrap; }
+
+/* A short note ("2 quotes") sits beside the label. A sentence does not: given
+   an `auto` column it claimed the whole width and crushed the label into a
+   one-character-per-line stack. Long notes drop to their own line instead. */
+.step.stacked { grid-template-columns: 15px minmax(0, 1fr); }
+.step.stacked .step-note {
+  grid-column: 2;
+  white-space: normal;
+  text-align: left;
+  margin-top: 2px;
+}
 .step.live { color: rgba(255, 255, 255, 0.95); }
 .step.done { color: rgba(255, 255, 255, 0.62); }
 .step.done .step-mark { color: var(--up); }

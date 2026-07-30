@@ -657,14 +657,25 @@ function gridOf(cards) {
     const flags = el('div', 'card-flags');
     if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Review'));
     if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
+    // Language earns a badge precisely because it changes what a card is worth:
+    // a Japanese Charizard and an English one are different cards in different
+    // markets, and two identical-looking tiles should not imply otherwise.
+    if (card.is_non_english) {
+      const badge = el('span', 'flag flag-lang', card.language_badge || 'Non-EN');
+      badge.title = card.language_label || '';
+      flags.appendChild(badge);
+    }
     if (flags.children.length) art.appendChild(flags);
 
     const body = el('div', 'card-body');
+    const alsoKnownAs = card.card_name_en && card.card_name_en !== card.card_name ? card.card_name_en : '';
     body.append(
       el('div', 'card-name', card.card_name || 'Unknown'),
       // Number first: it is short and it identifies the printing, so when the
-      // line truncates the useful half survives.
-      el('div', 'card-meta', [card.card_number, card.card_set].filter(Boolean).join(' · ') || '—'),
+      // line truncates the useful half survives. The English name joins it for
+      // a card printed in another script, which is otherwise unreadable to
+      // anyone scanning the grid.
+      el('div', 'card-meta', [alsoKnownAs, card.card_number, card.card_set].filter(Boolean).join(' · ') || '—'),
     );
 
     const priceRow = el('div', 'card-price-row');
@@ -898,7 +909,11 @@ function openSheet(id) {
   state.chartDays = 30;
 
   $('sheetTitle').textContent = card.card_name || 'Unknown card';
-  $('sheetSub').textContent = [card.card_set, card.card_number, card.rarity].filter(Boolean).join(' · ') || '—';
+  $('sheetSub').textContent = [
+    card.card_name_en && card.card_name_en !== card.card_name ? card.card_name_en : '',
+    card.card_set, card.card_number, card.rarity,
+    card.is_non_english ? card.language_label : '',
+  ].filter(Boolean).join(' · ') || '—';
 
   renderSheetBody();
   sheet.classList.add('open');
@@ -948,8 +963,12 @@ function renderSheetBody() {
     figures.append(el('div', 'figure-note', `${money(card.unit_price)} Near Mint · adjusted for condition`));
   } else {
     figures.append(el('div', 'figure-note', card.needs_review
-      ? 'Not priced — we could not confirm this card. Correct it and it will price itself.'
-      : 'No market data found for this printing.'));
+      ? 'Not priced — the printing could not be confirmed. A price we cannot attach to a specific printing would be another card\'s price, so none is shown.'
+      : card.is_non_english
+        // Being explicit matters here: the absence of a price is a deliberate
+        // choice, not a bug. English marketplaces quote English printings.
+        ? `No marketplace quotes a price for ${card.language_label} printings of this card. English prices are not shown as a stand-in, because they are not this card's price.`
+        : 'No market data found for this printing.'));
   }
 
   const pills = el('div', 'figure-pills');
@@ -1507,6 +1526,38 @@ async function refreshPrices(button) {
   } finally {
     if (button) { button.disabled = false; button.textContent = original; }
   }
+}
+
+/**
+ * Re-check everything in Needs review.
+ *
+ * The most common reason a card landed here was fixable in the app rather than
+ * on the card — most recently, a non-English card the identity code could not
+ * read at all — so a per-card fix was the wrong shape for a whole shelf.
+ */
+$('recheckReviewBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Re-checking…';
+  try {
+    const r = await api('/api/portfolio/recheck-review', { method: 'POST' });
+    toast(r.message || 'Re-checking…', 'info', 5000);
+  } catch (err) {
+    toast(err.message, 'error', 6000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
+/** Live progress for the bulk re-check, in the same place as a refresh. */
+function showRecheckProgress(payload) {
+  const note = $('syncNote');
+  if (!note) return;
+  if (!payload) { note.textContent = ''; note.classList.remove('busy'); return; }
+  note.classList.add('busy');
+  note.textContent = `Re-checking ${payload.done} of ${payload.total} — ${payload.confirmed} confirmed`;
 }
 
 /**
@@ -2217,7 +2268,9 @@ function analysisStep(key, state_, text, note, { moveToEnd = false } = {}) {
   } else if (moveToEnd) {
     host.appendChild(row);
   }
-  row.className = `step ${state_}`;
+  // A note long enough to be a sentence gets its own line, or it would take
+  // the width the label needs and stack the label one character per line.
+  row.className = `step ${state_}${note && String(note).length > 18 ? ' stacked' : ''}`;
   row.querySelector('.step-mark').innerHTML = MARKS[state_] || '';
   row.querySelector('.step-text').textContent = text;
   row.querySelector('.step-note').textContent = note || '';
@@ -2285,14 +2338,26 @@ function onScanProgress(ev) {
     case 'identified': {
       const c = ev.card || {};
       const pctText = c.confidence > 0 ? `${Math.round(c.confidence * 100)}% sure` : '';
-      analysisStep('ai', 'done', `Looks like ${c.card_name || 'a card'}`, pctText);
+      // A non-English card is named twice: what is printed on it, and the
+      // English name that makes it findable in a card database.
+      const alsoKnownAs = c.card_name_en && c.card_name_en !== c.card_name ? ` (${c.card_name_en})` : '';
+      analysisStep('ai', 'done', `Looks like ${c.card_name || 'a card'}${alsoKnownAs}`, pctText);
+      if (c.is_non_english && c.language) analysisStep('lang', 'done', `Printed in ${c.language}`);
       $('analysisName').textContent = c.card_name || 'Unknown card';
-      $('analysisMeta').textContent = [c.card_set, c.card_number].filter(Boolean).join(' · ') || 'Set unknown';
+      $('analysisMeta').textContent =
+        [c.card_set || c.set_code, c.card_number, c.is_non_english ? c.language : ''].filter(Boolean).join(' · ')
+        || 'Set unknown';
       break;
     }
 
     case 'verifying':
       analysisStep('verify', 'live', 'Confirming the printing in the card database');
+      break;
+
+    // Which database is being used, and why. A Japanese card cannot be
+    // confirmed against an English-only catalogue, so it goes somewhere else.
+    case 'verifying_language':
+      analysisStep('verify', 'live', ev.message || `Looking this up as a ${ev.language} printing`);
       break;
 
     case 'candidates':
@@ -2301,9 +2366,11 @@ function onScanProgress(ev) {
 
     case 'verified': {
       const c = ev.card || {};
-      analysisStep('verify', 'done', `Confirmed: ${c.card_set || 'unknown set'} ${c.card_number || ''}`.trim());
+      const where = ev.via && ev.via.startsWith('tcgdex') ? ' via TCGdex' : '';
+      analysisStep('verify', 'done', `Confirmed: ${c.card_set || 'unknown set'} ${c.card_number || ''}${where}`.trim());
       $('analysisName').textContent = c.card_name || $('analysisName').textContent;
-      $('analysisMeta').textContent = [c.card_set, c.card_number, c.rarity].filter(Boolean).join(' · ');
+      $('analysisMeta').textContent =
+        [c.card_set, c.card_number, c.rarity, c.is_non_english ? c.language : ''].filter(Boolean).join(' · ');
       if (c.image_url) { $('analysisImg').hidden = false; $('analysisImg').src = c.image_url; }
       break;
     }
@@ -2379,7 +2446,9 @@ function connectEvents() {
       if (payload.type === 'portfolio_updated' || payload.type === 'card_added') loadCollection();
       if (payload.type === 'scan_progress') onScanProgress(payload);
       if (payload.type === 'refresh_progress') showRefreshProgress(payload);
+      if (payload.type === 'recheck_progress') showRecheckProgress(payload);
       if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
+      if (payload.activityType === 'recheck_complete') { toast(payload.message, 'success', 8000); showRecheckProgress(null); }
       if (payload.activityType === 'error') toast(payload.message, 'error', 7000);
     };
     source.onerror = () => {

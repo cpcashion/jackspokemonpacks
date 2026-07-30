@@ -36,6 +36,13 @@ import {
     copyValue,
     CONDITIONS,
     isTruthy,
+    normalizeLanguage,
+    languageCode,
+    languageLabel,
+    languageBadge,
+    languageIsCertain,
+    isNonEnglish,
+    hasNonLatinScript,
 } from './lib/identity.js';
 import { auditHistoryRows } from './lib/history.js';
 import {
@@ -134,6 +141,17 @@ async function initDB() {
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_variant_matched INTEGER DEFAULT 0;
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_low REAL DEFAULT 0;
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_high REAL DEFAULT 0;
+
+        -- A non-English card is stored under the name printed on it. The English
+        -- name of the same Pokémon is kept alongside so it stays searchable and
+        -- so an English-language card database can be queried at all.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS card_name_en TEXT DEFAULT '';
+        -- The short code printed near the number ("csb6C", "sv8a"). On Japanese,
+        -- Chinese and Korean cards this identifies the set far more reliably
+        -- than a translated set name.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS set_code TEXT DEFAULT '';
+        -- Which database confirmed the printing, so a re-verification can say.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS verified_source TEXT DEFAULT '';
     `);
 
     // One row per physical copy. Jack owns three Charizards; that is one card
@@ -166,6 +184,7 @@ async function initDB() {
     await backfillVariantKeys();
     await backfillCardCopies();
     await queueLegacyPricesForRecheck();
+    await clearPricesOnUnconfirmedCards();
 }
 
 async function hasRun(key) {
@@ -210,6 +229,44 @@ async function queueLegacyPricesForRecheck() {
  * Fill in variant_key for rows created before the column existed. Computed in
  * JS so there is exactly one definition of card identity in the codebase.
  */
+/**
+ * Strip prices off cards whose printing was never confirmed.
+ *
+ * Re-pricing used to run a loose name-and-number search on cards awaiting
+ * review and store whatever came back, so a card in Needs review could display
+ * a confident figure that belonged to an entirely different printing — a common
+ * Steelix showed as worth hundreds. Those numbers cannot be corrected, only
+ * removed: the card has to be identified before it can be valued.
+ *
+ * The history goes with them, because it was recorded against the same
+ * unconfirmed identity.
+ */
+async function clearPricesOnUnconfirmedCards() {
+    const KEY = 'clear_unconfirmed_prices_v1';
+    if (await hasRun(KEY)) return;
+
+    const affected = await pool.query(`
+        SELECT id FROM portfolio_cards
+        WHERE COALESCE(needs_review, 0) = 1 AND COALESCE(current_price, 0) > 0
+    `);
+    const ids = affected.rows.map(r => r.id);
+
+    if (ids.length) {
+        await pool.query('DELETE FROM price_history WHERE card_id = ANY($1::int[])', [ids]);
+        await pool.query(`
+            UPDATE portfolio_cards
+            SET current_price = 0, price_source = '', price_source_url = '',
+                price_confidence = 0, price_marketplace = '', price_variant = '',
+                price_variant_matched = 0, price_low = 0, price_high = 0,
+                price_sources = '{}'::jsonb, highest_recent_sale = 0,
+                best_sold_price = 0, best_sold_source = '', last_price_check = NULL
+            WHERE id = ANY($1::int[])
+        `, [ids]);
+        console.log(`  [Migrate] Removed prices from ${ids.length} unconfirmed card(s) — they were matched loosely and could belong to a different printing`);
+    }
+    await markRun(KEY, ids.length);
+}
+
 async function backfillVariantKeys() {
     const res = await pool.query(`
         SELECT id, card_name, card_set, card_number, holo_type, is_holo, language, is_first_edition
@@ -255,15 +312,16 @@ initDB().then(() => ensureDefaultUser()).catch(err => console.error("DB Init Err
 // ── Portfolio DB helpers ──
 async function insertPortfolioCard(card, userId) {
     const res = await pool.query(`
-        INSERT INTO portfolio_cards (user_id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         RETURNING id
     `, [
-        userId, card.card_name, card.card_set || '', card.card_number || '', card.rarity || 'Unknown',
+        userId, card.card_name, card.card_name_en || '', card.card_set || '', card.set_code || '',
+        card.card_number || '', card.rarity || 'Unknown',
         canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
         card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
-        card.year || 0, card.language || 'English', card.holo_type || 'Unknown',
-        buildVariantKey(card), card.needs_review ? 1 : 0
+        card.year || 0, normalizeLanguage(card.language), card.holo_type || 'Unknown',
+        buildVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || ''
     ]);
     return res.rows[0].id;
 }
@@ -349,6 +407,76 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
 /** Marks a card as checked without touching its price — used when a lookup finds nothing. */
 async function markPriceChecked(cardId) {
     await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [cardId]);
+}
+
+/**
+ * Drop a price that belonged to a different printing.
+ *
+ * Called when a card's identity changes. Keeping the old figure is how a card
+ * ended up sitting in Needs review displaying a confident price — a number
+ * that was correct for the card it used to be recorded as, and wrong for the
+ * card it now is. Its history is deleted for the same reason.
+ */
+async function clearStalePrice(cardId) {
+    await pool.query(`
+        UPDATE portfolio_cards
+        SET current_price         = 0,
+            price_source          = '',
+            price_source_url      = '',
+            price_confidence      = 0,
+            price_marketplace     = '',
+            price_variant         = '',
+            price_variant_matched = 0,
+            price_low             = 0,
+            price_high            = 0,
+            price_sources         = '{}'::jsonb,
+            highest_recent_sale   = 0,
+            best_sold_price       = 0,
+            best_sold_source      = '',
+            last_price_check      = NOW()
+        WHERE id = $1
+    `, [cardId]);
+}
+
+/**
+ * Write a confirmed printing back onto a card and take it out of Needs review.
+ *
+ * The variant key is recomputed here because the identity may have moved — a
+ * card confirmed as a different set is a different printing, and leaving the
+ * old key would let it be folded into the wrong group as a duplicate.
+ */
+async function applyVerifiedIdentity(cardId, verified) {
+    await pool.query(`
+        UPDATE portfolio_cards
+        SET card_name       = $2,
+            card_name_en    = $3,
+            card_set        = $4,
+            set_code        = $5,
+            card_number     = $6,
+            rarity          = $7,
+            year            = $8,
+            language        = $9,
+            image_url       = CASE WHEN $10 <> '' THEN $10 ELSE image_url END,
+            confidence      = $11,
+            variant_key     = $12,
+            verified_source = $13,
+            needs_review    = 0
+        WHERE id = $1
+    `, [
+        cardId,
+        verified.card_name || '',
+        verified.card_name_en || '',
+        verified.card_set || '',
+        verified.set_code || '',
+        verified.card_number || '',
+        verified.rarity || 'Unknown',
+        verified.year || 0,
+        normalizeLanguage(verified.language),
+        verified.image_url || '',
+        Number(verified.confidence) || 0,
+        buildVariantKey(verified),
+        verified.verified_source || '',
+    ]);
 }
 
 // ── Fabricated price history ───────────────────────────────────────────────
@@ -480,10 +608,10 @@ async function insertPricePoint(cardId, price, source, sourceUrl = '') {
 
 async function getAllPortfolioCards(userId) {
     const res = await pool.query(`
-        SELECT pc.id, pc.user_id, pc.card_name, pc.card_set, pc.card_number,
+        SELECT pc.id, pc.user_id, pc.card_name, pc.card_name_en, pc.card_set, pc.set_code, pc.card_number,
             pc.rarity, pc.condition, pc.is_holo, pc.is_first_edition, pc.confidence,
             pc.image_url, pc.notes, pc.year, pc.language, pc.holo_type,
-            pc.variant_key, pc.needs_review,
+            pc.variant_key, pc.needs_review, pc.verified_source,
             pc.price_confidence, pc.price_marketplace, pc.price_variant,
             pc.price_variant_matched, pc.price_low, pc.price_high,
             pc.added_at, pc.current_price AS card_current_price, pc.price_source AS card_price_source,
@@ -568,6 +696,12 @@ function decorateCardRow(row) {
         unit_price: unitPrice,
         total_value: Number(totalValue.toFixed(2)),
         has_mixed_conditions: new Set(perCopy.map(c => c.condition || 'Unknown')).size > 1,
+        // Language belongs on screen for anything that is not English: a
+        // Japanese Charizard and an English one are different cards worth
+        // different money, and the list should not make them look alike.
+        language_label: languageLabel(row.language),
+        language_badge: languageBadge(row.language),
+        is_non_english: isNonEnglish(row.language),
     };
 }
 
@@ -674,10 +808,10 @@ function computePortfolioStats(cards) {
 //  TCGDEX IMAGE LOOKUP (free, no API key)
 // ═══════════════════════════════════════════════════════════════
 
-async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
+async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber, lang = 'en') {
     try {
         const searchName = encodeURIComponent(cardName.trim());
-        const resp = await axios.get(`https://api.tcgdex.net/v2/en/cards?name=${searchName}`, {
+        const resp = await axios.get(`https://api.tcgdex.net/v2/${lang}/cards?name=${searchName}`, {
             timeout: 10000,
             headers: { 'Accept': 'application/json' }
         });
@@ -700,7 +834,7 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
             const withImage = results.filter(r => r.image).slice(0, 5);
             for (const candidate of withImage) {
                 try {
-                    const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
+                    const detail = await axios.get(`https://api.tcgdex.net/v2/${lang}/cards/${candidate.id}`, {
                         timeout: 8000,
                         headers: { 'Accept': 'application/json' }
                     });
@@ -727,20 +861,46 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
 }
 
 /**
- * @param {boolean} [strict] rethrow transport failures instead of returning
- *   null. A pricing lookup has to be able to tell "TCGdex has no listing for
- *   this card" from "TCGdex never answered"; an image lookup does not care.
+ * Look one card up in TCGdex.
+ *
+ * TCGdex publishes each language separately at /v2/{lang}/, which makes it the
+ * one source here that can confirm a Japanese, Korean or Chinese printing at
+ * all — the Pokémon TCG API is English-only. A non-English card is therefore
+ * searched in its own language, under its own printed name, and only falls
+ * back to English if that finds nothing.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.strict] rethrow transport failures instead of
+ *   returning null. A pricing lookup has to be able to tell "TCGdex has no
+ *   listing for this card" from "TCGdex never answered"; an image lookup does
+ *   not care.
+ * @param {string} [opts.lang] TCGdex language code, e.g. "ja", "zh-cn".
+ * @param {string} [opts.fallbackName] name to retry with in English when the
+ *   localised search comes back empty.
  */
-async function fetchTCGdexCard(cardName, cardSet, cardNumber, strict = false) {
+async function fetchTCGdexCard(cardName, cardSet, cardNumber, opts = {}) {
+    // Historically this took a positional `strict` boolean.
+    const { strict = false, lang = 'en', fallbackName = '' } =
+        typeof opts === 'boolean' ? { strict: opts } : opts;
     if (!cardName) return null;
     try {
-        const searchName = encodeURIComponent(cardName.trim());
-        const resp = await axios.get(`https://api.tcgdex.net/v2/en/cards?name=${searchName}`, {
-            timeout: 10000,
-            headers: { 'Accept': 'application/json' }
-        });
-        noteSource('tcgdex', { ok: true, status: resp.status, message: 'OK' });
-        const results = Array.isArray(resp.data) ? resp.data : [];
+        const attempts = [{ lang, name: cardName }];
+        if (lang !== 'en' && fallbackName && fallbackName !== cardName) {
+            attempts.push({ lang: 'en', name: fallbackName });
+        }
+
+        let results = [];
+        let activeLang = lang;
+        for (const attempt of attempts) {
+            const searchName = encodeURIComponent(attempt.name.trim());
+            const resp = await axios.get(`https://api.tcgdex.net/v2/${attempt.lang}/cards?name=${searchName}`, {
+                timeout: 10000,
+                headers: { 'Accept': 'application/json' }
+            });
+            noteSource('tcgdex', { ok: true, status: resp.status, message: 'OK' });
+            const found = Array.isArray(resp.data) ? resp.data : [];
+            if (found.length) { results = found; activeLang = attempt.lang; break; }
+        }
         if (!results.length) return null;
 
         const normalizedSet = normalizeText(cardSet);
@@ -751,12 +911,13 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber, strict = false) {
             if (!candidate?.id) return null;
             if (detailCache.has(candidate.id)) return detailCache.get(candidate.id);
             try {
-                const detail = await axios.get(`https://api.tcgdex.net/v2/en/cards/${candidate.id}`, {
+                const detail = await axios.get(`https://api.tcgdex.net/v2/${activeLang}/cards/${candidate.id}`, {
                     timeout: 10000,
                     headers: { 'Accept': 'application/json' }
                 });
-                detailCache.set(candidate.id, detail.data || null);
-                return detail.data || null;
+                const data = detail.data ? { ...detail.data, tcgdexLang: activeLang } : null;
+                detailCache.set(candidate.id, data);
+                return data;
             } catch {
                 detailCache.set(candidate.id, null);
                 return null;
@@ -845,10 +1006,14 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
  */
 const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Identify every physical Pokemon card visible in this image.
 
+Pokemon cards are printed in English, Japanese, Korean, Simplified Chinese, Traditional Chinese, French, German, Spanish, Italian, Portuguese, Dutch, Polish, Russian, Thai and Indonesian. Read whichever language the card is actually in. Never refuse a card because it is not in English.
+
 Read these directly off the card. Do not infer them from the artwork or from what is typical:
-- Card name exactly as printed, including suffixes such as EX, GX, V, VMAX, VSTAR, ex.
-- Card number, bottom of the card, exactly as printed (e.g. "4/102", "SWSH045", "TG12/TG30").
-- Set: use the set symbol and the number's denominator. If you cannot identify the set with confidence, use "".
+- card_name: the name EXACTLY as printed, in the card's own script. For a Japanese card that means the Japanese name (e.g. "リザードン"), for Simplified Chinese the Chinese name (e.g. "古空棘鱼"). Include suffixes as printed: EX, GX, V, VMAX, VSTAR, ex.
+- card_name_en: the SAME Pokemon's official English name (e.g. "リザードン" -> "Charizard", "古空棘鱼" -> "Relicanth", "리자몽" -> "Charizard"). Include the English form of any suffix. For a card already in English, repeat card_name here. This field is what lets the card be looked up, so give your best answer rather than an empty string whenever you can recognise the Pokemon.
+- card_number: bottom of the card, exactly as printed (e.g. "4/102", "SWSH045", "TG12/TG30", "014/131").
+- set_code: the short code printed near the number if there is one (e.g. "csb6C", "sv8a", "SV3", "S12a"). Japanese, Chinese and Korean cards carry this and it identifies the set far more reliably than a name. Use "" if none is printed.
+- card_set: the set name. Use the set symbol, the set code and the number's denominator. If you cannot identify the set with confidence, use "".
 - Printing. This is critical and is decided by the foil pattern:
   * "Reverse Holo" - the card BORDER/background is foiled but the artwork is not.
   * "Holofoil" - the ARTWORK BOX is foiled.
@@ -856,11 +1021,13 @@ Read these directly off the card. Do not infer them from the artwork or from wha
   * "Non-Holo" - no foil anywhere.
   If the foil pattern is not clearly visible, use "Unknown" rather than guessing.
 - 1st Edition: true ONLY if the "1st Edition" stamp is actually visible on the card.
-- Language, from the printed text. Copyright year, from the bottom of the card.
+- language: which language the card is printed in, from the script and the text. Be precise between "Chinese (Simplified)" and "Chinese (Traditional)". Only say "English" if the card really is English.
+- year: copyright year from the bottom of the card.
 - Condition, from visible edge wear, surface scratches, whitening and centering.
 
 Rules:
 - Never invent a name, set or number. An empty string is always better than a guess.
+- card_name_en is the one exception: an English name you are confident of from recognising the Pokemon is wanted even though it is not printed on the card. If you cannot tell which Pokemon it is, use "".
 - Ignore binder pages, sleeves, pack art, background objects and anything that is not a physical card.
 - If a card is blurry, cropped, or obstructed, either omit it or give it a low confidence.
 - Confidence reflects how clearly you could READ the card, not how sure you are the card exists.
@@ -869,15 +1036,17 @@ Rules:
 Return ONLY valid JSON (no markdown fences):
 {
   "cards": [{
-    "card_name": "Pokemon name",
+    "card_name": "name exactly as printed, in its own script",
+    "card_name_en": "official English name of the same Pokemon",
     "card_set": "Set name or empty string",
+    "set_code": "printed set code or empty string",
     "card_number": "e.g. 4/102",
     "rarity": "Common|Uncommon|Rare|Rare Holo|Rare Ultra|Secret Rare|Illustration Rare|Promo|Unknown",
     "condition_estimate": "Mint|Near Mint|Lightly Played|Moderately Played|Heavily Played|Damaged|Unknown",
     "is_holographic": true/false,
     "holo_type": "Holofoil|Reverse Holo|Non-Holo|Cosmos Holo|Unknown",
     "year": 1999,
-    "language": "English|Japanese|Spanish|etc",
+    "language": "English|Japanese|Korean|Chinese (Simplified)|Chinese (Traditional)|French|German|Spanish|Italian|Portuguese|Dutch|Polish|Russian|Thai|Indonesian",
     "is_first_edition": true/false,
     "confidence": 0.0 to 1.0,
     "notes": "Identifying features, visible damage, or what was unreadable"
@@ -897,34 +1066,60 @@ function parseAiJson(text) {
     }
 }
 
+/** Placeholders the AI falls back to, in the languages it might answer in. */
+const PLACEHOLDER_NAMES = new Set([
+    'pokemon', 'pokemon card', 'unknown', 'unknown card', 'trainer', 'energy',
+    'ポケモン', 'たね', 'トレーナー', 'エネルギー',
+    '宝可梦', '寶可夢', '训练家', '訓練家', '能量',
+    '포켓몬', '트레이너', '에너지',
+]);
+
 function hasMeaningfulCardName(name) {
     const normalized = normalizeText(name);
     if (!normalized) return false;
-    return ![
-        'pokemon',
-        'pokemon card',
-        'unknown',
-        'unknown card',
-        'trainer',
-        'energy'
-    ].includes(normalized);
+    return !PLACEHOLDER_NAMES.has(normalized);
+}
+
+/**
+ * Every name this card could be looked up under: what is printed on it, and —
+ * for a non-English card — the English name of the same Pokémon.
+ *
+ * A Chinese card reads "古空棘鱼"; no amount of normalisation will match that
+ * against an English-language card database. The English name the AI supplies
+ * alongside it is the only bridge, so identity comparisons accept either.
+ */
+function cardNameCandidates(card) {
+    return [card?.card_name, card?.card_name_en]
+        .map(normalizeText)
+        .filter(Boolean)
+        .filter((n, i, all) => all.indexOf(n) === i);
+}
+
+/** Does either of this card's names match the candidate's, exactly? */
+function namesMatchExactly(card, candidateName) {
+    const target = normalizeText(candidateName);
+    return Boolean(target) && cardNameCandidates(card).includes(target);
 }
 
 function isLikelyVerifiedMatch(score, candidate, card) {
-    const aiName = normalizeText(card.card_name);
-    const candidateName = normalizeText(candidate?.name);
     const aiNumber = normalizeCardNumber(card.card_number);
     const candidateNumber = normalizeCardNumber(candidate?.number);
     const aiSet = normalizeText(card.card_set);
     const candidateSet = normalizeText(candidate?.set?.name);
-    const exactName = aiName && candidateName && aiName === candidateName;
+    const exactName = namesMatchExactly(card, candidate?.name);
     const exactNumber = aiNumber && candidateNumber && aiNumber === candidateNumber;
     const exactSet = aiSet && candidateSet && (aiSet === candidateSet || aiSet.includes(candidateSet) || candidateSet.includes(aiSet));
+
+    // A non-English card is matched against an English database, so its set
+    // name will not line up even when the card is right — Japanese sets have
+    // different names and different numbering from their English counterparts.
+    // The printed number is therefore the only trustworthy confirmation.
+    if (isNonEnglish(card.language)) return score >= 7 && exactName && Boolean(exactNumber);
+
     return score >= 7 && exactName && (exactNumber || (exactSet && (card.confidence || 0) >= 0.85));
 }
 
 function scorePokemonCardCandidate(card, candidate) {
-    const aiName = normalizeText(card.card_name);
     const candidateName = normalizeText(candidate?.name);
     const aiSet = normalizeText(card.card_set);
     const candidateSet = normalizeText(candidate?.set?.name);
@@ -933,9 +1128,10 @@ function scorePokemonCardCandidate(card, candidate) {
 
     let score = 0;
 
-    if (aiName && candidateName) {
-        if (aiName === candidateName) score += 4;
-        else if (candidateName.includes(aiName) || aiName.includes(candidateName)) score += 2;
+    if (candidateName) {
+        const names = cardNameCandidates(card);
+        if (names.includes(candidateName)) score += 4;
+        else if (names.some(n => candidateName.includes(n) || n.includes(candidateName))) score += 2;
     }
 
     if (aiNumber && candidateNumber && aiNumber === candidateNumber) score += 5;
@@ -1035,8 +1231,27 @@ const CANDIDATE_TTL_MS = 10 * 60 * 1000;
 /** Why the most recent candidate lookup for a card came back empty, if it did. */
 const lastCandidateErrors = new Map();
 
+/**
+ * The name to search an English-language card database with.
+ *
+ * api.pokemontcg.io carries English printings only, so querying it with the
+ * name printed on a Japanese or Chinese card returns nothing no matter how it
+ * is spelled. The English name the AI reports alongside the printed one is
+ * what makes the lookup possible at all.
+ */
+function englishSearchName(card) {
+    const printed = String(card?.card_name || '').trim();
+    const english = String(card?.card_name_en || '').trim();
+    if (english && hasMeaningfulCardName(english)) {
+        // Prefer the English name whenever the printed one cannot possibly
+        // match: a non-Latin script, or a card we know is not English.
+        if (hasNonLatinScript(printed) || isNonEnglish(card?.language) || !printed) return english;
+    }
+    return printed || english;
+}
+
 async function fetchPokemonTcgCandidates(card) {
-    if (!hasMeaningfulCardName(card.card_name)) return [];
+    if (!hasMeaningfulCardName(englishSearchName(card))) return [];
 
     const cacheKey = buildVariantKey(card);
     const cached = candidateCache.get(cacheKey);
@@ -1057,18 +1272,21 @@ async function fetchPokemonTcgCandidates(card) {
     const headers = { 'Accept': 'application/json' };
     if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
 
-    const safeName = String(card.card_name || '').replace(/"/g, '\\"').trim();
+    const safeName = englishSearchName(card).replace(/"/g, '\\"').trim();
     const safeSet = String(card.card_set || '').replace(/"/g, '\\"').trim();
     const normalizedNumber = normalizeCardNumber(card.card_number);
+    // A non-English card's set name comes from a different print run and will
+    // not exist in an English database, so searching by it wastes a request.
+    const setIsSearchable = Boolean(safeSet) && !isNonEnglish(card.language);
 
     // Most specific first. The loop below stops at the first query that answers,
     // rather than always running all four — the keyless tier of this API is
     // rate limited, and four queries per card multiplied across a collection is
     // what exhausted it and made every lookup fail.
     const queries = [];
-    if (safeName && safeSet && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
+    if (safeName && setIsSearchable && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
     if (safeName && normalizedNumber) queries.push(`name:"${safeName}" number:"${normalizedNumber}"`);
-    if (safeName && safeSet) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
+    if (safeName && setIsSearchable) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
     if (safeName) queries.push(`name:"${safeName}"`);
 
     const unique = new Map();
@@ -1125,11 +1343,28 @@ function cardDatabaseReachable() {
 }
 
 /**
+ * Confirm a card the AI read against a real card database, and return it in
+ * canonical form.
+ *
+ * Which database depends on the language, and that is not a detail:
+ *
+ *  - api.pokemontcg.io carries English printings only. Its numbering is the
+ *    English numbering. A Japanese Charizard printed 013/102 in a Japanese set
+ *    has no relationship to English 4/102, so matching a non-English card
+ *    against it would either fail or — worse — succeed against the wrong card
+ *    and attach an English-market price to a Japanese printing.
+ *  - TCGdex publishes each language separately, with the numbers actually
+ *    printed on those cards, so it is the only source that can confirm a
+ *    Japanese, Korean or Chinese printing.
+ *
+ * Whichever one confirms it, the printed name and language are preserved. A
+ * card is stored as the thing Jack is holding, not as its English equivalent.
+ *
  * @param {(stage:string, payload?:object) => void} [report] scan progress sink
  * @returns {object|null} the canonical card, or null with a reason reported
  */
 async function verifyAndCanonicalizeCard(card, report = () => {}) {
-    if (!card || !hasMeaningfulCardName(card.card_name)) {
+    if (!card || !hasMeaningfulCardName(card.card_name || card.card_name_en)) {
         report('verify_failed', { reason: 'unreadable_name', message: 'Could not make out the card name.' });
         return null;
     }
@@ -1138,6 +1373,85 @@ async function verifyAndCanonicalizeCard(card, report = () => {}) {
         return null;
     }
 
+    if (isNonEnglish(card.language)) {
+        report('verifying_language', {
+            language: languageLabel(card.language),
+            message: `Looking this up as a ${languageLabel(card.language)} printing`,
+        });
+        return verifyAgainstTcgdex(card, report);
+    }
+    return verifyAgainstPokemonTcg(card, report);
+}
+
+/** Confirm a non-English printing against TCGdex in its own language. */
+async function verifyAgainstTcgdex(card, report) {
+    const lang = languageCode(card.language);
+    const label = languageLabel(card.language);
+    let found = null;
+    try {
+        found = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number, {
+            lang,
+            fallbackName: card.card_name_en || '',
+            strict: true,
+        });
+    } catch (err) {
+        const failure = describeAxiosError(err);
+        report('verify_failed', {
+            reason: `database_${failure.kind}`,
+            message: `The ${label} card database could not answer — ${failure.message}.`,
+        });
+        return null;
+    }
+
+    if (!found) {
+        report('verify_failed', {
+            reason: 'no_match',
+            message: `No ${label} card matched "${card.card_name}" ${card.card_number || ''}`.trim() + '.',
+        });
+        return null;
+    }
+
+    // The printed number is the one strong signal here: TCGdex's localId is
+    // what is on the card, in that language's own numbering.
+    const printed = normalizeCardNumber(card.card_number);
+    const theirs = normalizeCardNumber(found.localId);
+    if (printed && theirs && printed !== theirs) {
+        report('verify_failed', {
+            reason: 'number_mismatch',
+            message: `Closest ${label} match is numbered ${found.localId}, not ${card.card_number}.`,
+        });
+        return null;
+    }
+
+    if (!namesMatchExactly(card, found.name)) {
+        report('verify_failed', {
+            reason: 'low_match',
+            message: `The closest ${label} match was "${found.name}", which is not close enough to trust.`,
+        });
+        return null;
+    }
+
+    return {
+        ...card,
+        // Kept as printed. This is a Japanese/Chinese/Korean card and storing
+        // it under its English name would misrepresent what Jack owns.
+        card_name: card.card_name || found.name,
+        card_name_en: card.card_name_en || '',
+        card_set: found.set?.name || card.card_set || '',
+        card_number: card.card_number || found.localId || '',
+        rarity: found.rarity || card.rarity || 'Unknown',
+        year: card.year || 0,
+        language: normalizeLanguage(card.language),
+        image_url: found.image ? `${found.image}/high.webp` : '',
+        tcgplayer_url: '',
+        cardmarket_url: '',
+        verified_source: `tcgdex_${found.tcgdexLang || lang}`,
+        confidence: Math.max(Number(card.confidence) || 0, printed && theirs ? 0.95 : 0.85),
+    };
+}
+
+/** Confirm an English printing against the Pokémon TCG API. */
+async function verifyAgainstPokemonTcg(card, report) {
     const candidates = await fetchPokemonTcgCandidates(card);
     if (!candidates.length) {
         const failure = candidateLookupError(card);
@@ -1148,8 +1462,7 @@ async function verifyAndCanonicalizeCard(card, report = () => {}) {
     }
     report('candidates', { count: candidates.length });
 
-    const normalizedAiName = normalizeText(card.card_name);
-    const sameNameCandidates = candidates.filter(c => normalizeText(c?.name) === normalizedAiName);
+    const sameNameCandidates = candidates.filter(c => namesMatchExactly(card, c?.name));
     const exactNumberCandidates = sameNameCandidates.filter(c => normalizeCardNumber(c?.number) === normalizeCardNumber(card.card_number));
     const exactSetCandidates = sameNameCandidates.filter(c => {
         const setA = normalizeText(c?.set?.name);
@@ -1179,14 +1492,16 @@ async function verifyAndCanonicalizeCard(card, report = () => {}) {
     return {
         ...card,
         card_name: bestCandidate.name || card.card_name,
+        card_name_en: bestCandidate.name || card.card_name_en || '',
         card_set: bestCandidate.set?.name || card.card_set || '',
         card_number: bestCandidate.number || card.card_number || '',
         rarity: bestCandidate.rarity || card.rarity || 'Unknown',
         year: parseInt((bestCandidate.set?.releaseDate || '').slice(0, 4), 10) || card.year || 0,
-        language: card.language || 'English',
+        language: 'english',
         image_url: bestCandidate.images?.large || bestCandidate.images?.small || '',
         tcgplayer_url: bestCandidate.tcgplayer?.url || '',
         cardmarket_url: bestCandidate.cardmarket?.url || '',
+        verified_source: 'pokemontcg',
         // Pricing is deliberately NOT taken from this candidate. It runs through
         // lookupMarketPrice so a scanned card and a refreshed card are priced by
         // exactly the same rules.
@@ -1205,6 +1520,50 @@ function analysisLooksTooWeak(card) {
 const GEMINI_SUPPORTED_TYPES = new Set([
     'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif'
 ]);
+
+/**
+ * Long edge, in pixels, of the image actually sent for recognition.
+ *
+ * A modern phone photo is 12 MP or more. Uploading one of those to the model on
+ * every shutter press dominated the time from tap to result, and none of that
+ * detail is used: what has to be legible is a name in ~40px type, a card number
+ * in ~15px type, and a foil pattern. 1280px on the long edge keeps all three
+ * readable — including CJK glyphs, which need more pixels than Latin text —
+ * while cutting the bytes sent by roughly an order of magnitude.
+ *
+ * The client already crops to the capture guide and caps its own output, so this
+ * mainly affects photos chosen from the library and the native camera.
+ */
+const AI_IMAGE_MAX_EDGE = 1280;
+
+/**
+ * Shrink an image for recognition. Returns the original buffer unchanged if
+ * anything goes wrong: a slower scan is better than a failed one.
+ */
+async function prepareImageForAi(buffer) {
+    try {
+        const image = sharp(buffer, { failOn: 'none' });
+        const meta = await image.metadata();
+        const longEdge = Math.max(meta.width || 0, meta.height || 0);
+        if (!longEdge || longEdge <= AI_IMAGE_MAX_EDGE) return { buffer, mime: null, resized: false };
+
+        const out = await image
+            .rotate() // honour EXIF orientation before dropping the metadata
+            .resize(AI_IMAGE_MAX_EDGE, AI_IMAGE_MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 88, mozjpeg: true })
+            .toBuffer();
+        return {
+            buffer: out,
+            mime: 'image/jpeg',
+            resized: true,
+            from: longEdge,
+            savedBytes: buffer.length - out.length,
+        };
+    } catch (err) {
+        console.error('  [AI prep] Could not resize, sending as-is:', err.message);
+        return { buffer, mime: null, resized: false };
+    }
+}
 
 async function convertToJpeg(buffer, filePath) {
     try {
@@ -1490,7 +1849,11 @@ async function collectPokemonTcgQuotes(card, ctx) {
 }
 
 async function collectTcgdexQuotes(card, ctx) {
-    const tcgdexCard = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number, true);
+    const tcgdexCard = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number, {
+        strict: true,
+        lang: languageCode(card.language),
+        fallbackName: card.card_name_en || '',
+    });
     return quotesFromTcgdexCard(tcgdexCard, ctx);
 }
 
@@ -1549,12 +1912,37 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
     }
 
     const ctx = priceContextFor(card);
+    const nonEnglish = isNonEnglish(card.language);
+    const langLabel = languageLabel(card.language);
 
+    // A price is only a price for the printing it was quoted on. The Pokémon
+    // TCG API and JustTCG both index the English TCGplayer catalogue, so their
+    // numbers describe the English card — applying one to a Japanese or Chinese
+    // printing would be a confident, plausible, wrong answer, which is worse
+    // than no answer. Those sources are therefore not consulted at all for a
+    // non-English card; TCGdex is, because it is queried in that language.
     const collectors = [
-        { name: 'pokemontcg', configured: true, run: () => collectPokemonTcgQuotes(card, ctx) },
+        {
+            name: 'pokemontcg',
+            configured: !nonEnglish,
+            reason: nonEnglish ? `English-only catalogue — cannot price a ${langLabel} printing` : '',
+            run: () => collectPokemonTcgQuotes(card, ctx),
+        },
         { name: 'tcgdex', configured: true, run: () => collectTcgdexQuotes(card, ctx) },
-        { name: 'scrydex', configured: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), run: () => collectScrydexQuotes(card, ctx) },
-        { name: 'justtcg', configured: Boolean(JUSTTCG_API_KEY), run: () => collectJustTcgQuotes(card) },
+        {
+            name: 'scrydex',
+            configured: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) && !nonEnglish,
+            reason: !SCRYDEX_API_KEY || !SCRYDEX_TEAM_ID ? 'no API key'
+                : `English-only catalogue — cannot price a ${langLabel} printing`,
+            run: () => collectScrydexQuotes(card, ctx),
+        },
+        {
+            name: 'justtcg',
+            configured: Boolean(JUSTTCG_API_KEY) && !nonEnglish,
+            reason: !JUSTTCG_API_KEY ? 'no API key'
+                : `English-only catalogue — cannot price a ${langLabel} printing`,
+            run: () => collectJustTcgQuotes(card),
+        },
     ];
 
     const sources = [];
@@ -1563,15 +1951,20 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
         try { onSource?.(entry); } catch { /* a listener must never break a lookup */ }
     };
 
-    for (const { name, configured } of collectors) {
-        try { onSource?.({ name, label: PRICE_SOURCE_LABELS[name] || name, state: configured ? 'asking' : 'skipped', reason: configured ? '' : 'no API key' }); }
-        catch { /* ignore */ }
+    for (const { name, configured, reason } of collectors) {
+        try {
+            onSource?.({
+                name, label: PRICE_SOURCE_LABELS[name] || name,
+                state: configured ? 'asking' : 'skipped',
+                reason: configured ? '' : (reason || 'not available'),
+            });
+        } catch { /* ignore */ }
     }
 
-    const settled = await Promise.allSettled(collectors.map(async ({ name, configured, run }) => {
+    const settled = await Promise.allSettled(collectors.map(async ({ name, configured, reason, run }) => {
         const label = PRICE_SOURCE_LABELS[name] || name;
         if (!configured) {
-            report({ name, label, state: 'skipped', quotes: 0, reason: 'no API key' });
+            report({ name, label, state: 'skipped', quotes: 0, reason: reason || 'not available' });
             return [];
         }
         const startedAt = Date.now();
@@ -1668,6 +2061,7 @@ function scanReporter(scanId) {
 
 
 let priceRefreshRunning = false;
+let reviewRecheckRunning = false;
 
 // Batched refresh: process N cards (for Vercel cron, N=5 to fit in 10s timeout)
 async function refreshBatchPrices(batchSize = 5) {
@@ -1680,7 +2074,7 @@ async function refreshBatchPrices(batchSize = 5) {
     try {
         // Pick the N cards that haven't been checked in the longest (or never)
         const res = await pool.query(`
-            SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
             FROM portfolio_cards
             WHERE COALESCE(needs_review, 0) = 0
             ORDER BY
@@ -1742,7 +2136,7 @@ async function refreshAllPrices() {
     // refresh silently short-circuits until the process restarts.
     try {
         const res = await pool.query(`
-            SELECT id, card_name, card_set, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
             FROM portfolio_cards
             WHERE COALESCE(needs_review, 0) = 0
             ORDER BY last_price_check ASC NULLS FIRST, id ASC
@@ -2196,10 +2590,12 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
 
         const merged = {
             card_name: req.body.card_name ?? before.card_name,
+            card_name_en: req.body.card_name_en ?? before.card_name_en ?? '',
             card_set: req.body.card_set ?? before.card_set,
+            set_code: req.body.set_code ?? before.set_code ?? '',
             card_number: req.body.card_number ?? before.card_number,
             holo_type: req.body.holo_type ?? before.holo_type,
-            language: req.body.language ?? before.language,
+            language: normalizeLanguage(req.body.language ?? before.language),
             rarity: req.body.rarity ?? before.rarity,
             is_first_edition: req.body.is_first_edition !== undefined
                 ? (req.body.is_first_edition ? 1 : 0)
@@ -2211,37 +2607,69 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
 
         await pool.query(`
             UPDATE portfolio_cards
-            SET card_name = $2, card_set = $3, card_number = $4, holo_type = $5,
-                language = $6, rarity = $7, is_first_edition = $8, is_holo = $9,
-                variant_key = $10, needs_review = 0, last_price_check = NULL
-            WHERE id = $1 AND user_id = $11
+            SET card_name = $2, card_name_en = $3, card_set = $4, set_code = $5,
+                card_number = $6, holo_type = $7,
+                language = $8, rarity = $9, is_first_edition = $10, is_holo = $11,
+                variant_key = $12, needs_review = 0, last_price_check = NULL
+            WHERE id = $1 AND user_id = $13
         `, [
-            cardId, merged.card_name, merged.card_set, merged.card_number, merged.holo_type,
+            cardId, merged.card_name, merged.card_name_en, merged.card_set, merged.set_code,
+            merged.card_number, merged.holo_type,
             merged.language, merged.rarity, merged.is_first_edition, merged.is_holo,
             variantKey, req.user.id,
         ]);
 
-        // Price history belongs to the old printing; keep it only if the
-        // identity is unchanged (e.g. a typo fix in the set name).
+        // The price and its history belong to the old printing. A typo fix in a
+        // set name leaves the identity alone and keeps both; a genuine change of
+        // printing invalidates them, and carrying the old figure forward is how
+        // a card came to show a confident price for something it is not.
         if (identityChanged) {
             await pool.query('DELETE FROM price_history WHERE card_id = $1', [cardId]);
+            await clearStalePrice(cardId);
         }
 
-        const market = await lookupMarketPrice(merged);
-        if (market && market.price > 0) {
-            await insertPricePoint(cardId, market.price, market.source, market.url || '');
-            await updatePortfolioCardMarketData(cardId, market);
-        } else {
+        // The corrected fields are honoured as given, but the price still has to
+        // be earned: a printing we cannot confirm gets no price rather than the
+        // price of whatever the loose search happened to match. That mismatch is
+        // how a common card came to be valued in the hundreds.
+        forgetCandidates(merged);
+        const verified = await verifyAndCanonicalizeCard({ ...merged, confidence: 0.95 });
+        let priceNote = '';
+
+        if (!verified) {
+            // The correction is kept, but the flag means "printing unconfirmed"
+            // and that is still true — so it goes back on rather than leaving an
+            // unpriced card sitting in the collection with no explanation.
+            await pool.query('UPDATE portfolio_cards SET needs_review = 1 WHERE id = $1', [cardId]);
             await markPriceChecked(cardId);
+            priceNote = isNonEnglish(merged.language)
+                ? `Saved your correction, but this ${languageLabel(merged.language)} printing still could not be found in the card database, so it stays in Needs review and unpriced.`
+                : 'Saved your correction, but the printing still could not be confirmed, so it stays in Needs review and unpriced rather than being given another card\'s price.';
+        } else {
+            await applyVerifiedIdentity(cardId, verified);
+            const market = await lookupMarketPrice({ ...merged, ...verified }, { fresh: true });
+            if (market && market.price > 0) {
+                await insertPricePoint(cardId, market.price, market.source, market.url || '');
+                await updatePortfolioCardMarketData(cardId, market);
+                priceNote = `Confirmed and priced at $${market.price.toFixed(2)}.`;
+            } else {
+                await markPriceChecked(cardId);
+                priceNote = 'Confirmed, but no marketplace quotes a price for this printing.';
+            }
         }
+
+        const after = await pool.query('SELECT current_price, price_source, price_confidence, needs_review FROM portfolio_cards WHERE id = $1', [cardId]);
+        const row = after.rows[0] || {};
 
         broadcast({ type: 'portfolio_updated' });
         res.json({
             success: true,
             identityChanged,
-            price: market?.price || 0,
-            source: market?.source || 'not_found',
-            confidence: market?.confidence || 0,
+            confirmed: Boolean(verified),
+            message: priceNote,
+            price: Number(row.current_price) || 0,
+            source: row.price_source || 'not_found',
+            confidence: Number(row.price_confidence) || 0,
         });
     } catch (err) {
         console.error('Edit error:', err);
@@ -2391,9 +2819,55 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
         const card = owned.rows[0];
         const previousPrice = Number(card.current_price) || 0;
 
+        // A card awaiting review has never had its printing confirmed, so
+        // re-pricing it means re-verifying it first. Two reasons:
+        //
+        //  1. Without this, re-pricing could never clear the review flag, so a
+        //     card corrected in the app stayed in Needs review forever.
+        //  2. Pricing an unconfirmed card matches loosely on name and number
+        //     and will happily return the price of a different printing. That
+        //     is how a common card ended up valued in the hundreds. A price we
+        //     cannot attach to a specific printing is not worth having.
+        let subject = card;
+        let clearedReview = false;
+        if (card.needs_review) {
+            forgetCandidates(card);
+            const verified = await verifyAndCanonicalizeCard({
+                ...card,
+                // The stored confidence is the AI's read of the photo. Re-verifying
+                // works from the fields as they now stand, which the person may
+                // have corrected by hand, so it must not be gated on that.
+                confidence: Math.max(Number(card.confidence) || 0, 0.9),
+            });
+            if (!verified) {
+                await markPriceChecked(cardId);
+                broadcast({ type: 'portfolio_updated' });
+                return res.json({
+                    success: true,
+                    status: 'unconfirmed',
+                    message: isNonEnglish(card.language)
+                        ? `Still cannot confirm this ${languageLabel(card.language)} printing. Check the card number and set, then try again — it is left unpriced rather than given the price of a different card.`
+                        : 'Still cannot confirm which printing this is, so it is left unpriced rather than given the price of a different card. Check the name, set and number.',
+                    price: previousPrice,
+                    previousPrice,
+                    delta: 0,
+                    changed: false,
+                    needsReview: true,
+                    source: 'unconfirmed',
+                    quotesUsed: 0,
+                    quotesSeen: 0,
+                    sources: [],
+                });
+            }
+
+            await applyVerifiedIdentity(cardId, verified);
+            subject = { ...card, ...verified, needs_review: 0 };
+            clearedReview = true;
+        }
+
         // `fresh` clears both the price cache and the candidate memo: the point
         // of asking is to get a new answer, not a fast one.
-        const market = await lookupMarketPrice(card, { fresh: true });
+        const market = await lookupMarketPrice(subject, { fresh: true });
         const price = Number(market?.price) || 0;
 
         if (price > 0) {
@@ -2422,8 +2896,10 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
             delta = 0;
         } else if (price === 0) {
             status = 'not_found';
-            message = card.needs_review
-                ? 'No listing matched. Confirm the set and card number on this card, then try again.'
+            message = isNonEnglish(subject.language)
+                // Not a failure to find the card — a real gap in the data. The
+                // English marketplaces are deliberately not substituted here.
+                ? `Confirmed as a ${languageLabel(subject.language)} printing, but no marketplace quotes a price for it. English prices are not used as a stand-in because they are not this card's price.`
                 : 'No marketplace listing found for this exact printing.';
         } else if (Math.abs(delta) < 0.005) {
             status = 'unchanged';
@@ -2432,11 +2908,18 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
             message = `${previousPrice > 0 ? `$${previousPrice.toFixed(2)} → ` : ''}$${price.toFixed(2)} (${delta > 0 ? '+' : ''}$${delta.toFixed(2)}) from ${market.quotesUsed} of ${market.quotesSeen} quotes.`;
         }
 
+        if (clearedReview) {
+            message = `Confirmed as ${subject.card_name}`
+                + `${subject.card_set ? ` (${subject.card_set}${subject.card_number ? ` ${subject.card_number}` : ''})` : ''}`
+                + ` and moved out of Needs review. ${message}`;
+        }
+
         broadcast({ type: 'portfolio_updated' });
         res.json({
             success: true,
             status,
             message,
+            clearedReview,
             // The card's price after this attempt. On an outage that is the one
             // it already had, not the zero the lookup came back with.
             price: status === 'sources_unavailable' ? previousPrice : price,
@@ -2453,6 +2936,85 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('Reprice error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Re-check every card in Needs review.
+ *
+ * Correcting cards one at a time is the wrong shape for a shelf of cards the
+ * scanner could not confirm — especially since the most common reason was a
+ * fixable one (a non-English card the identity code could not read at all).
+ * This walks the whole list, re-verifies each, and prices the ones that now
+ * confirm. Cards that still cannot be confirmed are left unpriced rather than
+ * given a plausible wrong number.
+ */
+app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
+    if (reviewRecheckRunning) {
+        return res.status(409).json({ error: 'A re-check is already running.' });
+    }
+    reviewRecheckRunning = true;
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM portfolio_cards WHERE user_id = $1 AND COALESCE(needs_review, 0) = 1 ORDER BY id ASC',
+            [req.user.id]);
+
+        res.json({ success: true, started: rows.length, message: `Re-checking ${rows.length} card${rows.length === 1 ? '' : 's'}…` });
+
+        // The response is already sent; this continues in the background and
+        // reports itself over SSE, because a shelf of cards takes minutes.
+        (async () => {
+            let confirmed = 0;
+            let priced = 0;
+            let stillUnknown = 0;
+
+            for (let i = 0; i < rows.length; i++) {
+                const card = rows[i];
+                try {
+                    forgetCandidates(card);
+                    const verified = await verifyAndCanonicalizeCard({
+                        ...card,
+                        confidence: Math.max(Number(card.confidence) || 0, 0.9),
+                    });
+
+                    if (!verified) {
+                        stillUnknown++;
+                        await markPriceChecked(card.id).catch(() => {});
+                    } else {
+                        await applyVerifiedIdentity(card.id, verified);
+                        confirmed++;
+                        const market = await lookupMarketPrice({ ...card, ...verified }, { fresh: true });
+                        if (market?.price > 0) {
+                            await insertPricePoint(card.id, market.price, market.source, market.url || '');
+                            await updatePortfolioCardMarketData(card.id, market);
+                            priced++;
+                        } else {
+                            await markPriceChecked(card.id);
+                        }
+                    }
+                } catch (err) {
+                    console.error(`  [Recheck] ${card.card_name}:`, err.message);
+                    stillUnknown++;
+                }
+
+                broadcast({
+                    type: 'recheck_progress',
+                    done: i + 1, total: rows.length, confirmed, priced, stillUnknown,
+                    card_name: card.card_name,
+                });
+                await sleep(600);
+            }
+
+            broadcastActivity('recheck_complete',
+                `Re-checked ${rows.length} card${rows.length === 1 ? '' : 's'}: `
+                + `${confirmed} confirmed, ${priced} priced, ${stillUnknown} still unidentified.`);
+            broadcast({ type: 'portfolio_updated' });
+        })().catch(err => console.error('Recheck error:', err))
+            .finally(() => { reviewRecheckRunning = false; });
+    } catch (err) {
+        reviewRecheckRunning = false;
+        console.error('Recheck error:', err);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
     }
 });
 
@@ -2634,19 +3196,32 @@ async function processPortfolioUpload(files, userId, options = {}) {
                 }
             }
 
-            // The thumbnail is made before the AI call so the client has
-            // something of the actual card to show while it waits.
-            try {
-                const thumbBuffer = await sharp(buffer)
-                    .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
-                    .jpeg({ quality: 80 })
-                    .toBuffer();
-                thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
-                report('thumbnail', { ...photo, image_data: thumbDataUrl });
-            } catch (e) { console.error(`  [Thumb] Failed for photo ${index + 1}:`, e.message); }
+            // A 12 MP phone photo carries far more detail than reading a card
+            // name and number needs, and uploading all of it was the single
+            // largest cost between the shutter and the answer.
+            const prepared = await prepareImageForAi(buffer);
+            if (prepared.resized) {
+                console.log(`  [Vision] ${prepared.from}px → ${AI_IMAGE_MAX_EDGE}px, ${Math.round(prepared.savedBytes / 1024)}KB less to upload`);
+            }
+
+            // The thumbnail and the recognition call are independent, so they run
+            // together: the client gets a picture of the card to look at while
+            // the model is still thinking, rather than after.
+            const thumbnail = sharp(prepared.buffer)
+                .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 80 })
+                .toBuffer()
+                .then((thumbBuffer) => {
+                    thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
+                    report('thumbnail', { ...photo, image_data: thumbDataUrl });
+                })
+                .catch((e) => { console.error(`  [Thumb] Failed for photo ${index + 1}:`, e.message); });
 
             report('identifying', { ...photo, message: 'Reading the card with AI' });
-            vision = await analyzeImageBuffer(buffer, sendMime);
+            [vision] = await Promise.all([
+                analyzeImageBuffer(prepared.buffer, prepared.mime || sendMime),
+                thumbnail,
+            ]);
 
             try { rmSync(file.path, { force: true }); } catch { }
         } catch (err) {
@@ -2691,9 +3266,13 @@ async function processPortfolioUpload(files, userId, options = {}) {
                 ...photo,
                 card: {
                     card_name: rawCard.card_name || '',
+                    card_name_en: rawCard.card_name_en || '',
                     card_set: rawCard.card_set || '',
+                    set_code: rawCard.set_code || '',
                     card_number: rawCard.card_number || '',
                     rarity: rawCard.rarity || '',
+                    language: languageLabel(rawCard.language),
+                    is_non_english: isNonEnglish(rawCard.language),
                     confidence: Number(rawCard.confidence) || 0,
                 },
             });
@@ -2707,13 +3286,17 @@ async function processPortfolioUpload(files, userId, options = {}) {
                     ...photo,
                     card: {
                         card_name: verified.card_name,
+                        card_name_en: verified.card_name_en || '',
                         card_set: verified.card_set,
                         card_number: verified.card_number,
                         rarity: verified.rarity,
                         year: verified.year,
+                        language: languageLabel(verified.language),
+                        is_non_english: isNonEnglish(verified.language),
                         image_url: verified.image_url || '',
                         confidence: verified.confidence,
                     },
+                    via: verified.verified_source || '',
                 });
             } else {
                 if (!hasMeaningfulCardName(card.card_name)) {
@@ -2778,6 +3361,10 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
             copy_id: copy.id,
             quantity: copies.length,
             card_name: existing.card_name,
+            card_name_en: existing.card_name_en || '',
+            language: normalizeLanguage(existing.language),
+            language_label: languageLabel(existing.language),
+            is_non_english: isNonEnglish(existing.language),
             card_set: existing.card_set,
             card_number: existing.card_number,
             rarity: existing.rarity,
@@ -2796,14 +3383,22 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
 
     let imageUrl = card.image_url || '';
     try {
-        if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number) || '';
-        if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number) || '';
+        // A Japanese card should show Japanese artwork, so TCGdex is asked in
+        // the card's own language first.
+        if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)) || '';
+        // The English fallbacks only make sense with an English name to search.
+        const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
+        if (!imageUrl && english) imageUrl = await fetchCardImageFromTCGdex(english, card.card_set, card.card_number) || '';
+        if (!imageUrl && english) imageUrl = await fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) || '';
     } catch { /* the scan photo stands in until a refresh finds artwork */ }
 
     const cardId = await insertPortfolioCard({
         card_name: card.card_name,
+        card_name_en: card.card_name_en || '',
         card_set: card.card_set || '',
+        set_code: card.set_code || '',
         card_number: card.card_number || '',
+        verified_source: card.verified_source || '',
         rarity: card.rarity || 'Unknown',
         condition: card.condition_estimate || card.condition,
         is_holo: card.is_holographic || card.is_holo || false,
@@ -2874,7 +3469,12 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
         id: cardId,
         quantity: 1,
         card_name: card.card_name,
+        card_name_en: card.card_name_en || '',
+        language: normalizeLanguage(card.language),
+        language_label: languageLabel(card.language),
+        is_non_english: isNonEnglish(card.language),
         card_set: card.card_set || '',
+        set_code: card.set_code || '',
         card_number: card.card_number || '',
         rarity: card.rarity || 'Unknown',
         condition,

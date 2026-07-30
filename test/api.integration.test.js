@@ -51,11 +51,11 @@ if (!DB) {
         };
         const res = await pool.query(`
             INSERT INTO portfolio_cards
-                (user_id, card_name, card_set, card_number, holo_type, language,
-                 is_first_edition, is_holo, condition, current_price)
-            VALUES (1, $1, $2, $3, $4, $5, $6, 1, $7, $8) RETURNING id
-        `, [c.card_name, c.card_set, c.card_number, c.holo_type, c.language,
-            c.is_first_edition, c.condition, c.current_price ?? 0]);
+                (user_id, card_name, card_name_en, card_set, card_number, holo_type, language,
+                 is_first_edition, is_holo, condition, current_price, needs_review)
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10) RETURNING id
+        `, [c.card_name, c.card_name_en ?? '', c.card_set, c.card_number, c.holo_type, c.language,
+            c.is_first_edition, c.condition, c.current_price ?? 0, c.needs_review ?? 0]);
         return res.rows[0].id;
     };
 
@@ -246,9 +246,22 @@ if (!DB) {
         assert.equal(edited.status, 200);
         assert.equal(edited.body.identityChanged, true);
 
-        const row = await pool.query('SELECT variant_key, needs_review FROM portfolio_cards WHERE id = $1', [id]);
+        const row = await pool.query('SELECT variant_key, needs_review, current_price FROM portfolio_cards WHERE id = $1', [id]);
         assert.match(row.rows[0].variant_key, /base set 2\|1\|reverse/);
-        assert.equal(row.rows[0].needs_review, 0);
+
+        // The correction is always kept, but a price has to be earned. An edit
+        // used to clear the review flag and then price the card off a loose
+        // name+number search, which is how a common card came to be valued in
+        // the hundreds. Now the flag tracks whether the printing was actually
+        // confirmed, and an unconfirmed card is left unpriced on purpose.
+        assert.equal(edited.body.confirmed, row.rows[0].needs_review === 0,
+            'the review flag and the confirmed flag must agree');
+        if (!edited.body.confirmed) {
+            assert.equal(Number(row.rows[0].current_price), 0,
+                'an unconfirmed printing must not carry a price');
+            assert.match(edited.body.message, /Saved your correction/,
+                'and the edit must say it was kept');
+        }
     });
 
     /**
@@ -354,5 +367,137 @@ if (!DB) {
         // Sequence numbers let a client drop out-of-order or duplicate events.
         const seqs = progress.map(p => p.seq);
         assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'events carry an increasing sequence');
+    });
+
+    /**
+     * A non-English card stores and reports as the card it is.
+     *
+     * Before, its name normalised to the empty string, so it was rejected as
+     * unreadable and — had it been saved — would have shared a variant key with
+     * every other non-Latin card in the collection.
+     */
+    test('a Chinese card keeps its printed name, its language, and its own identity', async () => {
+        const relicanth = await seedLegacyCard({
+            card_name: '古空棘鱼', card_name_en: 'Relicanth', card_set: '', card_number: '014/131',
+            language: 'chinese-simplified', holo_type: 'Non-Holo',
+        });
+        const charizard = await seedLegacyCard({
+            card_name: 'リザードン', card_name_en: 'Charizard', card_set: '', card_number: '004/102',
+            language: 'japanese', holo_type: 'Holofoil',
+        });
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2), ($3, $2)',
+            [relicanth, 'Near Mint', charizard]);
+
+        const { body } = await api('/api/portfolio');
+        const cn = body.cards.find(c => c.id === relicanth);
+        const jp = body.cards.find(c => c.id === charizard);
+        assert.ok(cn && jp, 'both cards are listed');
+
+        assert.equal(cn.card_name, '古空棘鱼', 'stored under the name printed on it');
+        assert.equal(cn.card_name_en, 'Relicanth', 'and findable by its English name');
+        assert.equal(cn.language_label, 'Chinese (Simplified)');
+        assert.equal(cn.is_non_english, true);
+        assert.equal(jp.language_label, 'Japanese');
+
+        // These rows were inserted straight into the table, so their keys are
+        // assigned by the write path. Touching each through the edit endpoint is
+        // what exercises the identity code on a non-Latin name.
+        for (const id of [relicanth, charizard]) {
+            await api(`/api/portfolio/${id}/edit`, { method: 'POST', body: JSON.stringify({}) });
+        }
+        const keys = await pool.query(
+            'SELECT id, variant_key FROM portfolio_cards WHERE id = ANY($1::int[])', [[relicanth, charizard]]);
+        const byId = Object.fromEntries(keys.rows.map(r => [r.id, r.variant_key]));
+
+        assert.notEqual(byId[relicanth], byId[charizard],
+            'two non-Latin cards must not share one identity');
+        for (const id of [relicanth, charizard]) {
+            assert.notEqual(byId[id].split('|')[0], '',
+                `the name segment of "${byId[id]}" must not be empty`);
+        }
+    });
+
+    /**
+     * The correctness rule behind the pricing fix. English marketplaces price
+     * English printings; substituting one for a Japanese card produces a
+     * confident wrong number, which is worse than no number.
+     */
+    test('English-only price sources are not consulted for a non-English card', async () => {
+        const id = await seedLegacyCard({
+            card_name: 'リザードン', card_name_en: 'Charizard', card_set: '', card_number: '004/102',
+            language: 'japanese', current_price: 0,
+        });
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+
+        const { body } = await api(`/api/portfolio/${id}/reprice`, { method: 'POST' });
+        const byName = Object.fromEntries((body.sources || []).map(s => [s.name, s]));
+
+        for (const name of ['pokemontcg', 'justtcg', 'scrydex']) {
+            if (!byName[name]) continue;
+            assert.equal(byName[name].state, 'skipped',
+                `${name} indexes the English catalogue and must not price a Japanese card`);
+            assert.match(byName[name].reason, /English|API key/,
+                `${name} should say why it was skipped`);
+        }
+        // TCGdex is queried per language, so it is the one that may answer.
+        assert.ok(byName.tcgdex, 'TCGdex is still consulted');
+        assert.notEqual(byName.tcgdex.state, 'skipped');
+    });
+
+    /**
+     * "I repriced the ones that need review, but it's still saying needs review."
+     *
+     * Re-pricing never re-verified, so the flag could not clear — and it priced
+     * against a loose name+number match, which is how a card worth cents was
+     * valued in the hundreds. Now an unconfirmed card is re-verified first and,
+     * if it still cannot be confirmed, left unpriced on purpose.
+     */
+    test('re-pricing a card in review re-verifies it rather than guessing a price', async () => {
+        const id = await seedLegacyCard({
+            card_name: 'Steelix', card_set: 'Temporal Forces', card_number: '093/132',
+            needs_review: 1, current_price: 0,
+        });
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+
+        const { status, body } = await api(`/api/portfolio/${id}/reprice`, { method: 'POST' });
+        assert.equal(status, 200);
+
+        const row = await pool.query('SELECT needs_review, current_price FROM portfolio_cards WHERE id = $1', [id]);
+
+        if (body.status === 'unconfirmed') {
+            // The important half: it refused to invent a price for a card whose
+            // printing it could not pin down.
+            assert.equal(Number(row.rows[0].current_price), 0,
+                'an unconfirmed card must not be given a price');
+            assert.equal(row.rows[0].needs_review, 1, 'and stays flagged');
+            assert.match(body.message, /confirm/i, 'and says what it could not do');
+            assert.equal(body.needsReview, true);
+        } else {
+            // If it did confirm, the flag must have cleared — the bug was that
+            // it never could.
+            assert.equal(row.rows[0].needs_review, 0,
+                'a card that verified must leave Needs review');
+            assert.equal(body.clearedReview, true);
+        }
+    });
+
+    test('the bulk re-check walks every card in review and reports itself', async () => {
+        for (const n of ['Xerneas', 'Rabsca']) {
+            const id = await seedLegacyCard({ card_name: n, card_set: '', card_number: '064/132', needs_review: 1 });
+            await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+        }
+        const before = await pool.query(
+            'SELECT COUNT(*)::int c FROM portfolio_cards WHERE COALESCE(needs_review,0) = 1');
+        assert.ok(before.rows[0].c >= 2);
+
+        const { status, body } = await api('/api/portfolio/recheck-review', { method: 'POST' });
+        assert.equal(status, 200);
+        assert.equal(body.started, before.rows[0].c, 'every flagged card is queued');
+        assert.match(body.message, /Re-checking/);
+
+        // A second request while one is running is refused rather than doubling
+        // the load on the card database.
+        const again = await api('/api/portfolio/recheck-review', { method: 'POST' });
+        assert.equal(again.status, 409);
     });
 }

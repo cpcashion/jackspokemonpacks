@@ -415,6 +415,96 @@ if (!BASE || !chromium) {
         await p.close();
     });
 
+    /**
+     * A non-English card must be visibly a non-English card. Two tiles that
+     * look identical while being worth different money in different markets is
+     * the failure mode worth guarding against.
+     */
+    test('a non-English card is labelled with its language and English name', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.card');
+
+        const cards = await p.$$eval('.card', (ns) => ns.map((n) => {
+            const badge = n.querySelector('.flag-lang');
+            return {
+                name: n.querySelector('.card-name')?.textContent || '',
+                meta: n.querySelector('.card-meta')?.textContent || '',
+                lang: badge ? { text: badge.textContent, title: badge.getAttribute('title') } : null,
+            };
+        }));
+
+        const nonLatin = cards.filter((c) =>
+            /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}|\p{Script=Cyrillic}/u.test(c.name));
+        if (!nonLatin.length) return; // collection happens to be all-English
+
+        for (const card of nonLatin) {
+            assert.ok(card.lang, `"${card.name}" should carry a language badge`);
+            // Compact on the tile, unambiguous on hover: "Chinese (Simplified)"
+            // spelled out is wider than the card art it would sit on.
+            assert.match(card.lang.text, /^[A-Z]{2}$/, `badge should be a two-letter code, got "${card.lang.text}"`);
+            assert.ok(card.lang.title && card.lang.title.length > 2,
+                `"${card.name}" badge should name the language in full, got "${card.lang.title}"`);
+            assert.match(card.meta, /[A-Za-z]{3,}/,
+                `"${card.name}" should show its English name so the grid is readable`);
+        }
+        await p.close();
+    });
+
+    test('the analysis panel narrates a non-English card in both names', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForFunction(() => window.__test && window.__test.analysis);
+
+        const out = await p.evaluate(() => {
+            const t = window.__test.analysis;
+            t.reset('cjk', '');
+            const s = (stage, extra = {}) => t.progress({ type: 'scan_progress', scanId: 'cjk', stage, ...extra });
+            s('start', { photos: 1 });
+            s('identifying');
+            s('identified', {
+                card: {
+                    card_name: '古空棘鱼', card_name_en: 'Relicanth', card_number: '014/131',
+                    set_code: 'csb6C', language: 'Chinese (Simplified)', is_non_english: true, confidence: 1,
+                },
+            });
+            s('verifying_language', { language: 'Chinese (Simplified)', message: 'Looking this up as a Chinese (Simplified) printing' });
+            s('verified', {
+                card: { card_name: '古空棘鱼', card_name_en: 'Relicanth', card_set: 'Super Electric Breaker', card_number: '014/131', language: 'Chinese (Simplified)', is_non_english: true },
+                via: 'tcgdex_zh-cn',
+            });
+            s('pricing');
+            s('price_source', { name: 'pokemontcg', label: 'Pokémon TCG API', state: 'skipped', reason: 'English-only catalogue — cannot price a Chinese (Simplified) printing' });
+            s('price_source', { name: 'tcgdex', label: 'TCGdex', state: 'empty' });
+            s('unpriced', { message: 'No marketplace quotes a price for this printing.' });
+            return {
+                steps: [...document.querySelectorAll('#analysisSteps .step')]
+                    .map((n) => ({ state: n.className.replace('step ', ''), text: n.querySelector('.step-text').textContent, note: n.querySelector('.step-note').textContent })),
+                name: document.getElementById('analysisName').textContent,
+                meta: document.getElementById('analysisMeta').textContent,
+                price: document.getElementById('analysisPrice').textContent,
+            };
+        });
+
+        const text = out.steps.map((s) => s.text).join(' | ');
+        assert.match(text, /古空棘鱼/, 'reports the name as printed');
+        assert.match(text, /Relicanth/, 'and the English name that makes it findable');
+        assert.match(text, /Chinese \(Simplified\)/, 'and says which language it read');
+        assert.equal(out.name, '古空棘鱼', 'the card is titled as printed, not translated');
+        assert.match(out.meta, /Chinese \(Simplified\)/);
+
+        // The crucial one: an English-only source is shown as deliberately
+        // skipped, and no price is asserted for a printing nothing quoted.
+        const skipped = out.steps.find((s) => s.text.includes('Pokémon TCG API'));
+        assert.match(skipped.state, /\bskip\b/, `expected a skipped step, got "${skipped.state}"`);
+        assert.match(skipped.note, /English-only/, 'and it says why it was skipped');
+        // A reason that long gets its own line rather than crushing the label
+        // into one character per row.
+        assert.match(skipped.state, /stacked/, 'a sentence-length note stacks under the label');
+        assert.equal(out.price, '', 'a card with no quote shows no price');
+        await p.close();
+    });
+
     test('the analysis panel ignores progress from a different scan', async () => {
         const p = await browser.newPage();
         await p.goto(BASE, { waitUntil: 'networkidle' });

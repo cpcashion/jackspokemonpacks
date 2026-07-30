@@ -271,7 +271,8 @@ a { color: inherit; text-decoration: none; }
   background: var(--surface-3);
   color: var(--text-2);
 }
-.nav-count.alert { background: var(--warn-soft); color: var(--warn); }
+/* In-progress, not a problem — matches the tab badge it mirrors. */
+.nav-count.alert { background: var(--accent-soft); color: var(--accent); }
 
 .rail-spacer { flex: 1; }
 
@@ -462,7 +463,9 @@ a { color: inherit; text-decoration: none; }
   -webkit-backdrop-filter: blur(8px);
 }
 .flag-1st { background: var(--gold); color: #241a00; }
-.flag-review { background: var(--ember); color: #fff; }
+/* Same reasoning as the tab badge: the app is still working on this card, which
+   is a status, not a warning aimed at the person holding it. */
+.flag-review { background: var(--water); color: #fff; }
 /* Informational rather than a warning: a Japanese card is not a problem, it is
    simply a different card from its English counterpart. */
 .flag-lang { background: var(--water); color: #fff; }
@@ -1119,6 +1122,9 @@ a { color: inherit; text-decoration: none; }
   .tab-scan { color: var(--accent); }
   .tab-scan svg { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
 
+  /* A count of cards the app is still working on, not a pile of unread work
+     for the user. Red reads as "you have something to do here"; this is
+     informational, so it takes the neutral accent instead. */
   .tab-badge {
     position: absolute;
     top: 8px; left: 50%;
@@ -1126,10 +1132,10 @@ a { color: inherit; text-decoration: none; }
     min-width: 15px; height: 15px;
     padding: 0 4px;
     border-radius: var(--r-full);
-    background: var(--ember);
-    color: #fff;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--accent);
     font-family: var(--font-mono);
-    font-size: 9.5px; font-weight: 500;
+    font-size: 9.5px; font-weight: 600;
     display: grid; place-items: center;
   }
 

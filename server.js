@@ -36,6 +36,8 @@ import {
     copyValue,
     CONDITIONS,
     isTruthy,
+    parseCardNumber,
+    printedSetTotal,
     normalizeLanguage,
     languageCode,
     languageLabel,
@@ -45,6 +47,14 @@ import {
     hasNonLatinScript,
 } from './lib/identity.js';
 import { auditHistoryRows } from './lib/history.js';
+import {
+    hasMeaningfulCardName,
+    cardNameCandidates,
+    namesMatchExactly,
+    compareCandidate,
+    isLikelyVerifiedMatch,
+    scorePokemonCardCandidate,
+} from './lib/matching.js';
 import {
     quotesFromPokemonTcgCandidate,
     quotesFromTcgdexCard,
@@ -1011,9 +1021,9 @@ Pokemon cards are printed in English, Japanese, Korean, Simplified Chinese, Trad
 Read these directly off the card. Do not infer them from the artwork or from what is typical:
 - card_name: the name EXACTLY as printed, in the card's own script. For a Japanese card that means the Japanese name (e.g. "リザードン"), for Simplified Chinese the Chinese name (e.g. "古空棘鱼"). Include suffixes as printed: EX, GX, V, VMAX, VSTAR, ex.
 - card_name_en: the SAME Pokemon's official English name (e.g. "リザードン" -> "Charizard", "古空棘鱼" -> "Relicanth", "리자몽" -> "Charizard"). Include the English form of any suffix. For a card already in English, repeat card_name here. This field is what lets the card be looked up, so give your best answer rather than an empty string whenever you can recognise the Pokemon.
-- card_number: bottom of the card, exactly as printed (e.g. "4/102", "SWSH045", "TG12/TG30", "014/131").
+- card_number: bottom of the card, exactly as printed, INCLUDING the part after the slash (e.g. "4/102", "093/132", "TG12/TG30", "014/131"). The number after the slash is how the set is identified, so never drop it. If the card genuinely has no slash, give what is printed ("SWSH045", "PROMO").
 - set_code: the short code printed near the number if there is one (e.g. "csb6C", "sv8a", "SV3", "S12a"). Japanese, Chinese and Korean cards carry this and it identifies the set far more reliably than a name. Use "" if none is printed.
-- card_set: the set name. Use the set symbol, the set code and the number's denominator. If you cannot identify the set with confidence, use "".
+- card_set: the set name. Use the set symbol, the set code and the number's denominator. If you cannot identify the set with confidence, use "" — an empty set name costs nothing, because the card number's denominator identifies the set on its own. A wrong guess is worse than no guess.
 - Printing. This is critical and is decided by the foil pattern:
   * "Reverse Holo" - the card BORDER/background is foiled but the artwork is not.
   * "Holofoil" - the ARTWORK BOX is foiled.
@@ -1064,86 +1074,6 @@ function parseAiJson(text) {
         console.error(`  [parseAiJson] Failed to parse: ${text.substring(0, 100)}...`);
         return null;
     }
-}
-
-/** Placeholders the AI falls back to, in the languages it might answer in. */
-const PLACEHOLDER_NAMES = new Set([
-    'pokemon', 'pokemon card', 'unknown', 'unknown card', 'trainer', 'energy',
-    'ポケモン', 'たね', 'トレーナー', 'エネルギー',
-    '宝可梦', '寶可夢', '训练家', '訓練家', '能量',
-    '포켓몬', '트레이너', '에너지',
-]);
-
-function hasMeaningfulCardName(name) {
-    const normalized = normalizeText(name);
-    if (!normalized) return false;
-    return !PLACEHOLDER_NAMES.has(normalized);
-}
-
-/**
- * Every name this card could be looked up under: what is printed on it, and —
- * for a non-English card — the English name of the same Pokémon.
- *
- * A Chinese card reads "古空棘鱼"; no amount of normalisation will match that
- * against an English-language card database. The English name the AI supplies
- * alongside it is the only bridge, so identity comparisons accept either.
- */
-function cardNameCandidates(card) {
-    return [card?.card_name, card?.card_name_en]
-        .map(normalizeText)
-        .filter(Boolean)
-        .filter((n, i, all) => all.indexOf(n) === i);
-}
-
-/** Does either of this card's names match the candidate's, exactly? */
-function namesMatchExactly(card, candidateName) {
-    const target = normalizeText(candidateName);
-    return Boolean(target) && cardNameCandidates(card).includes(target);
-}
-
-function isLikelyVerifiedMatch(score, candidate, card) {
-    const aiNumber = normalizeCardNumber(card.card_number);
-    const candidateNumber = normalizeCardNumber(candidate?.number);
-    const aiSet = normalizeText(card.card_set);
-    const candidateSet = normalizeText(candidate?.set?.name);
-    const exactName = namesMatchExactly(card, candidate?.name);
-    const exactNumber = aiNumber && candidateNumber && aiNumber === candidateNumber;
-    const exactSet = aiSet && candidateSet && (aiSet === candidateSet || aiSet.includes(candidateSet) || candidateSet.includes(aiSet));
-
-    // A non-English card is matched against an English database, so its set
-    // name will not line up even when the card is right — Japanese sets have
-    // different names and different numbering from their English counterparts.
-    // The printed number is therefore the only trustworthy confirmation.
-    if (isNonEnglish(card.language)) return score >= 7 && exactName && Boolean(exactNumber);
-
-    return score >= 7 && exactName && (exactNumber || (exactSet && (card.confidence || 0) >= 0.85));
-}
-
-function scorePokemonCardCandidate(card, candidate) {
-    const candidateName = normalizeText(candidate?.name);
-    const aiSet = normalizeText(card.card_set);
-    const candidateSet = normalizeText(candidate?.set?.name);
-    const aiNumber = normalizeCardNumber(card.card_number);
-    const candidateNumber = normalizeCardNumber(candidate?.number);
-
-    let score = 0;
-
-    if (candidateName) {
-        const names = cardNameCandidates(card);
-        if (names.includes(candidateName)) score += 4;
-        else if (names.some(n => candidateName.includes(n) || n.includes(candidateName))) score += 2;
-    }
-
-    if (aiNumber && candidateNumber && aiNumber === candidateNumber) score += 5;
-
-    if (aiSet && candidateSet) {
-        if (aiSet === candidateSet) score += 3;
-        else if (candidateSet.includes(aiSet) || aiSet.includes(candidateSet)) score += 1;
-    }
-
-    if (card.year && candidate?.set?.releaseDate?.startsWith(String(card.year))) score += 1;
-
-    return score;
 }
 
 function pickBestPokemonCardCandidate(card, candidates) {
@@ -1323,18 +1253,20 @@ async function fetchPokemonTcgCandidates(card) {
 
     const safeName = englishSearchName(card).replace(/"/g, '\\"').trim();
     const safeSet = String(card.card_set || '').replace(/"/g, '\\"').trim();
-    const normalizedNumber = normalizeCardNumber(card.card_number);
+    const { number: normalizedNumber, printedTotal } = parseCardNumber(card.card_number);
     // A non-English card's set name comes from a different print run and will
     // not exist in an English database, so searching by it wastes a request.
     const setIsSearchable = Boolean(safeSet) && !isNonEnglish(card.language);
 
-    // Most specific first. The loop below stops at the first query that answers,
-    // rather than always running all four — the keyless tier of this API is
-    // rate limited, and four queries per card multiplied across a collection is
-    // what exhausted it and made every lookup fail.
+    // Most specific first, and specificity is measured in printed evidence.
+    // "093/132" pins the set to one of 132 cards, which is a far tighter filter
+    // than a set name the model guessed from a symbol — and unlike the guess it
+    // cannot be wrong. The loop stops at the first query that answers, because
+    // the rate limit is the binding constraint on a large collection.
     const queries = [];
-    if (safeName && setIsSearchable && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
+    if (safeName && normalizedNumber && printedTotal) queries.push(`name:"${safeName}" number:"${normalizedNumber}" set.printedTotal:${printedTotal}`);
     if (safeName && normalizedNumber) queries.push(`name:"${safeName}" number:"${normalizedNumber}"`);
+    if (safeName && setIsSearchable && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
     if (safeName && setIsSearchable) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
     if (safeName) queries.push(`name:"${safeName}"`);
 
@@ -1511,30 +1443,56 @@ async function verifyAgainstPokemonTcg(card, report) {
     }
     report('candidates', { count: candidates.length });
 
-    const sameNameCandidates = candidates.filter(c => namesMatchExactly(card, c?.name));
-    const exactNumberCandidates = sameNameCandidates.filter(c => normalizeCardNumber(c?.number) === normalizeCardNumber(card.card_number));
-    const exactSetCandidates = sameNameCandidates.filter(c => {
-        const setA = normalizeText(c?.set?.name);
-        const setB = normalizeText(card.card_set);
-        return setA && setB && (setA === setB || setA.includes(setB) || setB.includes(setA));
-    });
+    /**
+     * Resolve, rather than refuse.
+     *
+     * This used to bail out whenever more than one printing shared a name,
+     * handing the card to a person to sort out. But "several Pikachus exist" is
+     * not ambiguity — the card in your hand says which one it is. Ranking the
+     * candidates against the printed number and set size decides it; the only
+     * genuine ambiguity is a tie between two candidates that fit the printed
+     * evidence equally well, which is rare and is the one case still refused.
+     */
+    const ranked = candidates
+        .map(c => ({ candidate: c, score: scorePokemonCardCandidate(card, c), match: compareCandidate(card, c) }))
+        .sort((a, b) => b.score - a.score);
 
-    if (sameNameCandidates.length > 1 && exactNumberCandidates.length === 0 && exactSetCandidates.length !== 1) {
-        console.log(`  [Verify] Ambiguous same-name variant rejected for "${card.card_name}"`);
-        report('verify_failed', {
-            reason: 'ambiguous',
-            message: `${sameNameCandidates.length} printings share that name — the set or number is needed to tell them apart.`,
-        });
-        return null;
+    const best = ranked[0];
+    const runnerUp = ranked[1];
+
+    if (best && runnerUp && best.score === runnerUp.score && isLikelyVerifiedMatch(best.score, best.candidate, card)) {
+        // Two printings fit everything printed on the card equally well. Prefer
+        // the earlier release, which is the original printing; a reprint that
+        // genuinely cannot be told apart from it is close enough in identity
+        // that pricing the original is the better answer than pricing nothing.
+        const date = (r) => r.candidate?.set?.releaseDate || '9999';
+        if (date(best) !== date(runnerUp)) {
+            ranked.sort((a, b) => (b.score - a.score) || (date(a) < date(b) ? -1 : 1));
+        }
     }
 
-    const { bestCandidate, bestScore } = pickBestPokemonCardCandidate(card, candidates);
+    const bestCandidate = ranked[0]?.candidate || null;
+    const bestScore = ranked[0]?.score ?? -1;
 
     if (!bestCandidate || !isLikelyVerifiedMatch(bestScore, bestCandidate, card)) {
-        report('verify_failed', {
-            reason: 'low_match',
-            message: 'The closest database match was not close enough to trust.',
-        });
+        const printed = parseCardNumber(card.card_number);
+        const closest = ranked[0];
+        let message = 'The closest database match was not close enough to trust.';
+
+        // Say what specifically did not line up. "Could not confirm" with no
+        // detail is what made this feel like a chore with no way to finish it.
+        if (closest) {
+            const m = closest.match;
+            if (m.setSizeConflicts) {
+                const theirTotal = Number(closest.candidate?.set?.printedTotal) || Number(closest.candidate?.set?.total) || 0;
+                message = `Card reads ${card.card_number}, but the closest match is from a set of ${theirTotal} cards. Re-scan with the number in frame.`;
+            } else if (!m.name) {
+                message = `No card named "${card.card_name}" in the database — the name may have been misread.`;
+            } else if (!m.number && printed.number) {
+                message = `Found ${closest.candidate?.name} but nothing numbered ${card.card_number}. The number may have been misread.`;
+            }
+        }
+        report('verify_failed', { reason: 'low_match', message });
         return null;
     }
 
@@ -2218,15 +2176,23 @@ async function refreshAllPrices() {
     // The flag must be cleared even if the query below throws, or every later
     // refresh silently short-circuits until the process restarts.
     try {
+        // Unconfirmed cards are included, not skipped.
+        //
+        // They used to be excluded, which meant a card the scanner could not
+        // place stayed unplaced forever unless a person went and pressed
+        // something. That is the app handing its own unfinished work to the
+        // user. A card database gains sets over time and the matching code
+        // improves, so the right behaviour is to quietly try again on every
+        // scheduled run until it resolves.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review
             FROM portfolio_cards
-            WHERE COALESCE(needs_review, 0) = 0
-            ORDER BY last_price_check ASC NULLS FIRST, id ASC
+            ORDER BY COALESCE(needs_review, 0) DESC, last_price_check ASC NULLS FIRST, id ASC
         `);
         const cards = res.rows;
         let updated = 0;
         let unavailable = 0;
+        let resolved = 0;
 
         for (let i = 0; i < cards.length; i++) {
             const card = cards[i];
@@ -2240,10 +2206,33 @@ async function refreshAllPrices() {
                     }
                 }
 
+                // An unconfirmed card gets one more attempt at being identified
+                // before it is priced. If it resolves it stops being a chore
+                // waiting for someone; if it does not, it is left unpriced and
+                // will be tried again on the next run.
+                let subject = card;
+                if (card.needs_review) {
+                    forgetCandidates(card);
+                    const verified = await verifyAndCanonicalizeCard({
+                        ...card,
+                        confidence: Math.max(Number(card.confidence) || 0, 0.9),
+                    });
+                    if (!verified) {
+                        await markPriceChecked(card.id);
+                        broadcast({ type: 'refresh_progress', done: i + 1, total: cards.length, updated, card_name: card.card_name });
+                        await pacePriceRequests();
+                        continue;
+                    }
+                    await applyVerifiedIdentity(card.id, verified);
+                    subject = { ...card, ...verified };
+                    resolved++;
+                    broadcastActivity('info', `Identified ${verified.card_name} (${verified.card_set}) — it is no longer awaiting review.`);
+                }
+
                 // `fresh` matters here: the whole point of a refresh is to go
                 // out to the marketplaces again, and a warm in-process cache
                 // would otherwise turn the run into a no-op.
-                const result = await lookupMarketPrice(card, { fresh: true });
+                const result = await lookupMarketPrice(subject, { fresh: true });
                 if (result && result.price > 0) {
                     await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
                     await updatePortfolioCardMarketData(card.id, result);
@@ -2281,13 +2270,14 @@ async function refreshAllPrices() {
             }
         }
 
-        console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
-        broadcastActivity('refresh_complete',
-            unavailable
-                ? `Updated ${updated} card${updated === 1 ? '' : 's'}; ${unavailable} could not be reached.`
-                : `Updated prices for ${updated} card${updated === 1 ? '' : 's'}`);
+        console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards, identified ${resolved}.`);
+        broadcastActivity('refresh_complete', [
+            `Updated prices for ${updated} card${updated === 1 ? '' : 's'}`,
+            resolved ? `identified ${resolved} that had been awaiting review` : '',
+            unavailable ? `${unavailable} could not be reached` : '',
+        ].filter(Boolean).join('; ') + '.');
         broadcast({ type: 'portfolio_updated' });
-        return { updated, total: cards.length, unavailable };
+        return { updated, total: cards.length, unavailable, resolved };
     } finally {
         priceRefreshRunning = false;
     }

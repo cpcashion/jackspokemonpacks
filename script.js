@@ -206,7 +206,7 @@ document.querySelectorAll('[data-theme-set]').forEach((b) => {
 
 // ── NAVIGATION ───────────────────────────────────────────────────
 
-const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Needs review', settings: 'Settings' };
+const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Identifying', settings: 'Settings' };
 
 function showView(name) {
   if (name === 'scan') { openScanner(); return; }
@@ -655,7 +655,7 @@ function gridOf(cards) {
     // holo, so a "Holo" badge on all of them says nothing and just adds noise —
     // the printing is on the card's detail sheet where it matters.
     const flags = el('div', 'card-flags');
-    if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Review'));
+    if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Identifying'));
     if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
     // Language earns a badge precisely because it changes what a card is worth:
     // a Japanese Charizard and an English one are different cards in different
@@ -683,7 +683,7 @@ function gridOf(cards) {
       priceRow.append(el('span', 'card-price', money(card.total_value)));
       priceRow.append(el('span', `card-delta ${trendClass(change)}`, trendText(change)));
     } else {
-      priceRow.append(el('span', 'card-price unpriced', card.needs_review ? 'Needs review' : 'No price found'));
+      priceRow.append(el('span', 'card-price unpriced', card.needs_review ? 'Identifying…' : 'No price found'));
     }
     body.appendChild(priceRow);
 
@@ -963,7 +963,7 @@ function renderSheetBody() {
     figures.append(el('div', 'figure-note', `${money(card.unit_price)} Near Mint · adjusted for condition`));
   } else {
     figures.append(el('div', 'figure-note', card.needs_review
-      ? 'Not priced — the printing could not be confirmed. A price we cannot attach to a specific printing would be another card\'s price, so none is shown.'
+      ? 'Not priced yet — the exact printing has not been pinned down, and a price we cannot attach to a printing would be another card\'s price. The app retries this on every refresh; you can also correct the number or set to settle it now.'
       : card.is_non_english
         // Being explicit matters here: the absence of a price is a deliberate
         // choice, not a bug. English marketplaces quote English printings.

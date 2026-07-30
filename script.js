@@ -19,6 +19,9 @@ const state = {
   heroRange: 30,
   scanQueue: 0,
   scanned: [],
+  // Which sets are open in the Sets view. A set expands where it stands
+  // instead of throwing you back to the Collection view with a search applied.
+  openSets: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -211,6 +214,13 @@ function showView(name) {
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
   document.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
   $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
+
+  // The glass pill is one element travelling across the bar, so the bar only
+  // needs to know which of the five columns is current.
+  const bar = document.querySelector('.tabbar');
+  const slot = bar?.querySelector(`.tab[data-view="${name}"]`)?.dataset.slot;
+  if (bar && slot !== undefined) bar.style.setProperty('--active', slot);
+
   window.scrollTo({ top: 0 });
   render();
   if (name === 'settings') { loadHealth(); loadVersion(); }
@@ -713,8 +723,13 @@ function listOf(cards) {
 
 /**
  * The collection grouped by set — the closest thing here to a Pokédex page.
- * Tapping a set searches for it, which reuses the filtering the grid already
- * does rather than inventing a second way to narrow the collection.
+ *
+ * Tapping a set opens it where it stands. It used to write the set name into
+ * the search box and switch to the Collection view, which threw you back to
+ * the top of the app, past the portfolio chart, with a filter you had not
+ * asked for and no obvious way back. A set is a place you look inside, so it
+ * behaves like one: a disclosure that expands, keeps its neighbours visible,
+ * and leaves your position on the page alone.
  */
 function renderSets() {
   const host = $('setsBody');
@@ -748,12 +763,11 @@ function renderSets() {
 
   const wrap = el('div', 'sets');
   for (const g of sets) {
-    const row = el('button', 'set glass glass-tap');
-    row.addEventListener('click', () => {
-      state.query = g.name.toLowerCase();
-      $('searchInput').value = g.name;
-      showView('collection');
-    });
+    const group = el('div', 'set-group glass');
+    const open = state.openSets.has(g.name);
+
+    const row = el('button', 'set glass-tap');
+    row.setAttribute('aria-expanded', String(open));
 
     // Three highest-value cards, fanned like cards in a sleeve.
     const stack = el('div', 'set-stack');
@@ -785,7 +799,38 @@ function renderSets() {
     );
     row.appendChild(figures);
 
-    wrap.appendChild(row);
+    const caret = el('span', 'set-caret');
+    caret.innerHTML = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+    row.appendChild(caret);
+
+    group.appendChild(row);
+
+    // The cards themselves. Built on first open and then kept, so opening a
+    // set a second time is instant and a big collection is not all in the DOM.
+    const panel = el('div', 'set-cards');
+    panel.hidden = !open;
+    group.appendChild(panel);
+
+    const fill = () => {
+      if (panel.dataset.filled) return;
+      panel.dataset.filled = '1';
+      const cards = [...g.cards].sort((a, b) => (b.total_value || 0) - (a.total_value || 0));
+      panel.appendChild(state.layout === 'list' ? listOf(cards) : gridOf(cards));
+      hydrateLocalImages(panel);
+    };
+    if (open) fill();
+
+    row.addEventListener('click', () => {
+      const nowOpen = !state.openSets.has(g.name);
+      if (nowOpen) { state.openSets.add(g.name); fill(); }
+      else state.openSets.delete(g.name);
+      panel.hidden = !nowOpen;
+      group.classList.toggle('open', nowOpen);
+      row.setAttribute('aria-expanded', String(nowOpen));
+    });
+
+    group.classList.toggle('open', open);
+    wrap.appendChild(group);
   }
   host.appendChild(wrap);
 
@@ -821,16 +866,22 @@ function isUnverifiedPrice(card) {
   return card.unit_price > 0 && !(Number(card.price_confidence) > 0);
 }
 
+/**
+ * Ask for a fresh price for one card.
+ *
+ * The server now says which of four things happened, so the button can too.
+ * Previously every outcome — a genuinely unlisted card, a rate-limited API, a
+ * price that came back identical — produced the same silence, which is why
+ * re-pricing looked like it did nothing at all.
+ */
 async function repriceCard(cardId, button) {
   const original = button?.textContent;
   if (button) { button.disabled = true; button.textContent = 'Checking market…'; }
   try {
     const result = await api(`/api/portfolio/${cardId}/reprice`, { method: 'POST' });
-    if (result.price > 0) {
-      toast(`${money(result.price)} from ${result.quotesUsed} source${result.quotesUsed === 1 ? '' : 's'}`, 'success');
-    } else {
-      toast('No marketplace has a price for this printing right now', 'info', 5000);
-    }
+    const tone = { priced: 'success', unchanged: 'info', not_found: 'info', sources_unavailable: 'error' }[result.status] || 'info';
+    toast(result.message || `${money(result.price)} from ${result.quotesUsed} source${result.quotesUsed === 1 ? '' : 's'}`,
+      tone, tone === 'success' ? 3200 : 6000);
     await loadCollection();
     if (state.openCardId === cardId) renderSheetBody();
   } catch (err) {
@@ -1458,6 +1509,19 @@ async function refreshPrices(button) {
   }
 }
 
+/**
+ * A full refresh takes minutes for a real collection, so it reports which card
+ * it is on. Without this the only evidence anything was happening was prices
+ * eventually changing, which is indistinguishable from nothing happening.
+ */
+function showRefreshProgress(payload) {
+  const note = $('syncNote');
+  if (!note) return;
+  if (!payload) { note.textContent = ''; note.classList.remove('busy'); return; }
+  note.classList.add('busy');
+  note.textContent = `Re-pricing ${payload.done} of ${payload.total} — ${payload.card_name}`;
+}
+
 $('refreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('settingsRefreshBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
 $('unverifiedBannerBtn').addEventListener('click', (e) => refreshPrices(e.currentTarget));
@@ -1518,6 +1582,51 @@ async function loadHealth() {
     host.textContent = `Could not load tracking status: ${err.message}`;
   }
 }
+
+/**
+ * Call every dependency for real and show which one is failing. "Scanning
+ * isn't working" and "this card isn't in the database" produce the same
+ * message in the scanner, and only this can tell them apart.
+ */
+$('diagnoseBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const host = $('diagnoseBody');
+  btn.disabled = true;
+  btn.textContent = 'Testing…';
+  host.innerHTML = '';
+  host.appendChild(el('div', 'field-hint', 'Calling each service…'));
+  try {
+    const d = await api('/api/diagnostics');
+    host.innerHTML = '';
+
+    const verdict = el('div', 'health-row');
+    verdict.append(el('div', 'health-label', 'Overall'));
+    const summary = [
+      `Scanning: ${d.summary.scanning}`,
+      `Pricing: ${d.summary.pricing}`,
+    ].join(' · ');
+    const v = el('div', 'health-value', summary);
+    if (d.summary.scanning !== 'working' || d.summary.pricing !== 'working') v.classList.add('warn');
+    verdict.appendChild(v);
+    host.appendChild(verdict);
+
+    for (const check of d.checks) {
+      const row = el('div', 'health-row');
+      row.append(el('div', 'health-label', `${check.ok ? '✓' : '✕'} ${check.label} · ${check.ms}ms`));
+      const value = el('div', 'health-value', check.detail || (check.ok ? 'OK' : 'Failed'));
+      if (!check.ok) value.classList.add('warn');
+      row.appendChild(value);
+      if (!check.ok && check.hint) row.appendChild(el('div', 'field-hint', check.hint));
+      host.appendChild(row);
+    }
+  } catch (err) {
+    host.innerHTML = '';
+    host.appendChild(el('div', 'health-value warn', `Could not run the test: ${err.message}`));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run the test';
+  }
+});
 
 // ── PRICE HISTORY AUDIT ──────────────────────────────────────────
 
@@ -1638,7 +1747,7 @@ function closeScanner() {
   document.body.style.overflow = '';
   stopCamera();
   setTrayOpen(false);
-  hideHit();
+  analysisHide();
 
   const saved = state.scanned.filter((s) => s.status === 'ok' || s.status === 'dupe');
   if (saved.length) loadCollection();
@@ -1848,7 +1957,10 @@ function cropToGuide() {
 }
 
 // Exposed for the browser test suite; nothing in the app reads it.
-window.__test = { mapGuideToSource };
+window.__test = {
+  mapGuideToSource,
+  analysis: { reset: (id, preview) => analysisReset(id, preview), progress: (ev) => onScanProgress(ev) },
+};
 
 $('shutterBtn').addEventListener('click', capture);
 
@@ -1894,16 +2006,23 @@ $('libraryInput').addEventListener('change', (e) => {
   files.forEach((f) => submitScan(f, URL.createObjectURL(f), f.name));
 });
 
-/** Upload one image and reflect its outcome in the tray and the live result card. */
+/** Upload one image, narrating the server's progress as it arrives. */
 async function submitScan(blob, previewUrl, filename) {
   const id = `s${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
   state.scanned.unshift({ id, status: 'working', preview: previewUrl, name: 'Reading the card…' });
   state.scanQueue++;
   renderTray();
 
+  // The panel shows one scan at a time — the most recent. Burst-scanning still
+  // works; the tray is the record of everything, the panel is the live one.
+  analysisReset(id, previewUrl);
+
   try {
     const form = new FormData();
     form.append('cards', blob, filename);
+    // The server tags its progress events with this, so a phone that fires off
+    // three photos does not see three scans' stages interleaved in one panel.
+    form.append('scanId', id);
     const res = await fetch('/api/portfolio/upload', { method: 'POST', body: form });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
@@ -1914,7 +2033,11 @@ async function submitScan(blob, previewUrl, filename) {
     if (!added.length) {
       const reason = results[0]?.message || 'No card was found in that photo.';
       updateScan(id, { status: 'error', name: 'Not recognised', note: reason });
-      showHit(null, reason);
+      if (analysisScanId === id) {
+        analysisSettle('fail');
+        analysisStep('fail', 'fail', reason);
+        analysisFinish({ tone: 'miss', name: 'Not recognised', meta: reason, tag: 'Try again' });
+      }
       buzz([25, 60, 25]);
       return;
     }
@@ -1930,7 +2053,21 @@ async function submitScan(blob, previewUrl, filename) {
       image: first.image_url || previewUrl,
       needsReview: first.needs_review,
     });
-    showHit(first, null, previewUrl);
+    if (analysisScanId === id) {
+      analysisSettle('done');
+      analysisStep('save', first.needs_review ? 'warn' : 'done',
+        first.needs_review ? 'Saved to Needs review'
+          : first.is_new_copy ? `Added as copy ${first.quantity}` : 'Added to your collection',
+        '', { moveToEnd: true });
+      analysisFinish({
+        tone: first.is_new_copy ? 'dupe' : '',
+        name: first.card_name || 'Unknown card',
+        meta: [first.card_set, first.card_number, first.rarity].filter(Boolean).join(' · ') || '—',
+        price: first.unit_price,
+        tag: first.needs_review ? 'Needs review' : first.is_new_copy ? `Copy ${first.quantity}` : 'Added',
+        dismissAfter: first.needs_review ? 0 : 5000,
+      });
+    }
     buzz(first.is_new_copy ? [20, 40, 20] : 45);
 
     // Extra cards found in the same photo still belong in the tray.
@@ -1946,7 +2083,11 @@ async function submitScan(blob, previewUrl, filename) {
     }
   } catch (err) {
     updateScan(id, { status: 'error', name: 'Scan failed', note: err.message });
-    showHit(null, err.message);
+    if (analysisScanId === id) {
+      analysisSettle('fail');
+      analysisStep('fail', 'fail', err.message);
+      analysisFinish({ tone: 'miss', name: 'Scan failed', meta: err.message, tag: 'Try again' });
+    }
   } finally {
     state.scanQueue--;
     renderTray();
@@ -2003,49 +2144,228 @@ function renderTray() {
 function setTrayOpen(open) {
   $('tray').classList.toggle('open', open);
   scanner.classList.toggle('tray-open', open);
-  if (open) hideHit();
+  if (open) analysisHide();
 }
 
 $('trayBtn').addEventListener('click', () => setTrayOpen(!$('tray').classList.contains('open')));
 $('trayCloseBtn').addEventListener('click', () => setTrayOpen(false));
 
-let hitTimer = null;
+// ── LIVE ANALYSIS PANEL ──────────────────────────────────────────
+//
+// The scan used to be a black box: the shutter fired, the title said
+// "Analysing…", and nothing else happened until a card appeared or didn't.
+// This panel narrates the same work the server is actually doing — what the
+// AI read off the card, whether the printing was confirmed against the card
+// database, which marketplaces are being asked, and what each answered.
+//
+// Every line comes from a `scan_progress` event, so it can only ever claim
+// progress that really happened. Stages are keyed, and a stage that arrives
+// twice updates its own line instead of adding another.
 
-function showHit(card, failureText, fallbackImage) {
-  const hit = $('hit');
-  const img = $('hitImg');
-  clearTimeout(hitTimer);
-  // The tray already lists everything; a result card under it would show through.
-  if ($('tray').classList.contains('open')) return;
+const MARKS = {
+  live: '<span class="spinner"></span>',
+  done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6L9 17l-5-5"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>',
+  fail: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  skip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 12h14"/></svg>',
+};
 
-  if (!card) {
-    hit.className = 'hit miss show';
-    img.hidden = true;
-    img.removeAttribute('src');
-    $('hitName').textContent = 'No card identified';
-    $('hitMeta').textContent = failureText || 'Try again with less glare';
-    $('hitPrice').textContent = '';
-    $('hitTag').textContent = 'Try again';
-  } else {
-    hit.className = `hit show${card.is_new_copy ? ' dupe' : ''}`;
-    const src = card.image_url || card.image_data || fallbackImage || '';
-    img.hidden = !src;
-    if (src) img.src = src;
-    $('hitName').textContent = card.card_name || 'Unknown';
-    $('hitMeta').textContent = [card.card_set, card.card_number].filter(Boolean).join(' · ') || '—';
-    $('hitPrice').textContent = card.unit_price > 0 ? money(card.unit_price) : '—';
-    $('hitTag').textContent = card.needs_review
-      ? 'Needs review'
-      : card.is_new_copy ? `Copy ${card.quantity}` : 'Added';
-  }
+let analysisTimer = null;
+/** The scanId whose events the panel is currently showing. */
+let analysisScanId = null;
 
-  scanner.classList.add('has-hit');
-  hitTimer = setTimeout(hideHit, 4200);
+function analysisReset(scanId, previewUrl) {
+  clearTimeout(analysisTimer);
+  analysisScanId = scanId;
+
+  const panel = $('analysis');
+  panel.className = 'analysis show busy';
+  $('analysisSteps').innerHTML = '';
+  $('analysisFoot').hidden = true;
+  $('analysisName').textContent = 'Reading the card…';
+  $('analysisMeta').textContent = 'Preparing the photo';
+  $('analysisPrice').textContent = '';
+  $('analysisTag').textContent = '';
+
+  const img = $('analysisImg');
+  img.hidden = !previewUrl;
+  if (previewUrl) img.src = previewUrl;
+
+  // You just took a photo; the analysis is what you want to see, not the list
+  // of everything scanned so far sitting on top of it.
+  if ($('tray').classList.contains('open')) setTrayOpen(false);
+
+  scanner.classList.add('analysing');
 }
 
-function hideHit() {
-  $('hit').classList.remove('show');
-  scanner.classList.remove('has-hit');
+/**
+ * Add or update one line. `key` makes a stage idempotent; passing an existing
+ * key promotes that line rather than repeating it.
+ *
+ * `moveToEnd` is for lines that summarise the ones below them: "Checking
+ * marketplace prices" is announced before the sources are known, but the price
+ * it resolves to belongs after them, not above.
+ */
+function analysisStep(key, state_, text, note, { moveToEnd = false } = {}) {
+  const host = $('analysisSteps');
+  let row = host.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (!row) {
+    row = el('div', 'step');
+    row.dataset.key = key;
+    row.append(el('span', 'step-mark'), el('span', 'step-text'), el('span', 'step-note'));
+    host.appendChild(row);
+  } else if (moveToEnd) {
+    host.appendChild(row);
+  }
+  row.className = `step ${state_}`;
+  row.querySelector('.step-mark').innerHTML = MARKS[state_] || '';
+  row.querySelector('.step-text').textContent = text;
+  row.querySelector('.step-note').textContent = note || '';
+  host.scrollTop = host.scrollHeight;
+  return row;
+}
+
+/** Any line still spinning is settled, so nothing is left claiming to be busy. */
+function analysisSettle(state_ = 'done') {
+  $('analysisSteps').querySelectorAll('.step.live').forEach((row) => {
+    row.className = `step ${state_}`;
+    row.querySelector('.step-mark').innerHTML = MARKS[state_] || '';
+  });
+}
+
+function analysisFinish({ tone, name, meta, price, tag, dismissAfter }) {
+  const panel = $('analysis');
+  panel.classList.remove('busy');
+  panel.classList.toggle('miss', tone === 'miss');
+  panel.classList.toggle('dupe', tone === 'dupe');
+
+  if (name !== undefined) $('analysisName').textContent = name;
+  if (meta !== undefined) $('analysisMeta').textContent = meta;
+  $('analysisPrice').textContent = price > 0 ? money(price) : '';
+  $('analysisTag').textContent = tag || '';
+
+  // A failure stays until it is read; a success gets out of the way so the
+  // next card can be photographed.
+  $('analysisFoot').hidden = Boolean(dismissAfter);
+  clearTimeout(analysisTimer);
+  if (dismissAfter) analysisTimer = setTimeout(analysisHide, dismissAfter);
+}
+
+function analysisHide() {
+  clearTimeout(analysisTimer);
+  analysisScanId = null;
+  $('analysis').classList.remove('show', 'busy', 'miss', 'dupe');
+  scanner.classList.remove('analysing');
+}
+
+$('analysisCloseBtn').addEventListener('click', analysisHide);
+
+/** One `scan_progress` event from the server. */
+function onScanProgress(ev) {
+  if (!ev.scanId || ev.scanId !== analysisScanId) return;
+
+  switch (ev.stage) {
+    case 'start':
+      analysisStep('read', 'live', 'Reading the photo');
+      break;
+
+    case 'converting':
+      analysisStep('read', 'live', 'Converting the image');
+      break;
+
+    case 'thumbnail':
+      if (ev.image_data) { $('analysisImg').hidden = false; $('analysisImg').src = ev.image_data; }
+      break;
+
+    case 'identifying':
+      analysisStep('read', 'done', 'Photo read');
+      analysisStep('ai', 'live', 'Identifying the card');
+      break;
+
+    case 'identified': {
+      const c = ev.card || {};
+      const pctText = c.confidence > 0 ? `${Math.round(c.confidence * 100)}% sure` : '';
+      analysisStep('ai', 'done', `Looks like ${c.card_name || 'a card'}`, pctText);
+      $('analysisName').textContent = c.card_name || 'Unknown card';
+      $('analysisMeta').textContent = [c.card_set, c.card_number].filter(Boolean).join(' · ') || 'Set unknown';
+      break;
+    }
+
+    case 'verifying':
+      analysisStep('verify', 'live', 'Confirming the printing in the card database');
+      break;
+
+    case 'candidates':
+      analysisStep('verify', 'live', `Comparing ${ev.count} matching printing${ev.count === 1 ? '' : 's'}`);
+      break;
+
+    case 'verified': {
+      const c = ev.card || {};
+      analysisStep('verify', 'done', `Confirmed: ${c.card_set || 'unknown set'} ${c.card_number || ''}`.trim());
+      $('analysisName').textContent = c.card_name || $('analysisName').textContent;
+      $('analysisMeta').textContent = [c.card_set, c.card_number, c.rarity].filter(Boolean).join(' · ');
+      if (c.image_url) { $('analysisImg').hidden = false; $('analysisImg').src = c.image_url; }
+      break;
+    }
+
+    case 'verify_failed':
+      analysisStep('verify', 'warn', ev.message || 'Could not confirm the printing');
+      break;
+
+    case 'unverified':
+      analysisStep('save', 'warn', ev.message || 'Saved for review');
+      break;
+
+    case 'duplicate':
+      analysisStep('dupe', 'done', ev.message || 'Already in the collection');
+      break;
+
+    case 'pricing':
+      analysisStep('price', 'live', 'Checking marketplace prices');
+      break;
+
+    case 'pricing_skipped':
+      analysisStep('price', 'skip', ev.message || 'Not priced yet');
+      break;
+
+    // One line per source, so it is visible where each number came from and
+    // which sources were unreachable rather than merely quiet.
+    case 'price_source': {
+      const key = `src:${ev.name}`;
+      if (ev.state === 'asking') analysisStep(key, 'live', ev.label || ev.name);
+      else if (ev.state === 'answered') analysisStep(key, 'done', ev.label || ev.name, `${ev.quotes} quote${ev.quotes === 1 ? '' : 's'}`);
+      else if (ev.state === 'empty') analysisStep(key, 'skip', ev.label || ev.name, 'no listing');
+      else if (ev.state === 'skipped') analysisStep(key, 'skip', ev.label || ev.name, ev.reason || 'skipped');
+      else if (ev.state === 'failed') analysisStep(key, 'fail', ev.label || ev.name, ev.reason || 'failed');
+      break;
+    }
+
+    case 'priced':
+      analysisStep('price', 'done',
+        `${money(ev.price)} — median of ${ev.quotesUsed} of ${ev.quotesSeen} quotes`,
+        ev.confidence > 0 ? `${Math.round(ev.confidence * 100)}% conf` : '',
+        { moveToEnd: true });
+      $('analysisPrice').textContent = money(ev.price);
+      break;
+
+    case 'unpriced':
+      analysisStep('price', 'warn', ev.message || 'No price found', '', { moveToEnd: true });
+      break;
+
+    // Reported as soon as the server knows, without waiting for the upload
+    // response — a panel still saying "Reading the card…" after the read has
+    // already failed is the exact thing this replaced.
+    case 'photo_failed':
+      analysisSettle('fail');
+      analysisStep('fail', 'fail', ev.message || 'Could not read that photo');
+      analysisFinish({
+        tone: 'miss',
+        name: ev.reason === 'no_card' ? 'No card in the frame' : 'Could not read that card',
+        meta: ev.message || '',
+        tag: ev.retryable === false ? 'Needs setup' : 'Try again',
+      });
+      break;
+  }
 }
 
 // ── LIVE UPDATES ─────────────────────────────────────────────────
@@ -2057,7 +2377,10 @@ function connectEvents() {
       let payload;
       try { payload = JSON.parse(e.data); } catch { return; }
       if (payload.type === 'portfolio_updated' || payload.type === 'card_added') loadCollection();
-      if (payload.activityType === 'refresh_complete') toast(payload.message, 'success');
+      if (payload.type === 'scan_progress') onScanProgress(payload);
+      if (payload.type === 'refresh_progress') showRefreshProgress(payload);
+      if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
+      if (payload.activityType === 'error') toast(payload.message, 'error', 7000);
     };
     source.onerror = () => {
       source.close();

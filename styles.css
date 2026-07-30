@@ -188,7 +188,7 @@ a { color: inherit; text-decoration: none; }
 /* Digits line up wherever they sit in a column. */
 .hero-value, .stat-value, .card-price, .row-num, .row-qty, .row-delta,
 .figure-value, .copy-val, .source-price, .rail-total-value, .set-value,
-.hero-change, .card-delta, .tray-item-price, .hit-price, .set-count { font-variant-numeric: tabular-nums; }
+.hero-change, .card-delta, .tray-item-price, .set-count { font-variant-numeric: tabular-nums; }
 
 /* ── SURFACES ────────────────────────────────────────────────── */
 
@@ -205,8 +205,9 @@ a { color: inherit; text-decoration: none; }
 @media (hover: hover) { .glass-tap:hover { background: var(--surface-2); border-color: var(--border-strong); } }
 .glass-tap:active { background: var(--surface-3); }
 
-/* Blur is reserved for chrome that floats above content. */
-.topbar, .sheet, .modal, .tray, .hit {
+/* Blur is reserved for chrome that floats above content. The tab bar and the
+   analysis panel set their own, heavier, material. */
+.topbar, .sheet, .modal, .tray {
   backdrop-filter: blur(var(--blur)) saturate(180%);
   -webkit-backdrop-filter: blur(var(--blur)) saturate(180%);
 }
@@ -403,6 +404,10 @@ a { color: inherit; text-decoration: none; }
 
 .toolbar-spacer { flex: 1; }
 .sync-note { font-size: 12px; color: var(--text-3); }
+.sync-note.busy {
+  color: var(--accent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34ch;
+}
 
 /* ── THE BINDER ──────────────────────────────────────────────
    Slots, not floating panels: tight gutters, art edge to edge, the card's
@@ -506,7 +511,22 @@ a { color: inherit; text-decoration: none; }
 
 .sets { display: flex; flex-direction: column; gap: 8px; }
 
-.set { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: var(--r-md); width: 100%; text-align: left; }
+/* A set is a container you open, not a link that takes you elsewhere: the
+   header stays put, its cards appear beneath it, and its neighbours stay on
+   screen so you keep your bearings. */
+.set-group { border-radius: var(--r-md); overflow: hidden; }
+.set-group.open { box-shadow: var(--shadow-md); }
+
+.set { display: flex; align-items: center; gap: 14px; padding: 12px 14px; width: 100%; text-align: left; }
+.set-caret {
+  flex-shrink: 0;
+  color: var(--text-3);
+  display: grid; place-items: center;
+  transition: transform 240ms cubic-bezier(0.32, 0.08, 0.24, 1), color 180ms ease;
+}
+.set-group.open .set-caret { transform: rotate(90deg); color: var(--accent); }
+.set-group.open > .set { border-bottom: 1px solid var(--border); }
+.set-cards { padding: 11px; }
 .set-stack { display: flex; flex-shrink: 0; }
 .set-stack .chip {
   width: 30px; aspect-ratio: 63/88;
@@ -677,7 +697,7 @@ a { color: inherit; text-decoration: none; }
   white-space: nowrap;
   transition: opacity var(--t-med);
 }
-.scanner.has-hit .guide-hint, .scanner.tray-open .guide-hint { opacity: 0; }
+.scanner.analysing .guide-hint, .scanner.tray-open .guide-hint { opacity: 0; }
 
 .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; z-index: 5; }
 .flash.fire { animation: flash 300ms ease-out; }
@@ -692,26 +712,94 @@ a { color: inherit; text-decoration: none; }
 .scanner-msg .btn-glass { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.16); color: #fff; }
 .scanner-msg .btn-quiet { color: rgba(255, 255, 255, 0.6); }
 
-.hit {
-  position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 7;
-  display: flex; align-items: center; gap: 11px;
-  padding: 9px 11px;
-  border-radius: var(--r-md);
-  background: rgba(24, 28, 36, 0.75);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+/* ── LIVE ANALYSIS ─────────────────────────────────────────────
+   A glass panel over the bottom of the viewfinder that narrates the scan.
+   It grows as stages arrive rather than being sized up front, so it never
+   reserves empty space for work that has not happened yet.               */
+.analysis {
+  position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 7;
+  border-radius: var(--r-lg);
+  background: rgba(18, 22, 29, 0.72);
+  backdrop-filter: blur(24px) saturate(170%);
+  -webkit-backdrop-filter: blur(24px) saturate(170%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 16px 40px -12px rgba(0, 0, 0, 0.7);
   color: #fff;
-  transform: translateY(130%); opacity: 0;
+  overflow: hidden;
+  transform: translateY(125%); opacity: 0;
   transition: transform var(--t-slow), opacity var(--t-med);
 }
-.hit.show { transform: none; opacity: 1; }
-.hit img { width: 34px; aspect-ratio: 63/88; object-fit: cover; border-radius: 4px; flex-shrink: 0; }
-.hit-body { flex: 1; min-width: 0; }
-.hit-name { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hit-meta { font-family: var(--font-mono); font-size: 11px; color: rgba(255, 255, 255, 0.55); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hit-price { font-family: var(--font-display); font-size: 15px; font-weight: 650; text-align: right; letter-spacing: -0.02em; }
-.hit-tag { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; color: var(--water); text-align: right; margin-top: 1px; }
-.hit.dupe .hit-tag { color: var(--gold); }
-.hit.miss .hit-tag { color: var(--ember); }
+.analysis.show { transform: none; opacity: 1; }
+
+.analysis-head { display: flex; align-items: center; gap: 11px; padding: 11px 12px; }
+
+.analysis-shot {
+  position: relative; flex-shrink: 0;
+  width: 38px; aspect-ratio: 63/88;
+  border-radius: 4px; overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+.analysis-shot img { width: 100%; height: 100%; object-fit: cover; }
+
+/* A sweep across the captured frame, for exactly as long as work is really
+   in flight. It stops the moment the last stage lands, so it is a report on
+   the scan rather than decoration. */
+.analysis-sweep { position: absolute; inset: 0; opacity: 0; }
+.analysis.busy .analysis-sweep {
+  opacity: 1;
+  background: linear-gradient(to bottom, transparent, rgba(120, 180, 255, 0.75), transparent);
+  animation: sweep 1.5s ease-in-out infinite;
+}
+@keyframes sweep {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .analysis.busy .analysis-sweep { animation: none; opacity: 0.35; }
+}
+
+.analysis-id { flex: 1; min-width: 0; }
+.analysis-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.analysis-meta { font-family: var(--font-mono); font-size: 11px; color: rgba(255, 255, 255, 0.55); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
+.analysis-figures { text-align: right; flex-shrink: 0; }
+.analysis-price { font-family: var(--font-display); font-size: 16px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.analysis-tag { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; color: var(--water); margin-top: 1px; }
+.analysis.dupe .analysis-tag { color: var(--gold); }
+.analysis.miss .analysis-tag { color: var(--ember); }
+
+.analysis-steps {
+  max-height: 40vh; overflow-y: auto;
+  padding: 0 12px 4px;
+  display: flex; flex-direction: column;
+}
+.analysis-steps:empty { display: none; }
+
+.step {
+  display: grid; grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: start; gap: 9px;
+  padding: 5px 0;
+  font-size: 12.5px; line-height: 1.4;
+  color: rgba(255, 255, 255, 0.62);
+}
+.step-mark { display: grid; place-items: center; height: 17px; }
+.step-mark svg { width: 13px; height: 13px; }
+.step-text { min-width: 0; overflow-wrap: anywhere; }
+.step-note { font-family: var(--font-mono); font-size: 10.5px; color: rgba(255, 255, 255, 0.4); white-space: nowrap; }
+.step.live { color: rgba(255, 255, 255, 0.95); }
+.step.done { color: rgba(255, 255, 255, 0.62); }
+.step.done .step-mark { color: var(--up); }
+.step.warn { color: rgba(255, 255, 255, 0.8); }
+.step.warn .step-mark { color: var(--gold); }
+.step.fail .step-mark { color: var(--ember); }
+.step.skip { color: rgba(255, 255, 255, 0.34); }
+
+/* The spinner inherits currentColor, so a live step reads as the bright one. */
+.step .spinner { width: 12px; height: 12px; border-width: 1.5px; }
+
+.analysis-foot { display: flex; justify-content: flex-end; padding: 2px 8px 7px; }
+.analysis-foot .btn { color: rgba(255, 255, 255, 0.6); }
 
 .scanner-bar { position: relative; z-index: 4; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 26px calc(18px + var(--safe-b)); background: #000; }
 
@@ -877,6 +965,9 @@ a { color: inherit; text-decoration: none; }
   .toolbar::-webkit-scrollbar { display: none; }
   .toolbar > * { flex-shrink: 0; }
   .toolbar-spacer, .sync-note { display: none; }
+  /* A refresh in flight is worth the space, and it leads so you see it without
+     having to scroll the toolbar sideways to find it. */
+  .sync-note.busy { display: block; order: -1; max-width: 26ch; }
 
   .grid { grid-template-columns: repeat(3, 1fr); gap: 7px; }
   .card-body { padding: 7px 7px 9px; }
@@ -910,47 +1001,114 @@ a { color: inherit; text-decoration: none; }
   body::after {
     content: '';
     position: fixed; left: 0; right: 0; bottom: 0;
-    height: calc(74px + var(--safe-b));
-    background: linear-gradient(to top, var(--bg) 40%, transparent);
+    height: calc(96px + var(--safe-b));
+    background: linear-gradient(to top, var(--bg) 34%, transparent);
     pointer-events: none;
     z-index: 55;
   }
 
-  /* Five equal columns: two destinations, the lens, two destinations. Every
-     cell is the same width, so nothing shifts as the selection moves. */
+  /* ── LIQUID GLASS TAB BAR ──────────────────────────────────
+     One capsule of glass, floating clear of the content. The material is
+     what makes it read as glass rather than as a transparent panel: a
+     large blur so the page behind becomes colour instead of detail, a
+     saturation lift so that colour stays alive, a bright rim along the top
+     edge where light would catch, and a shadow that separates it from the
+     page. The tint is deliberately substantial — a bar you can read
+     content through is a bar that competes with the content.            */
   .tabbar {
     position: fixed; z-index: 60;
-    left: 0; right: 0; bottom: 0;
+    left: 10px; right: 10px;
+    bottom: calc(7px + var(--safe-b));
+    height: 60px;
     display: grid;
     grid-template-columns: repeat(5, 1fr);
-    align-items: end;
-    padding: 6px 4px calc(6px + var(--safe-b));
-    background: var(--bar);
-    border-top: 1px solid var(--border);
+    border-radius: 24px;
+    isolation: isolate;
+
+    background:
+      linear-gradient(to bottom,
+        color-mix(in srgb, var(--bar) 88%, transparent),
+        color-mix(in srgb, var(--bar) 78%, transparent));
+    backdrop-filter: blur(30px) saturate(180%);
+    -webkit-backdrop-filter: blur(30px) saturate(180%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.55),
+      inset 0 0 0 1px var(--border),
+      0 1px 2px rgba(11, 15, 20, 0.06),
+      0 10px 30px -8px rgba(11, 15, 20, 0.18);
   }
+  /* Over a dark material the specular rim has to come right down, or the top
+     edge reads as a white line rather than as light catching glass. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme='light']) .tabbar {
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.1),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+        0 12px 34px -8px rgba(0, 0, 0, 0.7);
+    }
+  }
+  :root[data-theme='dark'] .tabbar {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.1),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+      0 12px 34px -8px rgba(0, 0, 0, 0.7);
+  }
+
+  /* The selection: a pane of brighter glass that slides between cells.
+     It is one element travelling across a five-column grid, so it lands
+     on exact column boundaries and no cell is ever resized to make room
+     for it — the old bar changed each tab's own footprint, which is why
+     the gaps appeared to breathe as you moved along. */
+  .tab-pill {
+    position: absolute;
+    top: 5px; bottom: 5px;
+    left: 0; width: 20%;
+    transform: translateX(calc(var(--active, 0) * 100%));
+    transition: transform 420ms cubic-bezier(0.32, 0.08, 0.24, 1);
+    pointer-events: none;
+    z-index: -1;
+  }
+  .tab-pill::before {
+    content: '';
+    position: absolute; inset: 0 6px;
+    border-radius: 18px;
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+  @media (prefers-reduced-motion: reduce) { .tab-pill { transition: none; } }
 
   .tab {
     display: flex; flex-direction: column;
-    align-items: center; justify-content: flex-end;
-    gap: 4px;
-    padding: 6px 2px 2px;
-    font-size: 10px; font-weight: 550;
+    align-items: center; justify-content: center;
+    gap: 3px;
+    font-size: 10px; font-weight: 560;
+    letter-spacing: 0.005em;
     color: var(--text-3);
-    min-height: 46px;
     position: relative;
-    transition: color var(--t-fast);
+    -webkit-tap-highlight-color: transparent;
+    transition: color 180ms ease;
   }
-  /* The active state fills the icon rather than resizing or boxing it, so a
-     tab occupies exactly the same space selected or not. */
-  .tab svg { width: 22px; height: 22px; fill: transparent; transition: fill var(--t-fast), color var(--t-fast); }
-  .tab span { line-height: 1; }
+  /* Nothing in the active state changes a tab's size — only colour, and the
+     icon filling in. That is the whole reason the spacing now holds still. */
+  .tab svg {
+    width: 23px; height: 23px;
+    fill: transparent;
+    transition: fill 220ms ease, transform 220ms cubic-bezier(0.32, 0.08, 0.24, 1);
+  }
+  .tab-label { line-height: 1; }
   .tab.active { color: var(--accent); }
-  .tab.active svg { fill: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .tab.active svg { fill: color-mix(in srgb, var(--accent) 17%, transparent); }
+  .tab:active svg { transform: scale(0.9); }
+
+  /* Scan is an action sitting among destinations, so it is tinted from the
+     start rather than only when selected. It never takes the pill. */
+  .tab-scan { color: var(--accent); }
+  .tab-scan svg { fill: color-mix(in srgb, var(--accent) 12%, transparent); }
 
   .tab-badge {
     position: absolute;
-    top: 3px; left: 50%;
-    margin-left: 8px;
+    top: 8px; left: 50%;
+    margin-left: 7px;
     min-width: 15px; height: 15px;
     padding: 0 4px;
     border-radius: var(--r-full);
@@ -961,26 +1119,7 @@ a { color: inherit; text-decoration: none; }
     display: grid; place-items: center;
   }
 
-  /* The lens: round, raised, and the only colour in the bar — an action can
-     never be mistaken for a destination. */
-  .lens {
-    justify-self: center;
-    width: 54px; height: 54px;
-    margin-bottom: 4px;
-    border-radius: 50%;
-    display: grid; place-items: center;
-    background: var(--accent);
-    color: #fff;
-    box-shadow: var(--shadow-lens);
-    border: 3px solid var(--bar);
-    transform: translateY(-16px);
-    transition: transform var(--t-fast), background var(--t-fast);
-  }
-  .lens svg { width: 24px; height: 24px; }
-  .lens:active { transform: translateY(-16px) scale(0.93); }
-  @media (hover: hover) { .lens:hover { background: var(--accent-hover); } }
-
-  .toasts { bottom: calc(76px + var(--safe-b)); }
+  .toasts { bottom: calc(84px + var(--safe-b)); }
 }
 
 @media (max-width: 400px) {

@@ -126,50 +126,102 @@ if (!BASE || !chromium) {
     /**
      * The tab bar previously appeared to change spacing as the selection moved,
      * because the active state altered each tab's footprint. These pin the fix:
-     * tabs are evenly distributed and identically sized in every state.
+     * five identical cells, and the selection is a separate element that slides
+     * between them without touching their geometry.
      */
-    test('tab bar: tabs stay evenly spaced whichever one is selected', async () => {
+    test('tab bar: cells stay put whichever one is selected', async () => {
         const phone = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true });
         const p = await phone.newPage();
         await p.goto(BASE, { waitUntil: 'networkidle' });
         await p.waitForSelector('.tabbar');
 
         const measure = () => p.$$eval('.tabbar .tab', (tabs) =>
-            tabs.map((t) => { const r = t.getBoundingClientRect(); return { w: Math.round(r.width), cx: Math.round(r.left + r.width / 2) }; }));
+            tabs.map((t) => {
+                const r = t.getBoundingClientRect();
+                return { w: r.width, h: r.height, cx: r.left + r.width / 2, top: r.top };
+            }));
 
         const before = await measure();
-        assert.equal(before.length, 4, 'four destinations');
+        assert.equal(before.length, 5, 'four destinations plus the scan action');
 
-        const widths = new Set(before.map((t) => t.w));
-        assert.equal(widths.size, 1, `all tabs equal width, got ${[...widths]}`);
+        // A fractional bar width cannot divide into five whole pixels, so the
+        // invariant is that no cell differs from another by a visible amount.
+        const spread = (values) => Math.max(...values) - Math.min(...values);
+        assert.ok(spread(before.map((t) => t.w)) < 1.5, `all cells the same width, spread ${spread(before.map(t => t.w))}`);
+        assert.ok(spread(before.map((t) => t.h)) < 0.5, `all cells the same height, spread ${spread(before.map(t => t.h))}`);
+
+        // Evenly distributed: the gap between consecutive centres is constant.
+        const gaps = before.slice(1).map((t, i) => t.cx - before[i].cx);
+        assert.ok(spread(gaps) < 1.5, `cells evenly spaced, gaps ${gaps.map(g => g.toFixed(2))}`);
 
         await p.click('.tab[data-view="review"]');
-        await p.waitForTimeout(300);
-        const after = await measure();
-
-        assert.deepEqual(after, before, 'selecting a tab must not move or resize any tab');
+        await p.waitForTimeout(500);
+        assert.deepEqual(await measure(), before, 'selecting a tab must not move or resize any cell');
         await phone.close();
     });
 
-    test('tab bar: the scan action is centred and is not a destination', async () => {
+    test('tab bar: nothing floats out of the bar, and Scan is not a destination', async () => {
         const phone = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true });
         const p = await phone.newPage();
         await p.goto(BASE, { waitUntil: 'networkidle' });
         await p.waitForSelector('.tabbar');
 
-        const lens = await p.$eval('.lens', (n) => {
+        const bar = await p.$eval('.tabbar', (n) => {
             const r = n.getBoundingClientRect();
-            return { cx: r.left + r.width / 2, hasViewAttr: n.hasAttribute('data-view'), label: n.getAttribute('aria-label') };
+            return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width };
         });
-        const barWidth = await p.$eval('.tabbar', (n) => n.getBoundingClientRect().width);
 
-        assert.ok(Math.abs(lens.cx - barWidth / 2) < 2, `lens should be centred, off by ${Math.abs(lens.cx - barWidth / 2)}px`);
-        assert.equal(lens.hasViewAttr, false, 'the action must not be wired as a navigation destination');
-        assert.ok(lens.label, 'the icon-only action needs an accessible name');
+        // Every cell is contained by the bar. A raised circular button — the
+        // thing that was explicitly not wanted — would break this.
+        const cells = await p.$$eval('.tabbar .tab', (ns) => ns.map((n) => {
+            const r = n.getBoundingClientRect();
+            return { label: n.textContent.trim(), top: r.top, bottom: r.bottom, left: r.left, right: r.right, cx: r.left + r.width / 2 };
+        }));
+        for (const c of cells) {
+            assert.ok(c.top >= bar.top - 0.5 && c.bottom <= bar.bottom + 0.5, `${c.label} escapes the bar vertically`);
+            assert.ok(c.left >= bar.left - 0.5 && c.right <= bar.right + 0.5, `${c.label} escapes the bar horizontally`);
+        }
 
-        // Two destinations either side of it.
-        const order = await p.$$eval('.tabbar > *', (ns) => ns.map((n) => (n.classList.contains('lens') ? 'lens' : 'tab')));
-        assert.deepEqual(order, ['tab', 'tab', 'lens', 'tab', 'tab']);
+        // The bar itself floats clear of the screen edges — the Liquid Glass
+        // capsule, not an edge-to-edge slab.
+        assert.ok(bar.left > 0 && bar.right < 393, 'the bar is inset from the screen edges');
+
+        const scan = await p.$eval('.tab-scan', (n) => ({
+            cx: n.getBoundingClientRect().left + n.getBoundingClientRect().width / 2,
+            hasViewAttr: n.hasAttribute('data-view'),
+            label: n.getAttribute('aria-label'),
+        }));
+        assert.ok(Math.abs(scan.cx - (bar.left + bar.width / 2)) < 2, 'Scan sits in the middle cell');
+        assert.equal(scan.hasViewAttr, false, 'the action must not be wired as a navigation destination');
+        assert.ok(scan.label, 'the action needs an accessible name');
+
+        // Tapping it opens the scanner rather than switching view.
+        await p.click('.tab-scan');
+        await p.waitForTimeout(250);
+        assert.ok(await p.$eval('#scanner', (n) => n.classList.contains('open')), 'Scan opens the scanner');
+        assert.equal(await p.$eval('.tab-scan', (n) => n.classList.contains('active')), false,
+            'an action never takes the selected state');
+        await phone.close();
+    });
+
+    test('tab bar: the selection indicator lands on the selected cell', async () => {
+        const phone = await browser.newContext({ viewport: { width: 393, height: 852 }, isMobile: true, hasTouch: true });
+        const p = await phone.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.tab-pill');
+
+        const centres = async () => ({
+            pill: await p.$eval('.tab-pill', (n) => { const r = n.getBoundingClientRect(); return r.left + r.width / 2; }),
+            tab: await p.$eval('.tab.active', (n) => { const r = n.getBoundingClientRect(); return r.left + r.width / 2; }),
+        });
+
+        let c = await centres();
+        assert.ok(Math.abs(c.pill - c.tab) < 2, `indicator starts on the active tab (off by ${Math.abs(c.pill - c.tab)})`);
+
+        await p.click('.tab[data-view="settings"]');
+        await p.waitForTimeout(600);
+        c = await centres();
+        assert.ok(Math.abs(c.pill - c.tab) < 2, `indicator follows the selection (off by ${Math.abs(c.pill - c.tab)})`);
         await phone.close();
     });
 
@@ -260,6 +312,125 @@ if (!BASE || !chromium) {
         // Sorted by value, most valuable first.
         const numbers = sets.map((s) => Number(s.value.replace(/[^0-9.]/g, '')));
         assert.deepEqual(numbers, [...numbers].sort((a, b) => b - a));
+        await p.close();
+    });
+
+    /**
+     * Tapping a set used to apply a search and jump to the Collection view,
+     * which threw you to the top of a different page with a filter you had not
+     * asked for. A set is a container: it opens where it stands.
+     */
+    test('tapping a set expands it in place and stays on the sets view', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.hero-value');
+        await p.click('.nav-item[data-view="sets"]');
+        await p.waitForSelector('.set');
+
+        const before = await p.$eval('.set-group', (n) => {
+            const r = n.getBoundingClientRect();
+            return { top: Math.round(r.top), name: n.querySelector('.set-name').textContent };
+        });
+        assert.ok(await p.$eval('.set-group .set-cards', (n) => n.hidden), 'sets start closed');
+
+        await p.click('.set');
+        await p.waitForTimeout(350);
+
+        assert.ok(await p.$eval('#view-sets', (n) => n.classList.contains('active')), 'still on the sets view');
+        assert.equal(await p.$eval('#searchInput', (n) => n.value), '', 'no search was applied on your behalf');
+        assert.ok(await p.$eval('.set-group .set-cards', (n) => !n.hidden), 'the set opened');
+        assert.ok(await p.$eval('.set-group .set-cards .card, .set-group .set-cards .row', (n) => !!n),
+            'the set shows its cards');
+
+        const after = await p.$eval('.set-group', (n) => Math.round(n.getBoundingClientRect().top));
+        assert.equal(after, before.top, 'the header you tapped did not move');
+        assert.equal(await p.$eval('.set', (n) => n.getAttribute('aria-expanded')), 'true');
+
+        // And it closes again.
+        await p.click('.set');
+        await p.waitForTimeout(250);
+        assert.ok(await p.$eval('.set-group .set-cards', (n) => n.hidden), 'tapping again closes it');
+        await p.close();
+    });
+
+    /**
+     * The scan panel must only ever report work the server said it did. This
+     * feeds it synthetic progress events and checks each one becomes a line.
+     */
+    test('the analysis panel narrates the stages it is told about', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForFunction(() => window.__test && window.__test.analysis);
+
+        const lines = await p.evaluate(() => {
+            const t = window.__test.analysis;
+            t.reset('probe', '');
+            const send = (stage, extra = {}) => t.progress({ type: 'scan_progress', scanId: 'probe', stage, ...extra });
+            send('start', { photos: 1 });
+            send('identifying');
+            send('identified', { card: { card_name: 'Charizard', card_set: 'Base', card_number: '4/102', confidence: 0.94 } });
+            send('verifying');
+            send('verified', { card: { card_name: 'Charizard', card_set: 'Base', card_number: '4', rarity: 'Rare Holo' } });
+            send('pricing');
+            send('price_source', { name: 'pokemontcg', label: 'Pokémon TCG API', state: 'answered', quotes: 3 });
+            send('price_source', { name: 'justtcg', label: 'JustTCG', state: 'skipped', reason: 'no API key' });
+            send('price_source', { name: 'tcgdex', label: 'TCGdex', state: 'failed', reason: 'Rate limited' });
+            send('priced', { price: 412.5, quotesUsed: 3, quotesSeen: 4, confidence: 0.9 });
+            return {
+                steps: [...document.querySelectorAll('#analysisSteps .step')]
+                    .map((n) => ({ state: n.className.replace('step ', ''), text: n.querySelector('.step-text').textContent })),
+                name: document.getElementById('analysisName').textContent,
+                price: document.getElementById('analysisPrice').textContent,
+                shown: document.getElementById('analysis').classList.contains('show'),
+            };
+        });
+
+        assert.ok(lines.shown, 'the panel is visible while a scan runs');
+        assert.equal(lines.name, 'Charizard');
+        assert.match(lines.price, /412/);
+
+        const text = lines.steps.map((s) => s.text).join(' | ');
+        assert.match(text, /Charizard/, 'reports what the AI read');
+        assert.match(text, /Confirmed/, 'reports the database confirmation');
+        assert.match(text, /Pokémon TCG API/, 'names each source it asked');
+        assert.match(text, /JustTCG/);
+        assert.match(text, /TCGdex/);
+
+        // A failed source is marked as failed, not merely quiet — that
+        // distinction is the whole point of listing them.
+        const failed = lines.steps.find((s) => s.text.includes('TCGdex'));
+        assert.equal(failed.state, 'fail');
+        const skipped = lines.steps.find((s) => s.text.includes('JustTCG'));
+        assert.equal(skipped.state, 'skip');
+
+        // The price it settled on reads after the sources it came from, not
+        // above them — a conclusion belongs below its evidence.
+        const priceRow = lines.steps.findIndex((s) => s.text.includes('median of'));
+        const lastSource = Math.max(...['Pokémon TCG API', 'JustTCG', 'TCGdex']
+            .map((n) => lines.steps.findIndex((s) => s.text.includes(n))));
+        assert.ok(priceRow > lastSource, 'the resolved price is listed after the sources');
+
+        // Nothing is left spinning once the last stage has landed.
+        assert.equal(lines.steps.filter((s) => s.state === 'live').length, 0);
+        await p.close();
+    });
+
+    test('the analysis panel ignores progress from a different scan', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForFunction(() => window.__test && window.__test.analysis);
+
+        const count = await p.evaluate(() => {
+            const t = window.__test.analysis;
+            t.reset('mine', '');
+            t.progress({ type: 'scan_progress', scanId: 'theirs', stage: 'identified', card: { card_name: 'Mewtwo' } });
+            return {
+                steps: document.querySelectorAll('#analysisSteps .step').length,
+                name: document.getElementById('analysisName').textContent,
+            };
+        });
+        assert.equal(count.steps, 0, 'another phone\'s scan must not write into this panel');
+        assert.ok(!count.name.includes('Mewtwo'));
         await p.close();
     });
 }

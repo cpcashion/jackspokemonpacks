@@ -44,6 +44,7 @@ import {
     aggregateQuotes,
     priceContextFor,
     fxStatus,
+    getUsdPerEur,
 } from './lib/pricing.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -725,7 +726,12 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber) {
     }
 }
 
-async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
+/**
+ * @param {boolean} [strict] rethrow transport failures instead of returning
+ *   null. A pricing lookup has to be able to tell "TCGdex has no listing for
+ *   this card" from "TCGdex never answered"; an image lookup does not care.
+ */
+async function fetchTCGdexCard(cardName, cardSet, cardNumber, strict = false) {
     if (!cardName) return null;
     try {
         const searchName = encodeURIComponent(cardName.trim());
@@ -733,6 +739,7 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
             timeout: 10000,
             headers: { 'Accept': 'application/json' }
         });
+        noteSource('tcgdex', { ok: true, status: resp.status, message: 'OK' });
         const results = Array.isArray(resp.data) ? resp.data : [];
         if (!results.length) return null;
 
@@ -779,7 +786,10 @@ async function fetchTCGdexCard(cardName, cardSet, cardNumber) {
         const firstDetail = await loadDetail(results[0]);
         return firstDetail;
     } catch (err) {
-        console.error(`  [TCGdex] Error looking up market card "${cardName}":`, err.message);
+        const failure = describeAxiosError(err);
+        noteSource('tcgdex', failure);
+        console.error(`  [TCGdex] Error looking up market card "${cardName}": ${failure.message}`);
+        if (strict) throw err;
         return null;
     }
 }
@@ -957,50 +967,186 @@ function hasDistinctVariantEvidence(card) {
     return Boolean(normalizeCardNumber(card?.card_number)) || Boolean(normalizeText(card?.card_set));
 }
 
+/**
+ * Health of each external source, so a failure can be reported as what it
+ * actually is. Without this, a rate limit, an outage and "this card genuinely
+ * isn't in the database" all surfaced identically as "no card detected".
+ */
+const sourceHealth = new Map();
+
+function noteSource(name, outcome) {
+    sourceHealth.set(name, { ...outcome, at: new Date().toISOString() });
+}
+
+function describeAxiosError(err) {
+    const status = err?.response?.status;
+    if (status === 429) return { ok: false, status, kind: 'rate_limited', message: 'Rate limited' };
+    if (status === 401 || status === 403) return { ok: false, status, kind: 'auth', message: 'Rejected — check the API key' };
+    if (status) return { ok: false, status, kind: 'http', message: `HTTP ${status}` };
+    if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) return { ok: false, kind: 'timeout', message: 'Timed out' };
+    return { ok: false, kind: 'network', message: err?.message || 'Unreachable' };
+}
+
+/**
+ * A collector that cannot reach its source must say so rather than return an
+ * empty list. Silently treating an outage as "this card has no listings" is
+ * what made "Re-price" report `not_found` while every source was blocked —
+ * indistinguishable, to the person holding the card, from doing nothing.
+ */
+class SourceUnavailable extends Error {
+    constructor(failure) {
+        super(failure.message);
+        this.failure = failure;
+    }
+}
+
+export function sourceHealthSnapshot() {
+    return Object.fromEntries(sourceHealth);
+}
+
+/**
+ * How long to stop calling a source that has just told us to back off.
+ *
+ * The keyless tier of the Pokémon TCG API rate limits hard, and once it starts
+ * returning 429 every further request extends the penalty. Verifying a scanned
+ * card and then pricing it both consult that API, so without this a rate limit
+ * hit twice per card and stayed hit — which is what made card analysis appear
+ * to be simply broken.
+ */
+const COOLDOWN_MS = { rate_limited: 60 * 1000, auth: 5 * 60 * 1000 };
+
+/** How much longer this source is being left alone, in ms. 0 if it is fine. */
+function sourceCooldownRemaining(name) {
+    const health = sourceHealth.get(name);
+    if (!health || health.ok) return 0;
+    const window = COOLDOWN_MS[health.kind];
+    if (!window) return 0;
+    return Math.max(0, window - (Date.now() - new Date(health.at).getTime()));
+}
+
+/**
+ * Candidate lookups are memoised briefly. Identifying a scanned card and then
+ * pricing it both need the same candidates, and without this they each ran the
+ * query set again — doubling the API calls for no new information.
+ */
+const candidateCache = new Map();
+const CANDIDATE_TTL_MS = 10 * 60 * 1000;
+
+/** Why the most recent candidate lookup for a card came back empty, if it did. */
+const lastCandidateErrors = new Map();
+
 async function fetchPokemonTcgCandidates(card) {
     if (!hasMeaningfulCardName(card.card_name)) return [];
+
+    const cacheKey = buildVariantKey(card);
+    const cached = candidateCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < CANDIDATE_TTL_MS) return cached.candidates;
+
+    // Asking again inside the cooldown cannot succeed and only deepens the
+    // penalty, so record why we did not ask and return.
+    const cooling = sourceCooldownRemaining('pokemontcg');
+    if (cooling > 0) {
+        const health = sourceHealth.get('pokemontcg');
+        lastCandidateErrors.set(cacheKey, {
+            ...health,
+            message: `${health.message} — waiting ${Math.ceil(cooling / 1000)}s before asking again`,
+        });
+        return [];
+    }
 
     const headers = { 'Accept': 'application/json' };
     if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
 
-    const queries = [];
     const safeName = String(card.card_name || '').replace(/"/g, '\\"').trim();
     const safeSet = String(card.card_set || '').replace(/"/g, '\\"').trim();
     const normalizedNumber = normalizeCardNumber(card.card_number);
 
+    // Most specific first. The loop below stops at the first query that answers,
+    // rather than always running all four — the keyless tier of this API is
+    // rate limited, and four queries per card multiplied across a collection is
+    // what exhausted it and made every lookup fail.
+    const queries = [];
     if (safeName && safeSet && normalizedNumber) queries.push(`name:"${safeName}" set.name:"${safeSet}" number:"${normalizedNumber}"`);
-    if (safeName && safeSet) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
     if (safeName && normalizedNumber) queries.push(`name:"${safeName}" number:"${normalizedNumber}"`);
+    if (safeName && safeSet) queries.push(`name:"${safeName}" set.name:"${safeSet}"`);
     if (safeName) queries.push(`name:"${safeName}"`);
 
     const unique = new Map();
+    let lastError = null;
 
     for (const q of queries) {
         try {
             const resp = await axios.get('https://api.pokemontcg.io/v2/cards', {
                 params: { q, pageSize: 15 },
                 headers,
-                timeout: 12000
+                timeout: 12000,
             });
             const results = resp.data?.data || [];
             for (const result of results) {
                 if (result?.id && !unique.has(result.id)) unique.set(result.id, result);
             }
-            if (unique.size >= 15) break;
+            noteSource('pokemontcg', { ok: true, status: resp.status, message: 'OK' });
+            // A query that returned anything has told us what we needed.
+            if (unique.size) break;
         } catch (err) {
-            console.error(`  [Verify] Pokemon TCG lookup failed for "${card.card_name}" with query "${q}":`, err.message);
+            lastError = describeAxiosError(err);
+            noteSource('pokemontcg', lastError);
+            console.error(`  [PokemonTCG] "${card.card_name}" (${q}): ${lastError.message}`);
+            // No point trying three more variations of a rate-limited request.
+            if (lastError.kind === 'rate_limited' || lastError.kind === 'auth') break;
         }
     }
 
-    return Array.from(unique.values());
+    const candidates = Array.from(unique.values());
+    // A failed lookup is not a fact about the card, so it is never remembered:
+    // caching "nothing found" after a rate limit is what made a later re-price
+    // fail instantly and silently for the next ten minutes.
+    if (candidates.length || !lastError) {
+        candidateCache.set(cacheKey, { candidates, ts: Date.now(), error: null });
+    }
+    lastCandidateErrors.set(cacheKey, lastError);
+    return candidates;
 }
 
-async function verifyAndCanonicalizeCard(card) {
-    if (!card || !hasMeaningfulCardName(card.card_name)) return null;
-    if (analysisLooksTooWeak(card)) return null;
+function candidateLookupError(card) {
+    return lastCandidateErrors.get(buildVariantKey(card)) || null;
+}
+
+/** Drop any memoised candidates for a card, so the next lookup really goes out. */
+function forgetCandidates(card) {
+    candidateCache.delete(buildVariantKey(card));
+    lastCandidateErrors.delete(buildVariantKey(card));
+}
+
+/** Whether the card database is currently answering at all. */
+function cardDatabaseReachable() {
+    const health = sourceHealth.get('pokemontcg');
+    return !health || health.ok === true;
+}
+
+/**
+ * @param {(stage:string, payload?:object) => void} [report] scan progress sink
+ * @returns {object|null} the canonical card, or null with a reason reported
+ */
+async function verifyAndCanonicalizeCard(card, report = () => {}) {
+    if (!card || !hasMeaningfulCardName(card.card_name)) {
+        report('verify_failed', { reason: 'unreadable_name', message: 'Could not make out the card name.' });
+        return null;
+    }
+    if (analysisLooksTooWeak(card)) {
+        report('verify_failed', { reason: 'weak_read', message: 'The set and number were not legible enough to confirm the printing.' });
+        return null;
+    }
 
     const candidates = await fetchPokemonTcgCandidates(card);
-    if (!candidates.length) return null;
+    if (!candidates.length) {
+        const failure = candidateLookupError(card);
+        report('verify_failed', failure
+            ? { reason: `database_${failure.kind}`, message: `The card database could not answer — ${failure.message}.` }
+            : { reason: 'no_match', message: 'No card in the database matched that name, set and number.' });
+        return null;
+    }
+    report('candidates', { count: candidates.length });
 
     const normalizedAiName = normalizeText(card.card_name);
     const sameNameCandidates = candidates.filter(c => normalizeText(c?.name) === normalizedAiName);
@@ -1013,12 +1159,20 @@ async function verifyAndCanonicalizeCard(card) {
 
     if (sameNameCandidates.length > 1 && exactNumberCandidates.length === 0 && exactSetCandidates.length !== 1) {
         console.log(`  [Verify] Ambiguous same-name variant rejected for "${card.card_name}"`);
+        report('verify_failed', {
+            reason: 'ambiguous',
+            message: `${sameNameCandidates.length} printings share that name — the set or number is needed to tell them apart.`,
+        });
         return null;
     }
 
     const { bestCandidate, bestScore } = pickBestPokemonCardCandidate(card, candidates);
 
     if (!bestCandidate || !isLikelyVerifiedMatch(bestScore, bestCandidate, card)) {
+        report('verify_failed', {
+            reason: 'low_match',
+            message: 'The closest database match was not close enough to trust.',
+        });
         return null;
     }
 
@@ -1084,8 +1238,47 @@ async function convertToJpeg(buffer, filePath) {
     }
 }
 
+/**
+ * Classify a recognition failure. The Gemini SDK throws plain Errors rather
+ * than HTTP errors, so the status has to be read out of the message — but a
+ * quota error and an unreachable network are different problems for the person
+ * holding the card, and reporting both as "no card found" sent them off
+ * re-photographing a card that was never the issue.
+ */
+function describeAiError(err) {
+    const message = String(err?.message || 'Unknown error');
+    if (/\b429\b|quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(message)) {
+        return { kind: 'rate_limited', message: 'Card recognition has hit its rate limit. Wait a minute and scan again.' };
+    }
+    if (/\b40[13]\b|API.?key|PERMISSION_DENIED|UNAUTHENTICATED/i.test(message)) {
+        return { kind: 'auth', message: 'Card recognition rejected our API key — it needs to be renewed in the server settings.' };
+    }
+    if (/\b50\d\b|UNAVAILABLE|overloaded/i.test(message)) {
+        return { kind: 'upstream', message: 'Card recognition is temporarily overloaded. Try again in a moment.' };
+    }
+    if (/timeout|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|fetch failed|network/i.test(message)) {
+        return { kind: 'network', message: 'Could not reach the card recognition service.' };
+    }
+    if (/SAFETY|blocked/i.test(message)) {
+        return { kind: 'blocked', message: 'Card recognition refused to read that image.' };
+    }
+    return { kind: 'error', message: message.slice(0, 240) };
+}
+
+/**
+ * @returns {{ok:true, analysis:object} | {ok:false, kind:string, message:string}}
+ * Never null: the caller has to be able to tell "the AI saw no card" from
+ * "the AI never answered".
+ */
 async function analyzeImageBuffer(buffer, mimeType) {
-    if (!geminiModel) return null;
+    if (!geminiModel) {
+        noteSource('gemini', { ok: false, kind: 'not_configured', message: 'GEMINI_API_KEY is not set' });
+        return {
+            ok: false,
+            kind: 'not_configured',
+            message: 'Card recognition is not switched on for this server — GEMINI_API_KEY is missing.',
+        };
+    }
     try {
         const base64Data = buffer.toString('base64');
         const result = await geminiModel.generateContent({
@@ -1102,10 +1295,18 @@ async function analyzeImageBuffer(buffer, mimeType) {
             }
         });
         const text = result.response.text();
-        return parseAiJson(text);
+        const analysis = parseAiJson(text);
+        if (!analysis) {
+            noteSource('gemini', { ok: false, kind: 'unparseable', message: 'Reply was not valid JSON' });
+            return { ok: false, kind: 'unparseable', message: 'Card recognition returned something unreadable. Try that photo again.' };
+        }
+        noteSource('gemini', { ok: true, message: 'OK' });
+        return { ok: true, analysis };
     } catch (err) {
-        console.error('  [Vision Analysis] Error:', err.message);
-        return null;
+        const failure = describeAiError(err);
+        noteSource('gemini', { ok: false, ...failure });
+        console.error(`  [Vision Analysis] ${failure.kind}: ${err.message}`);
+        return { ok: false, ...failure };
     }
 }
 
@@ -1164,8 +1365,10 @@ async function fetchScrydexCard(cardName, cardSet, cardNumber) {
             const cards = resp.data?.data || [];
             return cards[0] || null;
         } catch (err2) {
-            console.error(`  [Scrydex] Error for "${cardName}":`, err2.message);
-            return null;
+            const failure = describeAxiosError(err2);
+            noteSource('scrydex', failure);
+            console.error(`  [Scrydex] Error for "${cardName}": ${failure.message}`);
+            throw new SourceUnavailable(failure);
         }
     }
 }
@@ -1250,8 +1453,10 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
             printing: variant.printing
         };
     } catch (err) {
-        console.error(`  [JustTCG] Error for "${cardName}":`, err.message);
-        return null;
+        const failure = describeAxiosError(err);
+        noteSource('justtcg', failure);
+        console.error(`  [JustTCG] Error for "${cardName}": ${failure.message}`);
+        throw new SourceUnavailable(failure);
     }
 }
 
@@ -1272,19 +1477,24 @@ function priceCacheKey(card) {
 
 async function collectPokemonTcgQuotes(card, ctx) {
     const candidates = await fetchPokemonTcgCandidates(card);
-    if (!candidates.length) return [];
+    if (!candidates.length) {
+        // fetchPokemonTcgCandidates handles its own retries, so the error it
+        // recorded is the only evidence left that the request went wrong.
+        const failure = candidateLookupError(card);
+        if (failure) throw new SourceUnavailable(failure);
+        return [];
+    }
     const { bestCandidate } = pickBestPokemonCardCandidate(card, candidates);
     if (!bestCandidate) return [];
     return quotesFromPokemonTcgCandidate(bestCandidate, ctx);
 }
 
 async function collectTcgdexQuotes(card, ctx) {
-    const tcgdexCard = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number);
+    const tcgdexCard = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number, true);
     return quotesFromTcgdexCard(tcgdexCard, ctx);
 }
 
 async function collectScrydexQuotes(card, ctx) {
-    if (!SCRYDEX_API_KEY || !SCRYDEX_TEAM_ID) return [];
     const scrydexCard = await fetchScrydexCard(card.card_name, card.card_set, card.card_number);
     if (!scrydexCard) return [];
     // Scrydex mirrors the TCGplayer/Cardmarket shapes, so the same extractors apply.
@@ -1308,10 +1518,30 @@ async function collectJustTcgQuotes(card) {
     }];
 }
 
-async function lookupMarketPrice(card) {
+/** Human labels for the price sources, for anything the app shows a person. */
+const PRICE_SOURCE_LABELS = {
+    pokemontcg: 'Pokémon TCG API (TCGplayer + Cardmarket)',
+    tcgdex: 'TCGdex',
+    scrydex: 'Scrydex',
+    justtcg: 'JustTCG',
+};
+
+/**
+ * Resolve one card's market price.
+ *
+ * `onSource` is called as each source is asked and again as it answers, so a
+ * scan or a re-price can show which marketplaces are being consulted instead of
+ * a spinner. The returned object carries the same information as `sources`, so
+ * a caller that only wants the outcome does not have to listen.
+ */
+async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
     if (!card?.card_name) return null;
 
     const key = priceCacheKey(card);
+    if (fresh) {
+        priceCache.delete(key);
+        forgetCandidates(card);
+    }
     const cached = priceCache.get(key);
     if (cached && Date.now() - cached.ts < PRICE_CACHE_TTL_MS) {
         const { ts, ...rest } = cached;
@@ -1321,16 +1551,38 @@ async function lookupMarketPrice(card) {
     const ctx = priceContextFor(card);
 
     const collectors = [
-        ['pokemontcg', () => collectPokemonTcgQuotes(card, ctx)],
-        ['tcgdex', () => collectTcgdexQuotes(card, ctx)],
-        ['scrydex', () => collectScrydexQuotes(card, ctx)],
-        ['justtcg', () => collectJustTcgQuotes(card)],
+        { name: 'pokemontcg', configured: true, run: () => collectPokemonTcgQuotes(card, ctx) },
+        { name: 'tcgdex', configured: true, run: () => collectTcgdexQuotes(card, ctx) },
+        { name: 'scrydex', configured: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), run: () => collectScrydexQuotes(card, ctx) },
+        { name: 'justtcg', configured: Boolean(JUSTTCG_API_KEY), run: () => collectJustTcgQuotes(card) },
     ];
 
-    const settled = await Promise.allSettled(collectors.map(async ([name, run]) => {
+    const sources = [];
+    const report = (entry) => {
+        sources.push(entry);
+        try { onSource?.(entry); } catch { /* a listener must never break a lookup */ }
+    };
+
+    for (const { name, configured } of collectors) {
+        try { onSource?.({ name, label: PRICE_SOURCE_LABELS[name] || name, state: configured ? 'asking' : 'skipped', reason: configured ? '' : 'no API key' }); }
+        catch { /* ignore */ }
+    }
+
+    const settled = await Promise.allSettled(collectors.map(async ({ name, configured, run }) => {
+        const label = PRICE_SOURCE_LABELS[name] || name;
+        if (!configured) {
+            report({ name, label, state: 'skipped', quotes: 0, reason: 'no API key' });
+            return [];
+        }
+        const startedAt = Date.now();
         try {
-            return await run();
+            const quotes = await run();
+            report({ name, label, state: quotes.length ? 'answered' : 'empty', quotes: quotes.length, ms: Date.now() - startedAt });
+            return quotes;
         } catch (err) {
+            const failure = err instanceof SourceUnavailable ? err.failure : describeAxiosError(err);
+            noteSource(name, failure);
+            report({ name, label, state: 'failed', quotes: 0, ms: Date.now() - startedAt, reason: failure.message, kind: failure.kind });
             console.error(`  [Pricing] ${name} failed for "${card.card_name}":`, err.message);
             return [];
         }
@@ -1338,21 +1590,30 @@ async function lookupMarketPrice(card) {
 
     const quotes = settled.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
     const result = await aggregateQuotes(quotes, { axios });
+    const asked = sources.filter(s => s.state !== 'skipped');
+    const allAskedFailed = asked.length > 0 && asked.every(s => s.state === 'failed');
 
     if (!result) {
         console.log(`  [Pricing] No usable quote for "${card.card_name}" (${quotes.length} raw quotes)`);
         const empty = {
             price: 0,
-            source: 'not_found',
+            source: allAskedFailed ? 'sources_unavailable' : 'not_found',
             url: '',
             confidence: 0,
             allSourcePrices: {},
             quotesSeen: quotes.length,
             quotesUsed: 0,
+            sources,
+            sourcesUnavailable: allAskedFailed,
         };
-        priceCache.set(key, { ...empty, ts: Date.now() });
+        // A price of zero because every source was down is not a fact about the
+        // card, so it is not cached — otherwise the next six hours of re-prices
+        // would answer instantly with the same nothing.
+        if (!allAskedFailed) priceCache.set(key, { ...empty, ts: Date.now() });
         return empty;
     }
+    result.sources = sources;
+    result.sourcesUnavailable = false;
 
     console.log(
         `  [Pricing] "${card.card_name}" ${ctx.printing}${ctx.isFirstEdition ? '/1st' : ''} → ` +
@@ -1378,6 +1639,26 @@ function broadcast(event) {
 
 function broadcastActivity(type, message, data = null) {
     broadcast({ type: 'activity', activityType: type, message, data, timestamp: new Date().toISOString() });
+}
+
+/**
+ * Per-scan progress, streamed to whoever started that scan.
+ *
+ * The scanner used to sit on a live camera preview saying "analysis in
+ * progress" with nothing behind it, so a slow card-database lookup was
+ * indistinguishable from a hung one. Every stage the server actually goes
+ * through is announced instead, including which price sources it is asking and
+ * what each one answered — the client tags its upload with a scanId and
+ * listens for its own.
+ *
+ * Returns a no-op when there is no scanId, so callers never have to branch.
+ */
+function scanReporter(scanId) {
+    if (!scanId) return () => {};
+    let seq = 0;
+    return (stage, payload = {}) => {
+        broadcast({ type: 'scan_progress', scanId, seq: ++seq, stage, at: Date.now(), ...payload });
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1423,13 +1704,15 @@ async function refreshBatchPrices(batchSize = 5) {
                     if (imageUrl) await updateCardImageUrl(card.id, imageUrl);
                 }
 
-                const result = await lookupMarketPrice(card);
+                const result = await lookupMarketPrice(card, { fresh: true });
                 if (result && result.price > 0) {
                     await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
                     await updatePortfolioCardMarketData(card.id, result);
                     updated++;
-                } else {
-                    // Still mark as checked so we don't re-check endlessly
+                } else if (!result?.sourcesUnavailable) {
+                    // Mark as checked so we don't re-check endlessly — but not
+                    // when the sources were simply unreachable, since then
+                    // nothing was actually checked.
                     await markPriceChecked(card.id);
                 }
             } catch (err) {
@@ -1466,8 +1749,10 @@ async function refreshAllPrices() {
         `);
         const cards = res.rows;
         let updated = 0;
+        let unavailable = 0;
 
-        for (const card of cards) {
+        for (let i = 0; i < cards.length; i++) {
+            const card = cards[i];
             try {
                 if (!card.image_url || card.image_url.includes('undefined')) {
                     let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
@@ -1478,15 +1763,40 @@ async function refreshAllPrices() {
                     }
                 }
 
-                const result = await lookupMarketPrice(card);
+                // `fresh` matters here: the whole point of a refresh is to go
+                // out to the marketplaces again, and a warm in-process cache
+                // would otherwise turn the run into a no-op.
+                const result = await lookupMarketPrice(card, { fresh: true });
                 if (result && result.price > 0) {
                     await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
                     await updatePortfolioCardMarketData(card.id, result);
                     updated++;
                     broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
+                } else if (result?.sourcesUnavailable) {
+                    // Do NOT mark it checked. A card skipped because every
+                    // source was down has not been checked, and recording that
+                    // it was sends it to the back of the queue for a day.
+                    unavailable++;
                 } else {
                     await markPriceChecked(card.id);
                 }
+
+                broadcast({
+                    type: 'refresh_progress',
+                    done: i + 1,
+                    total: cards.length,
+                    updated,
+                    card_name: card.card_name,
+                });
+
+                // Every source refusing to answer means the next card will fare
+                // no better; hammering them just deepens the rate limit.
+                if (unavailable >= 5) {
+                    console.error('  [PriceRefresh] Stopping early — no price source is answering.');
+                    broadcastActivity('error', 'Stopped refreshing: no price source is answering right now.');
+                    break;
+                }
+
                 if (!result?.cached) await sleep(1200);
             } catch (err) {
                 console.error(`  [PriceRefresh] Error for ${card.card_name}:`, err.message);
@@ -1495,9 +1805,12 @@ async function refreshAllPrices() {
         }
 
         console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards.`);
-        broadcastActivity('refresh_complete', `Updated prices for ${updated} cards`);
+        broadcastActivity('refresh_complete',
+            unavailable
+                ? `Updated ${updated} card${updated === 1 ? '' : 's'}; ${unavailable} could not be reached.`
+                : `Updated prices for ${updated} card${updated === 1 ? '' : 's'}`);
         broadcast({ type: 'portfolio_updated' });
-        return { updated, total: cards.length };
+        return { updated, total: cards.length, unavailable };
     } finally {
         priceRefreshRunning = false;
     }
@@ -1718,6 +2031,98 @@ const requireAuth = (req, res, next) => {
     req.user = { id: DEFAULT_USER_ID, username: 'jack' };
     next();
 };
+
+/**
+ * Actually call every external dependency and report what happened.
+ *
+ * "The card analysis isn't working" has half a dozen possible causes that all
+ * looked identical from the app: no Gemini key, a rejected key, the card
+ * database rate limiting us, a network block. This probes each one and names
+ * the failure, so the fix is obvious instead of guessed at.
+ */
+app.get('/api/diagnostics', requireAuth, async (req, res) => {
+    const probe = async (name, label, fn, hint) => {
+        const started = Date.now();
+        try {
+            const detail = await fn();
+            return { name, label, ok: true, ms: Date.now() - started, detail };
+        } catch (err) {
+            const info = describeAxiosError(err);
+            return { name, label, ok: false, ms: Date.now() - started, detail: info.message, kind: info.kind, hint };
+        }
+    };
+
+    const checks = await Promise.all([
+        probe('database', 'Collection database', async () => {
+            const r = await pool.query('SELECT COUNT(*)::int AS c FROM portfolio_cards');
+            return `${r.rows[0].c} cards stored`;
+        }, 'Check DATABASE_URL'),
+
+        probe('gemini', 'Card recognition (Gemini)', async () => {
+            if (!geminiModel) throw new Error('No GEMINI_API_KEY set — scanning is disabled');
+            const result = await geminiModel.generateContent('Reply with the single word: ready');
+            const text = (result.response.text() || '').trim().slice(0, 40);
+            return text ? `Responding — "${text}"` : 'Responded but returned nothing';
+        }, 'Set GEMINI_API_KEY, and check the key is enabled for the Gemini API'),
+
+        probe('pokemontcg', 'Card database (Pokémon TCG API)', async () => {
+            const headers = { Accept: 'application/json' };
+            if (POKEMON_TCG_KEY) headers['X-Api-Key'] = POKEMON_TCG_KEY;
+            const r = await axios.get('https://api.pokemontcg.io/v2/cards', {
+                params: { q: 'name:"Charizard" number:"4"', pageSize: 1 }, headers, timeout: 12000,
+            });
+            const hit = r.data?.data?.[0];
+            return hit ? `Found ${hit.name} (${hit.set?.name})${POKEMON_TCG_KEY ? '' : ' — no API key, rate limited'}`
+                       : 'Reachable but returned no results';
+        }, 'Set POKEMON_TCG_KEY — without one this API rate limits quickly and every lookup fails'),
+
+        probe('tcgdex', 'Card prices (TCGdex)', async () => {
+            const r = await axios.get('https://api.tcgdex.net/v2/en/cards', {
+                params: { name: 'Charizard' }, timeout: 12000,
+            });
+            return `${(r.data || []).length} results`;
+        }, 'No key needed — a failure here means outbound network is blocked'),
+
+        probe('fx', 'Exchange rate (EUR→USD)', async () => {
+            const rate = await getUsdPerEur(axios);
+            const status = fxStatus();
+            return status.live ? `${rate} USD/EUR (live)` : `${rate} USD/EUR (fallback — live rate unavailable)`;
+        }, 'Only affects Cardmarket prices'),
+    ]);
+
+    if (SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) {
+        checks.push(await probe('scrydex', 'Card prices (Scrydex)', async () => {
+            const r = await axios.get('https://api.scrydex.com/pokemon/v1/cards', {
+                params: { q: 'name:"Charizard"', pageSize: 1 }, headers: scrydexHeaders(), timeout: 12000,
+            });
+            return `${(r.data?.data || []).length} results`;
+        }, 'Check SCRYDEX_API_KEY and SCRYDEX_TEAM_ID'));
+    }
+    if (JUSTTCG_API_KEY) {
+        checks.push(await probe('justtcg', 'Card prices (JustTCG)', async () => {
+            const r = await axios.get('https://api.justtcg.com/v1/cards', {
+                params: { q: 'Charizard', game: 'pokemon', limit: 1 },
+                headers: { 'x-api-key': JUSTTCG_API_KEY }, timeout: 12000,
+            });
+            return `${(r.data?.data || []).length} results`;
+        }, 'Check JUSTTCG_API_KEY'));
+    }
+
+    const scanningWorks = checks.find(c => c.name === 'gemini')?.ok === true;
+    const pricingWorks = checks.some(c => ['pokemontcg', 'tcgdex', 'scrydex', 'justtcg'].includes(c.name) && c.ok);
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+        build: BUILD_ID,
+        checks,
+        summary: {
+            scanning: scanningWorks ? 'working' : 'broken',
+            pricing: pricingWorks ? 'working' : 'broken',
+        },
+        recentSourceActivity: sourceHealthSnapshot(),
+    });
+});
+
 
 app.get('/api/auth/me', (req, res) => {
     res.json({ username: 'jack' });
@@ -1970,32 +2375,80 @@ app.post('/api/portfolio/merge-duplicates', requireAuth, express.json(), async (
  * unverified price can be fixed on the spot instead of waiting for the next
  * full refresh.
  */
+/**
+ * Re-price one card, on demand.
+ *
+ * This used to answer `{success:true, price:0, source:'not_found'}` whether the
+ * card was genuinely unlisted, every source was rate limited, or the cached
+ * nothing from ten minutes ago was replayed — so "Re-price" looked like it did
+ * nothing at all. Now it forces a real lookup and says which it was.
+ */
 app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
     const cardId = parseInt(req.params.id, 10);
     try {
         const owned = await pool.query('SELECT * FROM portfolio_cards WHERE id = $1 AND user_id = $2', [cardId, req.user.id]);
         if (!owned.rows.length) return res.status(404).json({ error: 'Card not found' });
         const card = owned.rows[0];
+        const previousPrice = Number(card.current_price) || 0;
 
-        // Bypass the cache: the point of asking is to get a fresh answer.
-        priceCache.delete(buildVariantKey(card));
+        // `fresh` clears both the price cache and the candidate memo: the point
+        // of asking is to get a new answer, not a fast one.
+        const market = await lookupMarketPrice(card, { fresh: true });
+        const price = Number(market?.price) || 0;
 
-        const market = await lookupMarketPrice(card);
-        if (market && market.price > 0) {
-            await insertPricePoint(cardId, market.price, market.source, market.url || '');
+        if (price > 0) {
+            await insertPricePoint(cardId, price, market.source, market.url || '');
             await updatePortfolioCardMarketData(cardId, market);
         } else {
             await markPriceChecked(cardId);
         }
 
+        let delta = Number((price - previousPrice).toFixed(2));
+        let status = 'priced';
+        let message;
+
+        if (market?.sourcesUnavailable) {
+            // Named per source and capped: "which one is down" is actionable,
+            // a paragraph of repeated transport errors is not.
+            const failures = (market.sources || []).filter(s => s.state === 'failed');
+            const named = failures.slice(0, 2)
+                .map(s => `${s.label.replace(/\s*\(.*\)$/, '')}: ${s.reason.split('—')[0].trim()}`)
+                .join('; ');
+            status = 'sources_unavailable';
+            message = `No price source could be reached${named ? ` — ${named}` : ''}`
+                + `${failures.length > 2 ? ` and ${failures.length - 2} more` : ''}. Your saved price is unchanged.`;
+            // Nothing was learned, so nothing changed. Reporting a price of
+            // zero here would read as "this card is now worthless".
+            delta = 0;
+        } else if (price === 0) {
+            status = 'not_found';
+            message = card.needs_review
+                ? 'No listing matched. Confirm the set and card number on this card, then try again.'
+                : 'No marketplace listing found for this exact printing.';
+        } else if (Math.abs(delta) < 0.005) {
+            status = 'unchanged';
+            message = `Still $${price.toFixed(2)} — re-checked against ${market.quotesUsed} of ${market.quotesSeen} quotes.`;
+        } else {
+            message = `${previousPrice > 0 ? `$${previousPrice.toFixed(2)} → ` : ''}$${price.toFixed(2)} (${delta > 0 ? '+' : ''}$${delta.toFixed(2)}) from ${market.quotesUsed} of ${market.quotesSeen} quotes.`;
+        }
+
         broadcast({ type: 'portfolio_updated' });
         res.json({
             success: true,
-            price: market?.price || 0,
+            status,
+            message,
+            // The card's price after this attempt. On an outage that is the one
+            // it already had, not the zero the lookup came back with.
+            price: status === 'sources_unavailable' ? previousPrice : price,
+            previousPrice,
+            delta,
+            changed: status === 'priced',
             source: market?.source || 'not_found',
+            marketplace: market?.marketplace || '',
             confidence: market?.confidence || 0,
             quotesUsed: market?.quotesUsed || 0,
             quotesSeen: market?.quotesSeen || 0,
+            sources: market?.sources || [],
         });
     } catch (err) {
         console.error('Reprice error:', err);
@@ -2118,8 +2571,11 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
 
             broadcastActivity('upload_start', `Analyzing ${files.length} photo${files.length > 1 ? 's' : ''}...`);
 
-            // Process synchronously so we can return the results
-            const result = await processPortfolioUpload(files, req.user.id);
+            // Process synchronously so we can return the results. Progress for
+            // this particular scan streams over SSE under the client's scanId.
+            const result = await processPortfolioUpload(files, req.user.id, {
+                scanId: typeof req.body?.scanId === 'string' ? req.body.scanId.slice(0, 64) : '',
+            });
             // `results` carries the rejections too, so the scanner can say why a
             // photo produced nothing instead of failing silently.
             res.json({
@@ -2152,20 +2608,25 @@ app.post('/api/portfolio/upload', requireAuth, (req, res) => {
 async function processPortfolioUpload(files, userId, options = {}) {
     const results = [];
     let totalAdded = 0;
+    const report = scanReporter(options.scanId);
 
     broadcastActivity('analyzing', `Scanning ${files.length} photo${files.length > 1 ? 's' : ''} with AI...`);
+    report('start', { photos: files.length });
 
     for (let index = 0; index < files.length; index++) {
         const file = files[index];
+        const photo = { index, of: files.length };
         broadcastActivity('analyzing', `Scanning photo ${index + 1} of ${files.length}...`);
+        report('reading', { ...photo, message: 'Preparing the photo' });
 
-        let buffer, analysis, thumbDataUrl = '';
+        let buffer, vision, thumbDataUrl = '';
         try {
             buffer = readFileSync(file.path);
             let sendMime = file.mimetype;
 
             if (!GEMINI_SUPPORTED_TYPES.has(sendMime)) {
                 console.log(`  [Vision] Converting ${sendMime} → JPEG for Gemini & Sharp...`);
+                report('converting', { ...photo, message: 'Converting the image' });
                 const converted = await convertToJpeg(buffer, file.path);
                 if (converted) {
                     buffer = converted;
@@ -2173,26 +2634,49 @@ async function processPortfolioUpload(files, userId, options = {}) {
                 }
             }
 
-            analysis = await analyzeImageBuffer(buffer, sendMime);
-
+            // The thumbnail is made before the AI call so the client has
+            // something of the actual card to show while it waits.
             try {
                 const thumbBuffer = await sharp(buffer)
                     .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
                     .jpeg({ quality: 80 })
                     .toBuffer();
                 thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;
+                report('thumbnail', { ...photo, image_data: thumbDataUrl });
             } catch (e) { console.error(`  [Thumb] Failed for photo ${index + 1}:`, e.message); }
+
+            report('identifying', { ...photo, message: 'Reading the card with AI' });
+            vision = await analyzeImageBuffer(buffer, sendMime);
 
             try { rmSync(file.path, { force: true }); } catch { }
         } catch (err) {
             console.error(`Photo ${index + 1} error:`, err.message);
             try { rmSync(file.path, { force: true }); } catch { }
+            report('photo_failed', { ...photo, reason: 'unreadable', message: 'Could not read that image.' });
             results.push({ status: 'error', reason: 'unreadable', message: 'Could not read that image.' });
             continue;
         }
 
+        // An outage is not the same as an empty frame. Saying "no card found"
+        // when the recognition service was down or rate limited sent people off
+        // re-photographing a perfectly good card.
+        if (!vision?.ok) {
+            const message = vision?.message || 'Card recognition failed.';
+            broadcastActivity('error', message);
+            report('photo_failed', { ...photo, reason: vision?.kind || 'ai_failed', message, retryable: vision?.kind !== 'not_configured' });
+            results.push({ status: 'error', reason: vision?.kind || 'ai_failed', message, image_data: thumbDataUrl });
+            continue;
+        }
+
+        const analysis = vision.analysis;
         if (!analysis?.cards?.length || analysis?.is_pokemon_card === false) {
             broadcastActivity('info', `No Pokémon card detected in photo ${index + 1}.`);
+            report('photo_failed', {
+                ...photo,
+                reason: 'no_card',
+                message: 'No Pokémon card found in the frame. Fill more of the frame with the card and avoid glare.',
+                retryable: true,
+            });
             results.push({
                 status: 'rejected',
                 reason: 'no_card',
@@ -2203,11 +2687,37 @@ async function processPortfolioUpload(files, userId, options = {}) {
         }
 
         for (const rawCard of analysis.cards) {
-            const verified = await verifyAndCanonicalizeCard(rawCard);
+            report('identified', {
+                ...photo,
+                card: {
+                    card_name: rawCard.card_name || '',
+                    card_set: rawCard.card_set || '',
+                    card_number: rawCard.card_number || '',
+                    rarity: rawCard.rarity || '',
+                    confidence: Number(rawCard.confidence) || 0,
+                },
+            });
+            report('verifying', { ...photo, message: 'Confirming the printing against the card database' });
+
+            const verified = await verifyAndCanonicalizeCard(rawCard, report);
             const card = verified || { ...rawCard, needs_review: true };
 
-            if (!verified) {
+            if (verified) {
+                report('verified', {
+                    ...photo,
+                    card: {
+                        card_name: verified.card_name,
+                        card_set: verified.card_set,
+                        card_number: verified.card_number,
+                        rarity: verified.rarity,
+                        year: verified.year,
+                        image_url: verified.image_url || '',
+                        confidence: verified.confidence,
+                    },
+                });
+            } else {
                 if (!hasMeaningfulCardName(card.card_name)) {
+                    report('photo_failed', { ...photo, reason: 'unreadable_card', message: 'Could not read the card name. Try again with less glare.', retryable: true });
                     results.push({
                         status: 'rejected',
                         reason: 'unreadable_card',
@@ -2217,6 +2727,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
                     continue;
                 }
                 broadcastActivity('info', `Saved "${card.card_name}" for review — could not confirm it in the card database.`);
+                report('unverified', { ...photo, card_name: card.card_name, message: 'Saving for review — the printing could not be confirmed' });
             }
 
             const saved = await saveScannedCard(card, {
@@ -2224,10 +2735,12 @@ async function processPortfolioUpload(files, userId, options = {}) {
                 thumbDataUrl,
                 needsReview: !verified,
                 forceSeparate: options.forceSeparate === true,
+                report: (stage, payload) => report(stage, { ...photo, ...payload }),
             });
 
             totalAdded++;
             results.push(saved);
+            report('saved', { ...photo, card: saved });
             broadcastActivity('card_added_detail', `${saved.is_new_copy ? '➕' : '✅'} ${saved.card_name}`, saved);
             broadcast({ type: 'card_added' });
         }
@@ -2235,6 +2748,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
 
     const added = results.filter(r => r.status === 'added');
     broadcastActivity('upload_complete', `Added ${added.length} card${added.length !== 1 ? 's' : ''} to your collection.`);
+    report('done', { added: added.length, results });
 
     return { totalAdded, cards: added, results };
 }
@@ -2243,11 +2757,12 @@ async function processPortfolioUpload(files, userId, options = {}) {
  * Persist one identified card: either as a new printing or as another copy of a
  * printing already held.
  */
-async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceSeparate }) {
+async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceSeparate, report = () => {} }) {
     const variantKey = buildVariantKey(card);
     const existing = forceSeparate ? null : await findCardByVariant(variantKey, userId);
 
     if (existing) {
+        report('duplicate', { card_name: existing.card_name, message: `Already in the collection — adding another copy` });
         const copy = await addCardCopy(existing.id, {
             condition: card.condition_estimate || card.condition,
             image_data: thumbDataUrl,
@@ -2313,11 +2828,34 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
     // would be a guess, and a guessed price is worse than no price.
     let market = null;
     if (!needsReview) {
+        report('pricing', { message: 'Checking marketplace prices' });
         try {
-            market = await lookupMarketPrice(card);
+            market = await lookupMarketPrice(card, {
+                onSource: (entry) => report('price_source', entry),
+            });
         } catch (err) {
             console.error(`  [Pricing] Inline lookup failed for ${card.card_name}:`, err.message);
         }
+        if (market?.price > 0) {
+            report('priced', {
+                price: market.price,
+                source: market.source,
+                marketplace: market.marketplace || '',
+                confidence: market.confidence,
+                low: market.low,
+                high: market.high,
+                quotesUsed: market.quotesUsed,
+                quotesSeen: market.quotesSeen,
+            });
+        } else {
+            report('unpriced', {
+                message: market?.sourcesUnavailable
+                    ? 'No price source could be reached — this card will be priced on the next refresh.'
+                    : 'No marketplace listing found for this printing yet.',
+            });
+        }
+    } else {
+        report('pricing_skipped', { message: 'Not priced until the printing is confirmed' });
     }
 
     if (market && market.price > 0) {

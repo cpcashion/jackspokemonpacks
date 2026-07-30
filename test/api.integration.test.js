@@ -250,4 +250,109 @@ if (!DB) {
         assert.match(row.rows[0].variant_key, /base set 2\|1\|reverse/);
         assert.equal(row.rows[0].needs_review, 0);
     });
+
+    /**
+     * "If I hit reprice, it doesn't really do anything. Nothing gets repriced."
+     *
+     * The old endpoint answered {price: 0, source: 'not_found'} for every
+     * outcome, including a total outage, and the app had nothing to say. These
+     * pin the contract that replaced it: a named status, a sentence a person
+     * can act on, and — crucially — a price that is never quietly zeroed
+     * because a marketplace was unreachable.
+     */
+    test('re-price names the outcome instead of silently reporting nothing', async () => {
+        const id = await seedLegacyCard({ card_name: 'Repriced Zapdos', card_set: 'Fossil', card_number: '15/62', current_price: 77.5 });
+        await pool.query("UPDATE portfolio_cards SET variant_key = 'repriced zapdos|fossil|15|holo|english|unl' WHERE id = $1", [id]);
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+
+        const { status, body } = await api(`/api/portfolio/${id}/reprice`, { method: 'POST' });
+        assert.equal(status, 200);
+
+        assert.ok(['priced', 'unchanged', 'not_found', 'sources_unavailable'].includes(body.status),
+            `unexpected status ${body.status}`);
+        assert.ok(body.message && body.message.length > 10, 'the outcome is explained in words');
+        assert.ok(Array.isArray(body.sources) && body.sources.length, 'every source consulted is accounted for');
+        for (const s of body.sources) {
+            assert.ok(['answered', 'empty', 'skipped', 'failed'].includes(s.state), `bad source state ${s.state}`);
+            assert.ok(s.label, 'each source is named for a person, not by its key');
+        }
+
+        // The one thing that must never happen: a card losing its price because
+        // a lookup could not be completed.
+        const after = await pool.query('SELECT current_price FROM portfolio_cards WHERE id = $1', [id]);
+        if (body.status === 'sources_unavailable' || body.status === 'not_found') {
+            assert.equal(Number(after.rows[0].current_price), 77.5, 'a failed lookup must not zero a known price');
+            assert.equal(body.price, 77.5, 'the reported price is the one the card still has');
+        }
+    });
+
+    test('re-price works on a card awaiting review, and says what it needs', async () => {
+        const id = await seedLegacyCard({ card_name: 'Blurry Vaporeon', card_set: '', card_number: '' });
+        await pool.query('UPDATE portfolio_cards SET needs_review = 1 WHERE id = $1', [id]);
+
+        const { status, body } = await api(`/api/portfolio/${id}/reprice`, { method: 'POST' });
+        assert.equal(status, 200, 'an unconfirmed card can still be re-priced on request');
+        assert.ok(body.message, 'and is told what would let it succeed');
+    });
+
+    /**
+     * A scan that fails because the recognition service is missing or down must
+     * say so. Reporting "no card found" sent people off re-photographing a card
+     * that was never the problem. GEMINI_API_KEY is deliberately empty here.
+     */
+    test('a scan reports why it failed, and streams its progress', async () => {
+        // 1x1 PNG — enough for a valid multipart upload.
+        const png = Buffer.from(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+            'base64');
+
+        // Listen first, so no event is missed.
+        const seen = [];
+        const stream = await fetch(`${BASE}/api/events`);
+        const reading = (async () => {
+            const reader = stream.body.getReader();
+            const dec = new TextDecoder();
+            let buf = '';
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                const parts = buf.split('\n\n');
+                buf = parts.pop();
+                for (const part of parts) {
+                    if (!part.startsWith('data: ')) continue;
+                    try { seen.push(JSON.parse(part.slice(6))); } catch { /* keepalive */ }
+                }
+                if (seen.some(e => e.type === 'scan_progress' && e.stage === 'done')) break;
+            }
+            reader.cancel().catch(() => {});
+        })();
+
+        const form = new FormData();
+        form.append('cards', new Blob([png], { type: 'image/png' }), 'card.png');
+        form.append('scanId', 'itest-scan');
+        const res = await fetch(`${BASE}/api/portfolio/upload`, { method: 'POST', body: form });
+        const body = await res.json();
+        await reading;
+
+        assert.equal(res.status, 200);
+        const first = body.results?.[0];
+        assert.ok(first, 'the scan reports a result for the photo');
+        assert.equal(first.reason, 'not_configured',
+            'with no API key the scan must blame the missing key, not the photo');
+        assert.match(first.message, /GEMINI_API_KEY/,
+            'and name what is missing so it can actually be fixed');
+
+        const progress = seen.filter(e => e.type === 'scan_progress' && e.scanId === 'itest-scan');
+        assert.ok(progress.length >= 3, `expected staged progress, got ${progress.map(p => p.stage).join(',')}`);
+        const stages = progress.map(p => p.stage);
+        assert.ok(stages.includes('identifying'), 'the client is told when the AI is being asked');
+        assert.ok(stages.includes('photo_failed'), 'and told when that step failed');
+        assert.equal(stages.at(-1), 'done', 'the stream always terminates, so nothing spins forever');
+
+        // Sequence numbers let a client drop out-of-order or duplicate events.
+        const seqs = progress.map(p => p.seq);
+        assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'events carry an increasing sequence');
+    });
 }

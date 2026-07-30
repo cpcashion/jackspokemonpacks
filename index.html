@@ -225,6 +225,19 @@
         <div id="healthBody" class="chart-empty" style="height:auto; padding: 8px 0;">Checking…</div>
       </div>
 
+      <!-- "Scanning isn't working" has half a dozen possible causes that all
+           look the same from the app. This calls each dependency for real and
+           names the one that is failing. -->
+      <div class="panel glass">
+        <div class="section-title" style="margin-bottom: 6px;">Test the scanner and price sources</div>
+        <p style="font-size: 13px; color: var(--text-3); line-height: 1.55;">
+          Calls every service the app depends on and reports exactly which one is failing, so a
+          missing key is never mistaken for a card the camera could not read.
+        </p>
+        <button class="btn btn-glass btn-sm" id="diagnoseBtn" style="margin-top: 11px;">Run the test</button>
+        <div id="diagnoseBody" style="margin-top: 12px;"></div>
+      </div>
+
       <div class="panel glass">
         <div class="section-title" style="margin-bottom: 10px;">How prices are worked out</div>
         <p style="font-size: 13.5px; color: var(--text-2); line-height: 1.6;">
@@ -251,35 +264,41 @@
   </main>
 </div>
 
-<!-- ── MOBILE TAB BAR ────────────────────────────────────────
-     Four destinations on a five-column grid with the scan action occupying
-     the middle column. Every tab therefore has an identical footprint, and
-     the active state changes only colour and icon fill — never size — so
-     the spacing cannot appear to shift when you move between them.        -->
-<nav class="tabbar">
-  <button class="tab active" data-view="collection">
+<!-- ── TAB BAR ───────────────────────────────────────────────
+     An iOS-style Liquid Glass bar: one translucent capsule floating clear of
+     the content, five equal cells, and a glass pill that slides in behind
+     whichever cell is selected.
+
+     Nothing is lifted out of the bar. The scan action lives in the middle
+     cell as a tinted tab — thumb-reachable, but not a button hovering over
+     the layout. And because the pill travels inside a fixed-width grid,
+     selecting a tab changes colour only: no cell ever moves or resizes,
+     which is what made the previous bar look unevenly spaced.             -->
+<nav class="tabbar" aria-label="Sections" style="--active: 0;">
+  <span class="tab-pill" aria-hidden="true"></span>
+
+  <button class="tab active" data-view="collection" data-slot="0">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-    <span>Collection</span>
+    <span class="tab-label">Cards</span>
   </button>
-  <button class="tab" data-view="sets">
+  <button class="tab" data-view="sets" data-slot="1">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="16" rx="2"/><path d="M7 4v16M21 7v11a2 2 0 0 1-2 2"/></svg>
-    <span>Sets</span>
+    <span class="tab-label">Sets</span>
   </button>
 
-  <!-- The lens. An action, not a place — so it is round, raised, and the
-       only coloured thing down here. -->
-  <button class="lens" id="lensBtn" aria-label="Scan a card">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5V6a2 2 0 0 1 2-2h2.5M16.5 4H19a2 2 0 0 1 2 2v2.5M21 15.5V18a2 2 0 0 1-2 2h-2.5M7.5 20H5a2 2 0 0 1-2-2v-2.5"/><circle cx="12" cy="12" r="3.4"/></svg>
+  <button class="tab tab-scan" id="lensBtn" aria-label="Scan a card">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5V6a2 2 0 0 1 2-2h2.5M16.5 4H19a2 2 0 0 1 2 2v2.5M21 15.5V18a2 2 0 0 1-2 2h-2.5M7.5 20H5a2 2 0 0 1-2-2v-2.5"/><circle cx="12" cy="12" r="3.4"/></svg>
+    <span class="tab-label">Scan</span>
   </button>
 
-  <button class="tab" data-view="review">
+  <button class="tab" data-view="review" data-slot="3">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
-    <span>Review</span>
+    <span class="tab-label">Review</span>
     <span class="tab-badge" id="tabReviewBadge" hidden>0</span>
   </button>
-  <button class="tab" data-view="settings">
+  <button class="tab" data-view="settings" data-slot="4">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-    <span>Settings</span>
+    <span class="tab-label">Settings</span>
   </button>
 </nav>
 
@@ -300,15 +319,28 @@
 
     <div class="flash" id="flash"></div>
 
-    <div class="hit" id="hit">
-      <img id="hitImg" alt="" />
-      <div class="hit-body">
-        <div class="hit-name" id="hitName"></div>
-        <div class="hit-meta" id="hitMeta"></div>
+    <!-- Live analysis. Everything the server does to a photo is reported here
+         as it happens: what the AI read, whether the printing was confirmed,
+         which marketplaces are being asked, and what each one answered. The
+         camera never just sits there claiming to be busy. -->
+    <div class="analysis" id="analysis" aria-live="polite">
+      <div class="analysis-head">
+        <div class="analysis-shot" id="analysisShot">
+          <img id="analysisImg" alt="" hidden />
+          <span class="analysis-sweep" id="analysisSweep"></span>
+        </div>
+        <div class="analysis-id">
+          <div class="analysis-name" id="analysisName">Reading the card…</div>
+          <div class="analysis-meta" id="analysisMeta">Just a moment</div>
+        </div>
+        <div class="analysis-figures">
+          <div class="analysis-price" id="analysisPrice"></div>
+          <div class="analysis-tag" id="analysisTag"></div>
+        </div>
       </div>
-      <div>
-        <div class="hit-price" id="hitPrice"></div>
-        <div class="hit-tag" id="hitTag"></div>
+      <div class="analysis-steps" id="analysisSteps"></div>
+      <div class="analysis-foot" id="analysisFoot" hidden>
+        <button class="btn btn-quiet btn-sm" id="analysisCloseBtn">Dismiss</button>
       </div>
     </div>
 

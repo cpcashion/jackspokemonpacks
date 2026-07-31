@@ -22,6 +22,10 @@ const state = {
   // Which sets are open in the Sets view. A set expands where it stands
   // instead of throwing you back to the Collection view with a search applied.
   openSets: new Set(),
+  // Which cut of the collection the Sets tab is showing: how the cards were
+  // sold, or how they play.
+  grouping: localStorage.getItem('grouping') === 'types' ? 'types' : 'sets',
+  openTypes: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -208,12 +212,18 @@ document.querySelectorAll('[data-theme-set]').forEach((b) => {
 
 const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Identifying', settings: 'Settings' };
 
+/** The Sets tab shows two different groupings, so the heading follows suit. */
+function viewTitle(name) {
+  if (name === 'sets') return state.grouping === 'types' ? 'Types' : 'Sets';
+  return VIEW_TITLES[name] || 'Collection';
+}
+
 function showView(name) {
   if (name === 'scan') { openScanner(); return; }
   state.view = name;
   document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
   document.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
-  $('viewTitle').textContent = VIEW_TITLES[name] || 'Collection';
+  $('viewTitle').textContent = viewTitle(name);
 
   // The glass pill is one element travelling across the bar, so the bar only
   // needs to know which of the five columns is current.
@@ -239,6 +249,17 @@ $('searchInput').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
   const value = e.target.value;
   searchTimer = setTimeout(() => { state.query = value.trim().toLowerCase(); render(); }, 130);
+});
+
+document.querySelectorAll('[data-group]').forEach((b) => {
+  b.classList.toggle('active', b.dataset.group === state.grouping);
+  b.addEventListener('click', () => {
+    state.grouping = b.dataset.group;
+    localStorage.setItem('grouping', state.grouping);
+    document.querySelectorAll('[data-group]').forEach((x) => x.classList.toggle('active', x === b));
+    $('viewTitle').textContent = viewTitle(state.view);
+    render();
+  });
 });
 
 document.querySelectorAll('[data-layout]').forEach((b) => {
@@ -289,7 +310,7 @@ function render() {
   renderStats();
   renderCounts();
   if (state.view === 'review') renderReview();
-  else if (state.view === 'sets') renderSets();
+  else if (state.view === 'sets') { state.grouping === 'types' ? renderTypes() : renderSets(); }
   else renderCollection();
 }
 
@@ -847,6 +868,164 @@ function renderSets() {
 
   const navSets = $('navSetsCount');
   if (navSets) navSets.textContent = sets.length;
+}
+
+/**
+ * The eleven energy types the trading card game prints, with the colours it
+ * prints them in. Mirrors lib/types.js — the server decides a card's type, this
+ * only decides how it looks.
+ */
+const TYPE_COLORS = {
+  Grass: '#63A83B', Fire: '#E2553D', Water: '#33A0DA', Lightning: '#E8B71E',
+  Psychic: '#9B5FA6', Fighting: '#BE5F32', Darkness: '#46506A', Metal: '#7E8C9B',
+  Fairy: '#DE6F9D', Dragon: '#B99138', Colorless: '#A9B0BC',
+  Trainer: '#5D7CA6', Energy: '#8A8F98',
+};
+
+/**
+ * The collection by energy type.
+ *
+ * A dual-type card counts under both its types, so the per-type counts add up
+ * to more than the number of cards. That is the honest arithmetic — picking one
+ * type per card would report fewer Fire cards than Jack owns — and the header
+ * states the real card count next to it so the two are never confused.
+ */
+function renderTypes() {
+  const host = $('setsBody');
+  host.innerHTML = '';
+
+  const groups = new Map();
+  let untyped = 0;
+  let totalCards = 0;
+
+  for (const card of state.cards) {
+    if (card.needs_review) continue;
+    totalCards++;
+    const types = String(card.types || '').split(',').map(t => t.trim()).filter(Boolean);
+    if (!types.length) { untyped++; continue; }
+
+    for (const type of types) {
+      if (!groups.has(type)) groups.set(type, { type, cards: [], copies: 0, value: 0 });
+      const g = groups.get(type);
+      g.cards.push(card);
+      g.copies += card.quantity;
+      g.value += card.total_value;
+    }
+  }
+
+  let types = [...groups.values()].sort((a, b) => b.copies - a.copies || b.value - a.value);
+  if (state.query) types = types.filter(g => g.type.toLowerCase().includes(state.query));
+
+  if (!types.length) {
+    host.appendChild(emptyState(icon('card'),
+      untyped ? 'Types not known yet' : 'No cards yet',
+      untyped
+        ? `${untyped} card${untyped === 1 ? ' has' : 's have'} no type recorded. Types are filled in during the next price refresh — Settings → Refresh all prices to do it now.`
+        : 'Scan a few cards and they will be grouped by their energy type.',
+      untyped ? null : 'Scan a card', untyped ? null : openScanner));
+    return;
+  }
+
+  // ── The distribution, as one bar ────────────────────────────────
+  // A single proportional bar answers "what is this collection mostly made
+  // of?" at a glance, which a list of numbers does not.
+  const totalCopies = types.reduce((n, g) => n + g.copies, 0);
+  const chart = el('div', 'type-chart glass');
+  chart.append(el('div', 'type-chart-label', 'Every card by type'));
+
+  const bar = el('div', 'type-bar');
+  bar.setAttribute('role', 'img');
+  bar.setAttribute('aria-label',
+    types.map(g => `${g.type}: ${g.copies}`).join(', '));
+  for (const g of types) {
+    const seg = el('div', 'type-bar-seg');
+    seg.style.flexGrow = String(g.copies);
+    seg.style.background = TYPE_COLORS[g.type] || TYPE_COLORS.Colorless;
+    seg.title = `${g.type} — ${g.copies} card${g.copies === 1 ? '' : 's'}`;
+    bar.appendChild(seg);
+  }
+  chart.appendChild(bar);
+
+  const legend = el('div', 'type-legend');
+  for (const g of types) {
+    const item = el('div', 'type-legend-item');
+    const dot = el('span', 'type-dot');
+    dot.style.background = TYPE_COLORS[g.type] || TYPE_COLORS.Colorless;
+    item.append(dot, el('span', 'type-legend-name', g.type),
+      el('span', 'type-legend-count', String(g.copies)));
+    legend.appendChild(item);
+  }
+  chart.appendChild(legend);
+
+  const note = [`${totalCards} card${totalCards === 1 ? '' : 's'}`];
+  // Only worth explaining when it is actually happening.
+  if (totalCopies > totalCards) note.push('dual-type cards count under both, so the type counts add up to more');
+  if (untyped) note.push(`${untyped} not yet typed`);
+  chart.appendChild(el('div', 'type-chart-note', note.join(' · ')));
+  host.appendChild(chart);
+
+  // ── The types themselves ────────────────────────────────────────
+  const wrap = el('div', 'sets');
+  for (const g of types) {
+    const group = el('div', 'set-group glass');
+    const open = state.openTypes.has(g.type);
+    const color = TYPE_COLORS[g.type] || TYPE_COLORS.Colorless;
+
+    const row = el('button', 'set glass-tap');
+    row.setAttribute('aria-expanded', String(open));
+
+    const chip = el('div', 'type-chip');
+    chip.style.background = color;
+    chip.textContent = g.type.slice(0, 2).toUpperCase();
+    row.appendChild(chip);
+
+    const body = el('div', 'set-body');
+    body.append(
+      el('div', 'set-name', g.type),
+      el('div', 'set-meta', `${g.cards.length} unique · ${g.copies} card${g.copies === 1 ? '' : 's'} held`),
+    );
+    row.appendChild(body);
+
+    const figures = el('div', 'set-figures');
+    figures.append(
+      el('div', 'set-value', money(g.value)),
+      el('div', 'set-count', `${((g.copies / (totalCopies || 1)) * 100).toFixed(0)}% of cards`),
+    );
+    row.appendChild(figures);
+
+    const caret = el('span', 'set-caret');
+    caret.innerHTML = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+    row.appendChild(caret);
+    group.appendChild(row);
+
+    // Same expand-in-place behaviour as Sets, for the same reason: a type is
+    // somewhere you look inside, not somewhere that sends you elsewhere.
+    const panel = el('div', 'set-cards');
+    panel.hidden = !open;
+    group.appendChild(panel);
+
+    const fill = () => {
+      if (panel.dataset.filled) return;
+      panel.dataset.filled = '1';
+      const cards = [...g.cards].sort((a, b) => (b.total_value || 0) - (a.total_value || 0));
+      panel.appendChild(state.layout === 'list' ? listOf(cards) : gridOf(cards));
+      hydrateLocalImages(panel);
+    };
+    if (open) fill();
+
+    row.addEventListener('click', () => {
+      const nowOpen = !state.openTypes.has(g.type);
+      if (nowOpen) { state.openTypes.add(g.type); fill(); }
+      else state.openTypes.delete(g.type);
+      panel.hidden = !nowOpen;
+      group.classList.toggle('open', nowOpen);
+      row.setAttribute('aria-expanded', String(nowOpen));
+    });
+
+    group.classList.toggle('open', open);
+    wrap.appendChild(group);
+  }
+  host.appendChild(wrap);
 }
 
 function renderReview() {
@@ -1676,6 +1855,148 @@ $('diagnoseBtn').addEventListener('click', async (e) => {
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run the test';
+  }
+});
+
+// ── COPY COUNT AUDIT ─────────────────────────────────────────────
+//
+// Quantity is the one number in this app that cannot be looked up. A price can
+// be checked against a marketplace; how many Charizards are physically in the
+// binder cannot. And since value is quantity × price, a card photographed twice
+// does not merely clutter the list — it inflates the collection total.
+//
+// So the interface shows the evidence rather than asserting a conclusion: the
+// photos, side by side, at a size you can actually judge. Nothing is
+// pre-selected for deletion beyond the obvious default, and nothing is removed
+// without an explicit confirmation.
+
+/** Copy ids the person has chosen to remove. */
+let photoAuditSelection = new Set();
+
+$('photoAuditBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Checking…';
+
+  photoAuditSelection = new Set();
+  $('photoAuditIntro').textContent = 'Comparing every copy against the photo that added it…';
+  $('photoAuditBody').innerHTML = '';
+  $('photoAuditApplyBtn').disabled = true;
+  openModal('photoAuditModal');
+
+  try {
+    const audit = await api('/api/portfolio/photo-audit');
+    renderPhotoAudit(audit);
+  } catch (err) {
+    $('photoAuditIntro').textContent = `Could not run the check: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
+function renderPhotoAudit(audit) {
+  const body = $('photoAuditBody');
+  body.innerHTML = '';
+
+  if (!audit.cards.length) {
+    $('photoAuditIntro').textContent = audit.copiesWithoutPhotos
+      ? `Nothing looks duplicated. ${audit.copiesWithoutPhotos} of ${audit.totalCopies} copies have no photo, so those could not be checked either way.`
+      : 'Every copy looks like a different physical card. Nothing to change.';
+    return;
+  }
+
+  $('photoAuditIntro').textContent =
+    `${audit.duplicateCopies} cop${audit.duplicateCopies === 1 ? 'y looks' : 'ies look'} like a card already counted, `
+    + `across ${audit.cardsAffected} card${audit.cardsAffected === 1 ? '' : 's'}. `
+    + `If that is right, the collection is overstated by ${money(audit.overstatedValue)}. `
+    + `Untick anything you really do own twice.`;
+
+  for (const card of audit.cards) {
+    const block = el('div', 'audit-card');
+    block.append(
+      el('div', 'audit-card-name', `${card.card_name} ${card.card_number || ''}`.trim()),
+      el('div', 'audit-card-meta',
+        `${card.card_set || 'Unknown set'} · counted ${card.quantity}, looks like ${card.suggestedQuantity} · ${money(card.unit_price)} each`),
+    );
+
+    for (const group of card.groups) {
+      const strip = el('div', 'audit-strip');
+      // The first copy in each group is kept; every other one is offered for
+      // removal, pre-ticked, because that is the answer in the common case.
+      group.copies.forEach((copy, i) => {
+        const keep = i === 0;
+        const cell = el('label', `audit-copy${keep ? ' keep' : ''}`);
+
+        if (copy.image_data) {
+          const img = el('img');
+          img.src = copy.image_data;
+          img.alt = '';
+          cell.appendChild(img);
+        } else {
+          cell.appendChild(el('div', 'audit-copy-nophoto', 'no photo'));
+        }
+
+        if (keep) {
+          cell.appendChild(el('span', 'audit-tag', 'Keep'));
+        } else {
+          const box = el('input');
+          box.type = 'checkbox';
+          box.checked = true;
+          photoAuditSelection.add(copy.id);
+          box.addEventListener('change', () => {
+            if (box.checked) photoAuditSelection.add(copy.id);
+            else photoAuditSelection.delete(copy.id);
+            syncPhotoAuditButton();
+          });
+          cell.appendChild(box);
+        }
+        cell.appendChild(el('span', 'audit-copy-cond', copy.condition || 'Unknown'));
+        strip.appendChild(cell);
+      });
+
+      const why = el('div', 'audit-why');
+      why.textContent = group.sameBatch
+        ? `${group.size} photos taken within a minute and a half of each other, all but identical.`
+        : `${group.size} photos that match closely, taken at different times — worth a look.`;
+      block.append(strip, why);
+    }
+
+    body.appendChild(block);
+  }
+
+  if (audit.copiesWithoutPhotos) {
+    body.appendChild(el('div', 'field-hint',
+      `${audit.copiesWithoutPhotos} cop${audit.copiesWithoutPhotos === 1 ? 'y has' : 'ies have'} no photo `
+      + 'and were not checked — added by hand, or scanned before photos were kept.'));
+  }
+  syncPhotoAuditButton();
+}
+
+function syncPhotoAuditButton() {
+  const btn = $('photoAuditApplyBtn');
+  const n = photoAuditSelection.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `Remove ${n} cop${n === 1 ? 'y' : 'ies'}` : 'Remove selected';
+}
+
+$('photoAuditApplyBtn').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Removing…';
+  try {
+    const result = await api('/api/portfolio/photo-audit/resolve', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, removeCopyIds: [...photoAuditSelection] }),
+    });
+    toast(`Removed ${result.removed} cop${result.removed === 1 ? 'y' : 'ies'} across ${result.cardsAffected} card${result.cardsAffected === 1 ? '' : 's'}`, 'success');
+    closeModals();
+    await loadCollection();
+  } catch (err) {
+    toast(err.message, 'error', 6000);
+    btn.disabled = false;
+    syncPhotoAuditButton();
   }
 });
 

@@ -39,10 +39,46 @@ The server re-checks every card on a schedule — daily by default, tunable with
 database, not held in memory, so a deploy or restart cannot lose the schedule:
 on restart it works out whether a refresh is due and runs it if so.
 
-This needs a host that keeps a process running. It will not work on a
-static host such as GitHub Pages, which serves files and nothing else — there
-would be no server to check prices while the app is closed, and nowhere to
-store the collection.
+This needs a host that runs a process. It will not work on a static host such
+as GitHub Pages, which serves files and nothing else — there would be no server
+to check prices while the app is closed, and nowhere to store the collection.
+
+On a host that sleeps when idle, the in-process timer cannot fire, because
+there is no process. Drive it from outside instead: point any scheduler at
+`GET /api/cron/refresh-prices` with `Authorization: Bearer $CRON_SECRET`. That
+endpoint respects the schedule, so calling it every ten minutes is safe — it
+starts a refresh only when one is actually due, and `?force=1` overrides. The
+same request also wakes a sleeping service, so one mechanism covers both.
+
+## Deploying to Render + Neon
+
+`render.yaml` is a Render blueprint; the comments in it explain each variable.
+
+1. **Neon** — create a project, copy the **pooled** connection string (the host
+   containing `-pooler`). The app opens a connection pool, and Neon's direct
+   endpoint allows far fewer concurrent connections. Note the region.
+2. **Render** — New → Blueprint, point it at this repo. Set the region to match
+   Neon. Fill in the secrets marked `sync: false`; `JWT_SECRET` and
+   `CRON_SECRET` are generated for you.
+3. **Migrate the data** — from a machine with both URLs to hand:
+
+   ```bash
+   pg_dump --no-owner --no-acl "$OLD_DATABASE_URL" > collection.sql
+   psql "$NEW_DATABASE_URL" < collection.sql
+   ```
+
+   The app also creates its own schema on first boot, so an empty Neon database
+   is a valid starting point if you would rather re-scan than migrate.
+4. **Keep it awake** — add a cron-job.org (or GitHub Actions) job hitting
+   `/api/cron/refresh-prices` every 10 minutes with the bearer token. Render's
+   free tier spins down after 15 minutes idle and takes about a minute to wake,
+   and 750 instance-hours a month is 31.25 days, so staying up continuously
+   still fits.
+5. **Point the domain** — add `jackspokemon.com` under the service's Custom
+   Domains and follow the DNS instructions. TLS is issued automatically.
+
+Do not use Render's own free Postgres: it expires 30 days after creation and is
+then deleted.
 
 Settings → **Price tracking status** shows which sources are live, when prices
 last refreshed, when the next refresh is due, and how many cards carry a
@@ -88,10 +124,20 @@ the surviving row.
 
 ## Cards that cannot be confirmed
 
-If the card databases cannot confirm a scan, it is saved anyway under **Needs
-review**, unpriced, with the AI's best guess intact. A photo you took never
+If the card databases cannot confirm a scan, it is saved anyway under
+**Pending**, unpriced, with the AI's best guess intact. A photo you took never
 disappears, and no price is invented for a card that could not be identified.
-Correct the name, set or printing and it prices itself.
+
+Identification uses what is *printed* on the card, in this order of trust: the
+name, the card number, and the number's denominator — "093/132" means the card
+came out of a set of 132, which is a far better set discriminator than a set
+name the model inferred from a symbol a few pixels across. A guessed set name
+can raise confidence but never decides a match, and a candidate whose set is a
+different size is ruled out however well it otherwise scores.
+
+Nothing here is a task for you. Every scheduled refresh retries the pending
+cards, so the list drains itself as the card databases gain sets; correcting a
+name or number just settles it sooner.
 
 ## Tests
 

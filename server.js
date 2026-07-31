@@ -47,6 +47,13 @@ import {
     hasNonLatinScript,
 } from './lib/identity.js';
 import { auditHistoryRows } from './lib/history.js';
+import { typesFromCard, serializeTypes } from './lib/types.js';
+import {
+    perceptualHash,
+    decodeDataUrl,
+    groupLikelySamePhoto,
+    summariseCard,
+} from './lib/photo-audit.js';
 import {
     hasMeaningfulCardName,
     cardNameCandidates,
@@ -162,6 +169,10 @@ async function initDB() {
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS set_code TEXT DEFAULT '';
         -- Which database confirmed the printing, so a re-verification can say.
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS verified_source TEXT DEFAULT '';
+        -- Energy types as printed, comma separated. A dual-type card holds both.
+        -- Trainer and Energy cards store their supertype here so that a grouping
+        -- by type still accounts for every card in the collection.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS types TEXT DEFAULT '';
     `);
 
     // One row per physical copy. Jack owns three Charizards; that is one card
@@ -322,8 +333,8 @@ initDB().then(() => ensureDefaultUser()).catch(err => console.error("DB Init Err
 // ── Portfolio DB helpers ──
 async function insertPortfolioCard(card, userId) {
     const res = await pool.query(`
-        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source, types)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         RETURNING id
     `, [
         userId, card.card_name, card.card_name_en || '', card.card_set || '', card.set_code || '',
@@ -331,7 +342,7 @@ async function insertPortfolioCard(card, userId) {
         canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
         card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
         card.year || 0, normalizeLanguage(card.language), card.holo_type || 'Unknown',
-        buildVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || ''
+        buildVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || '', card.types || ''
     ]);
     return res.rows[0].id;
 }
@@ -414,6 +425,38 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
     ]);
 }
 
+/**
+ * Fill in a card's types if we never captured them.
+ *
+ * Costs nothing extra: the refresh is about to price this card, which means
+ * looking up the same candidates, and those lookups are memoised. So this rides
+ * along on a request that was going to happen anyway rather than adding a
+ * second pass over the collection.
+ */
+async function backfillTypesIfMissing(card) {
+    if (card.types) return null;
+    try {
+        let types = '';
+        if (isNonEnglish(card.language)) {
+            const found = await fetchTCGdexCard(card.card_name, card.card_set, card.card_number, {
+                lang: languageCode(card.language),
+                fallbackName: card.card_name_en || '',
+            });
+            types = serializeTypes(typesFromCard(found || {}));
+        } else {
+            const candidates = await fetchPokemonTcgCandidates(card);
+            if (!candidates.length) return null;
+            const { bestCandidate } = pickBestPokemonCardCandidate(card, candidates);
+            types = serializeTypes(typesFromCard(bestCandidate || {}));
+        }
+        if (types) await pool.query('UPDATE portfolio_cards SET types = $2 WHERE id = $1', [card.id, types]);
+        return types || null;
+    } catch {
+        // Types are a nicety; never let one failing lookup abort a price refresh.
+        return null;
+    }
+}
+
 /** Marks a card as checked without touching its price — used when a lookup finds nothing. */
 async function markPriceChecked(cardId) {
     await pool.query('UPDATE portfolio_cards SET last_price_check = NOW() WHERE id = $1', [cardId]);
@@ -470,6 +513,9 @@ async function applyVerifiedIdentity(cardId, verified) {
             confidence      = $11,
             variant_key     = $12,
             verified_source = $13,
+            -- Only overwrite when the database actually told us something, so a
+            -- re-verify against a source without type data cannot erase it.
+            types           = CASE WHEN $14 <> '' THEN $14 ELSE types END,
             needs_review    = 0
         WHERE id = $1
     `, [
@@ -486,6 +532,7 @@ async function applyVerifiedIdentity(cardId, verified) {
         Number(verified.confidence) || 0,
         buildVariantKey(verified),
         verified.verified_source || '',
+        verified.types || '',
     ]);
 }
 
@@ -621,7 +668,7 @@ async function getAllPortfolioCards(userId) {
         SELECT pc.id, pc.user_id, pc.card_name, pc.card_name_en, pc.card_set, pc.set_code, pc.card_number,
             pc.rarity, pc.condition, pc.is_holo, pc.is_first_edition, pc.confidence,
             pc.image_url, pc.notes, pc.year, pc.language, pc.holo_type,
-            pc.variant_key, pc.needs_review, pc.verified_source,
+            pc.variant_key, pc.needs_review, pc.verified_source, pc.types,
             pc.price_confidence, pc.price_marketplace, pc.price_variant,
             pc.price_variant_matched, pc.price_low, pc.price_high,
             pc.added_at, pc.current_price AS card_current_price, pc.price_source AS card_price_source,
@@ -1427,6 +1474,7 @@ async function verifyAgainstTcgdex(card, report) {
         tcgplayer_url: '',
         cardmarket_url: '',
         verified_source: `tcgdex_${found.tcgdexLang || lang}`,
+        types: serializeTypes(typesFromCard(found)),
         confidence: Math.max(Number(card.confidence) || 0, printed && theirs ? 0.95 : 0.85),
     };
 }
@@ -1509,6 +1557,7 @@ async function verifyAgainstPokemonTcg(card, report) {
         tcgplayer_url: bestCandidate.tcgplayer?.url || '',
         cardmarket_url: bestCandidate.cardmarket?.url || '',
         verified_source: 'pokemontcg',
+        types: serializeTypes(typesFromCard(bestCandidate)),
         // Pricing is deliberately NOT taken from this candidate. It runs through
         // lookupMarketPrice so a scanned card and a refreshed card are priced by
         // exactly the same rules.
@@ -2115,7 +2164,7 @@ async function refreshBatchPrices(batchSize = 5) {
     try {
         // Pick the N cards that haven't been checked in the longest (or never)
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, types
             FROM portfolio_cards
             WHERE COALESCE(needs_review, 0) = 0
             ORDER BY
@@ -2185,7 +2234,7 @@ async function refreshAllPrices() {
         // improves, so the right behaviour is to quietly try again on every
         // scheduled run until it resolves.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, types
             FROM portfolio_cards
             ORDER BY COALESCE(needs_review, 0) DESC, last_price_check ASC NULLS FIRST, id ASC
         `);
@@ -2193,6 +2242,7 @@ async function refreshAllPrices() {
         let updated = 0;
         let unavailable = 0;
         let resolved = 0;
+        let typed = 0;
 
         for (let i = 0; i < cards.length; i++) {
             const card = cards[i];
@@ -2227,6 +2277,13 @@ async function refreshAllPrices() {
                     subject = { ...card, ...verified };
                     resolved++;
                     broadcastActivity('info', `Identified ${verified.card_name} (${verified.card_set}) — it is no longer awaiting review.`);
+                }
+
+                // Cards added before types were captured get them here, on the
+                // back of the lookup the pricing below is about to make anyway.
+                if (!subject.types) {
+                    const types = await backfillTypesIfMissing(subject);
+                    if (types) { subject = { ...subject, types }; typed++; }
                 }
 
                 // `fresh` matters here: the whole point of a refresh is to go
@@ -2270,14 +2327,14 @@ async function refreshAllPrices() {
             }
         }
 
-        console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards, identified ${resolved}.`);
+        console.log(`  [PriceRefresh] Complete. Updated ${updated}/${cards.length} cards, identified ${resolved}, typed ${typed}.`);
         broadcastActivity('refresh_complete', [
             `Updated prices for ${updated} card${updated === 1 ? '' : 's'}`,
             resolved ? `identified ${resolved} that had been awaiting review` : '',
             unavailable ? `${unavailable} could not be reached` : '',
         ].filter(Boolean).join('; ') + '.');
         broadcast({ type: 'portfolio_updated' });
-        return { updated, total: cards.length, unavailable, resolved };
+        return { updated, total: cards.length, unavailable, resolved, typed };
     } finally {
         priceRefreshRunning = false;
     }
@@ -3103,6 +3160,151 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
 });
 
 /**
+ * Check the copy counts against the photos that produced them.
+ *
+ * Quantity is the only number here no marketplace can verify, and the
+ * collection total is quantity × price — so a card photographed twice does not
+ * merely clutter the list, it overstates what the collection is worth. Every
+ * copy kept the thumbnail of the scan that created it, so the question is
+ * answerable from data the app already holds.
+ *
+ * Read-only. Deleting a copy someone owns is worse than leaving a duplicate, so
+ * this only reports; the correction is a separate, explicit call.
+ */
+app.get('/api/portfolio/photo-audit', requireAuth, async (req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT cc.id, cc.card_id, cc.condition, cc.created_at, cc.image_data,
+                   pc.card_name, pc.card_set, pc.card_number, pc.current_price
+            FROM card_copies cc
+            JOIN portfolio_cards pc ON pc.id = cc.card_id
+            WHERE pc.user_id = $1
+            ORDER BY cc.card_id ASC, cc.id ASC
+        `, [req.user.id]);
+
+        const byCard = new Map();
+        for (const row of rows) {
+            if (!byCard.has(row.card_id)) {
+                byCard.set(row.card_id, {
+                    card: {
+                        id: row.card_id, card_name: row.card_name, card_set: row.card_set,
+                        card_number: row.card_number, unit_price: Number(row.current_price) || 0,
+                    },
+                    copies: [],
+                });
+            }
+            byCard.get(row.card_id).copies.push(row);
+        }
+
+        const cards = [];
+        for (const { card, copies } of byCard.values()) {
+            // Only a card held more than once can have a miscount.
+            if (copies.length < 2) continue;
+
+            const hashed = [];
+            for (const copy of copies) {
+                const buffer = decodeDataUrl(copy.image_data);
+                hashed.push({
+                    id: copy.id,
+                    condition: copy.condition,
+                    created_at: copy.created_at,
+                    hash: buffer ? await perceptualHash(buffer, sharp) : null,
+                    // The thumbnail goes back with it so the two can be shown
+                    // side by side. A claim about someone's collection should be
+                    // checkable by looking, not taken on trust.
+                    image_data: copy.image_data || '',
+                });
+            }
+
+            const groups = groupLikelySamePhoto(hashed);
+            if (!groups.length) continue;
+
+            const summary = summariseCard(card, copies, groups);
+            summary.groups = groups.map(g => ({
+                ...g,
+                copies: g.ids.map(id => {
+                    const c = hashed.find(h => h.id === id);
+                    return { id, condition: c?.condition || 'Unknown', created_at: c?.created_at, image_data: c?.image_data || '' };
+                }),
+            }));
+            cards.push(summary);
+        }
+
+        cards.sort((a, b) => b.overstatedValue - a.overstatedValue);
+
+        res.json({
+            cards,
+            cardsAffected: cards.length,
+            duplicateCopies: cards.reduce((n, c) => n + c.duplicateCopies, 0),
+            overstatedValue: Number(cards.reduce((n, c) => n + c.overstatedValue, 0).toFixed(2)),
+            copiesWithoutPhotos: rows.filter(r => !r.image_data).length,
+            totalCopies: rows.length,
+        });
+    } catch (err) {
+        console.error('Photo audit error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Act on the audit: keep one copy from each group, remove the rest.
+ *
+ * Takes explicit copy ids rather than re-running the detection, so what is
+ * deleted is exactly what was shown on screen. A threshold that shifted between
+ * looking and confirming must not be able to delete something never seen.
+ */
+app.post('/api/portfolio/photo-audit/resolve', requireAuth, express.json(), async (req, res) => {
+    if (req.body?.confirm !== true) {
+        return res.status(400).json({ error: 'Refusing to remove copies without confirm:true' });
+    }
+    const removeIds = Array.isArray(req.body?.removeCopyIds)
+        ? req.body.removeCopyIds.map(Number).filter(Number.isInteger)
+        : [];
+    if (!removeIds.length) return res.json({ success: true, removed: 0 });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Ownership is resolved here, so another user's copy id cannot be
+        // smuggled in through the request body.
+        const owned = await client.query(`
+            SELECT cc.id, cc.card_id FROM card_copies cc
+            JOIN portfolio_cards pc ON pc.id = cc.card_id
+            WHERE cc.id = ANY($1::int[]) AND pc.user_id = $2
+        `, [removeIds, req.user.id]);
+        const ids = owned.rows.map(r => r.id);
+        const affectedCards = [...new Set(owned.rows.map(r => r.card_id))];
+
+        // A card must never be left with zero copies: that is a card Jack owns
+        // disappearing from the collection, which is worse than a wrong count.
+        for (const cardId of affectedCards) {
+            const total = await client.query('SELECT COUNT(*)::int AS c FROM card_copies WHERE card_id = $1', [cardId]);
+            const removing = owned.rows.filter(r => r.card_id === cardId).length;
+            if (removing >= total.rows[0].c) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'That would remove every copy of a card. At least one has to remain.',
+                    cardId,
+                });
+            }
+        }
+
+        const result = await client.query('DELETE FROM card_copies WHERE id = ANY($1::int[])', [ids]);
+        await client.query('COMMIT');
+
+        broadcast({ type: 'portfolio_updated' });
+        res.json({ success: true, removed: result.rowCount, cardsAffected: affectedCards.length });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Photo audit resolve error:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+/**
  * Report price-history points that were fabricated by the old backfill scripts
  * rather than observed. Read-only; purging is a separate confirmed action.
  */
@@ -3602,11 +3804,32 @@ app.get('/api/cron/refresh-prices', async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     try {
-        // Kick off the refresh asynchronously so we don't timeout the HTTP response
+        // Respects the schedule rather than forcing a refresh. On a host that
+        // sleeps when idle the in-process timer cannot fire, so this endpoint
+        // is also what keeps the service awake — and a pinger frequent enough
+        // to do that is far more frequent than prices need re-checking. Forcing
+        // every call would mean a full pass over the collection every ten
+        // minutes. `?force=1` is there for when you actually mean now.
+        const force = req.query.force === '1' || req.query.force === 'true';
+        const schedule = await refreshSchedule();
+
+        if (!force && !schedule.overdue) {
+            return res.json({
+                success: true, started: false, reason: 'not_due',
+                message: `Next refresh due ${schedule.nextRefreshAt}. Pass ?force=1 to run now.`,
+                nextRefreshAt: schedule.nextRefreshAt,
+            });
+        }
+        if (schedule.running) {
+            return res.json({ success: true, started: false, reason: 'already_running', message: 'A refresh is already in progress.' });
+        }
+
+        // Not awaited: a full pass takes minutes and the scheduler calling us
+        // should not be held open for it.
         refreshAllPrices()
             .then(() => setLastRefreshAt(Date.now()))
             .catch(err => console.error('[Cron] Refresh error:', err.message));
-        res.json({ success: true, message: "Background refresh started" });
+        res.json({ success: true, started: true, forced: force, message: 'Background refresh started' });
     } catch (err) {
         console.error('[Cron] Refresh error:', err.message);
         res.status(500).json({ error: err.message });

@@ -551,6 +551,107 @@ a { color: inherit; text-decoration: none; }
 .set-value { font-family: var(--font-display); font-size: 15px; font-weight: 650; letter-spacing: -0.025em; }
 .set-count { font-family: var(--font-mono); font-size: 11px; color: var(--text-3); margin-top: 1px; }
 
+/* ── TYPES ───────────────────────────────────────────────────── */
+
+.group-switch { align-self: flex-start; margin-bottom: 2px; }
+
+.type-chart { padding: 14px 16px 13px; border-radius: var(--r-lg); }
+.type-chart-label {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-3);
+  margin-bottom: 10px;
+}
+
+/* One proportional bar answers "what is this collection mostly made of?" in a
+   glance, which a column of numbers does not. Segments are flex-grown by count,
+   so the bar is the data rather than a decoration beside it. */
+.type-bar {
+  display: flex; height: 13px;
+  border-radius: var(--r-full);
+  overflow: hidden;
+  background: var(--surface-3);
+}
+.type-bar-seg { min-width: 3px; transition: flex-grow var(--t-med); }
+.type-bar-seg + .type-bar-seg { box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.35); }
+
+.type-legend {
+  display: flex; flex-wrap: wrap; gap: 5px 14px;
+  margin-top: 12px;
+}
+.type-legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.type-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.type-legend-name { color: var(--text-2); }
+.type-legend-count { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); font-weight: 550; }
+
+.type-chart-note { font-size: 11.5px; color: var(--text-3); margin-top: 11px; line-height: 1.5; }
+
+/* Stands in for the energy symbol at the size a list row allows. */
+.type-chip {
+  width: 34px; height: 34px; flex-shrink: 0;
+  border-radius: 50%;
+  display: grid; place-items: center;
+  color: #fff;
+  font-family: var(--font-display);
+  font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+  box-shadow: inset 0 -1px 2px rgba(0, 0, 0, 0.18);
+}
+
+/* ── COPY COUNT AUDIT ────────────────────────────────────────── */
+
+.audit-card { padding: 13px 0; border-bottom: 1px solid var(--border); }
+.audit-card:last-of-type { border-bottom: none; }
+.audit-card-name { font-size: 14px; font-weight: 600; }
+.audit-card-meta { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+
+/* The photos are the argument, so they get real size rather than a thumbnail
+   strip you would have to squint at to disagree with. */
+.audit-strip {
+  display: flex; gap: 8px;
+  margin-top: 11px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+}
+.audit-copy {
+  position: relative; flex-shrink: 0;
+  width: 78px;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.audit-copy img { width: 100%; aspect-ratio: 63/88; object-fit: cover; display: block; }
+.audit-copy-nophoto {
+  aspect-ratio: 63/88;
+  display: grid; place-items: center;
+  font-size: 10px; color: var(--text-3);
+}
+.audit-copy-cond {
+  display: block;
+  font-size: 9.5px; color: var(--text-3);
+  padding: 3px 4px;
+  text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Ticked means "remove". The kept one is marked, not the doomed ones, because
+   what survives is the thing worth being sure about. */
+.audit-copy.keep { border-color: var(--up); cursor: default; }
+.audit-copy input[type='checkbox'] {
+  position: absolute; top: 5px; right: 5px;
+  width: 17px; height: 17px;
+  accent-color: var(--ember);
+  cursor: pointer;
+}
+.audit-tag {
+  position: absolute; top: 5px; left: 5px;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--up); color: #fff;
+  padding: 2px 5px; border-radius: var(--r-full);
+}
+.audit-why { font-size: 11.5px; color: var(--text-3); margin-top: 7px; line-height: 1.5; }
+
 /* ── PILLS ───────────────────────────────────────────────────── */
 
 .pill {

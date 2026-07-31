@@ -354,6 +354,92 @@ if (!BASE || !chromium) {
     });
 
     /**
+     * Types is the second cut of the same collection. The arithmetic is the
+     * subtle part: a dual-type card counts under both types, so the per-type
+     * counts deliberately exceed the card count — and the view has to say so,
+     * or it reads as a bug.
+     */
+    test('the types view groups the collection and explains its own arithmetic', async () => {
+        const p = await browser.newPage();
+        const errors = [];
+        p.on('pageerror', (e) => errors.push(e.message));
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.card');
+        await p.click('.nav-item[data-view="sets"]');
+        await p.click('[data-group="types"]');
+        await p.waitForSelector('.type-chart');
+
+        assert.deepEqual(errors, []);
+        assert.equal(await p.textContent('#viewTitle'), 'Types', 'the heading follows the grouping');
+
+        const types = await p.$$eval('.set-group', (ns) => ns.map((n) => ({
+            name: n.querySelector('.set-name').textContent,
+            value: n.querySelector('.set-value').textContent,
+            meta: n.querySelector('.set-meta').textContent,
+            chip: n.querySelector('.type-chip')?.textContent || '',
+        })));
+        assert.ok(types.length > 0, 'types are listed');
+        assert.ok(types.every((t) => /^\$/.test(t.value)), 'every type shows a total');
+        assert.ok(types.every((t) => /^[A-Z]{2}$/.test(t.chip)), 'every type has its colour chip');
+
+        // Sorted by how many cards are held, most first.
+        const held = types.map((t) => Number(t.meta.match(/(\d+) cards? held/)?.[1] || 0));
+        assert.deepEqual(held, [...held].sort((a, b) => b - a));
+
+        // The bar is the data, not decoration: one segment per type.
+        const segments = await p.$$eval('.type-bar-seg', (ns) => ns.map((n) => Number(n.style.flexGrow)));
+        assert.equal(segments.length, types.length);
+        assert.deepEqual(segments, held, 'each segment is grown by that type\'s card count');
+
+        const note = await p.textContent('.type-chart-note');
+        const totalHeld = held.reduce((a, b) => a + b, 0);
+        const cardCount = Number(note.match(/(\d+) cards?/)?.[1] || 0);
+        if (totalHeld > cardCount) {
+            assert.match(note, /dual-type/i,
+                'when the counts exceed the card count, the view must say why');
+        }
+        await p.close();
+    });
+
+    test('a type expands in place, like a set', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.card');
+        await p.click('.nav-item[data-view="sets"]');
+        await p.click('[data-group="types"]');
+        await p.waitForSelector('.set-group');
+
+        assert.ok(await p.$eval('.set-group .set-cards', (n) => n.hidden), 'types start closed');
+        const before = await p.$eval('.set-group', (n) => Math.round(n.getBoundingClientRect().top));
+
+        await p.click('.set-group .set');
+        await p.waitForTimeout(350);
+
+        assert.ok(await p.$eval('#view-sets', (n) => n.classList.contains('active')), 'still on the same view');
+        assert.ok(await p.$eval('.set-group .set-cards', (n) => !n.hidden), 'the type opened');
+        assert.ok(await p.$eval('.set-group .set-cards .card, .set-group .set-cards .row', (n) => !!n),
+            'and shows its cards');
+        assert.equal(await p.$eval('.set-group', (n) => Math.round(n.getBoundingClientRect().top)), before,
+            'the header you tapped did not move');
+        await p.close();
+    });
+
+    test('the grouping choice survives a reload', async () => {
+        const p = await browser.newPage();
+        await p.goto(BASE, { waitUntil: 'networkidle' });
+        await p.waitForSelector('.card');
+        await p.click('.nav-item[data-view="sets"]');
+        await p.click('[data-group="types"]');
+        await p.waitForSelector('.type-chart');
+
+        await p.reload({ waitUntil: 'networkidle' });
+        await p.click('.nav-item[data-view="sets"]');
+        await p.waitForTimeout(300);
+        assert.ok(await p.$('.type-chart'), 'it came back on Types, not Sets');
+        await p.close();
+    });
+
+    /**
      * The scan panel must only ever report work the server said it did. This
      * feeds it synthetic progress events and checks each one becomes a line.
      */

@@ -167,7 +167,14 @@
     </section>
 
     <!-- ── SETS ── -->
+    <!-- Two ways of cutting the same collection. Sets is how the cards were
+         sold; types is how they play — and how a collector actually thinks
+         about what they have a lot of. -->
     <section class="view" id="view-sets">
+      <div class="segmented group-switch" role="group" aria-label="Group by">
+        <button data-group="sets" class="active">Sets</button>
+        <button data-group="types">Types</button>
+      </div>
       <div id="setsBody"></div>
     </section>
 
@@ -211,6 +218,13 @@
             <div class="setting-desc">Re-checks every card against the market APIs. Takes a while for a large collection.</div>
           </div>
           <button class="btn btn-glass btn-sm" id="settingsRefreshBtn">Refresh</button>
+        </div>
+        <div class="setting">
+          <div class="setting-body">
+            <div class="setting-title">Check copy counts</div>
+            <div class="setting-desc">Every copy kept the photo that added it. This compares them and flags copies that look like one card photographed twice — the only number here no marketplace can check, and the one that multiplies the collection total.</div>
+          </div>
+          <button class="btn btn-glass btn-sm" id="photoAuditBtn">Check</button>
         </div>
         <div class="setting">
           <div class="setting-body">
@@ -516,6 +530,21 @@
   <div class="modal-foot">
     <button class="btn btn-quiet" data-close-modal>Close</button>
     <button class="btn btn-primary" id="auditPurgeBtn" disabled>Delete invented points</button>
+  </div>
+</div>
+
+<!-- ── COPY COUNT MODAL ────────────────────────────────────────
+     Shows the photos side by side. A claim about how many cards someone owns
+     should be checkable by looking, not taken on trust. -->
+<div class="modal glass glass-lg" id="photoAuditModal" aria-hidden="true">
+  <div class="modal-head">
+    <h3>Copies that look like the same card</h3>
+    <p id="photoAuditIntro">Comparing every copy against the photo that added it…</p>
+  </div>
+  <div class="modal-body" id="photoAuditBody"></div>
+  <div class="modal-foot">
+    <button class="btn btn-quiet" data-close-modal>Close</button>
+    <button class="btn btn-primary" id="photoAuditApplyBtn" disabled>Remove selected</button>
   </div>
 </div>
 

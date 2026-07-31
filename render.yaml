@@ -1,13 +1,76 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# The database is deliberately NOT declared here. Render's own free Postgres
+# expires 30 days after creation and is then deleted, which is not a place to
+# keep a collection. DATABASE_URL points at Neon instead, whose free tier does
+# not expire.
+#
+# Free-tier behaviour worth knowing before relying on it:
+#
+#   * The service spins down after 15 minutes without traffic and takes about a
+#     minute to wake. The in-process scheduler cannot fire while it is asleep,
+#     so the daily re-price has to be driven from outside — see CRON_SECRET.
+#   * 750 instance-hours a month is 31.25 days, so one service can stay up
+#     continuously and still fit inside the free allowance.
+
 services:
   - type: web
-    name: jackspokemonpacks
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
+    name: jackspokemon
+    runtime: node
+    plan: free
+    # Match this to the Neon region. Every page load makes several queries and
+    # each one pays the round trip, so a cross-country hop is felt.
+    region: oregon
+    branch: main
+    autoDeploy: true
+
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+
+    # Cheap, unauthenticated, and touches no external API — so health checks
+    # never burn Pokémon TCG rate limit or Gemini quota.
+    healthCheckPath: /api/version
+
     envVars:
+      - key: NODE_VERSION
+        value: "22"
+
+      # ── Required ────────────────────────────────────────────────
+      # Neon connection string. Use the POOLED endpoint (…-pooler.…): the app
+      # opens a pg Pool, and Neon's direct endpoint allows far fewer concurrent
+      # connections than the pooled one.
       - key: DATABASE_URL
         sync: false
+      # Signs the auth cookie. Generated fresh here on purpose — the value in
+      # this repo's git history is compromised and must not be reused.
       - key: JWT_SECRET
-        sync: false
+        generateValue: true
+
+      # ── Card recognition ────────────────────────────────────────
+      # Rotate before use; the old value is in git history.
       - key: GEMINI_API_KEY
         sync: false
+
+      # ── Price sources ───────────────────────────────────────────
+      # Raises the Pokémon TCG API rate limit to a usable tier. Without it the
+      # refresh has to pace itself down to about 24 cards a minute.
+      - key: POKEMON_TCG_KEY
+        sync: false
+      - key: SCRYDEX_API_KEY
+        sync: false
+      - key: SCRYDEX_TEAM_ID
+        sync: false
+      - key: JUSTTCG_API_KEY
+        sync: false
+
+      # ── Scheduling ──────────────────────────────────────────────
+      # Shared secret for GET /api/cron/refresh-prices. Point a free external
+      # scheduler (cron-job.org, or a GitHub Actions cron) at that endpoint with
+      # `Authorization: Bearer <this value>`. One request every 10 minutes both
+      # keeps the service awake and drives the re-price, so a single mechanism
+      # covers the two things the free tier cannot do for itself.
+      - key: CRON_SECRET
+        generateValue: true
+
+      - key: PRICE_REFRESH_DAYS
+        value: "1"

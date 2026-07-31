@@ -482,6 +482,99 @@ if (!DB) {
     });
 
     /**
+     * Quantity is the only number here no marketplace can check, and value is
+     * quantity × price — so a card photographed twice inflates the total. These
+     * cover both halves: finding it, and the guards on acting.
+     */
+    test('the photo audit finds copies that are one card shot twice, and leaves the rest', async () => {
+        const sharp = (await import('sharp')).default;
+        const make = async (bg, panel, top = 40) => sharp({ create: { width: 240, height: 336, channels: 3, background: bg } })
+            .composite([{ input: await sharp({ create: { width: 160, height: 120, channels: 3, background: panel } }).png().toBuffer(), top, left: 40 }])
+            .jpeg().toBuffer();
+        const url = (buf) => `data:image/jpeg;base64,${buf.toString('base64')}`;
+
+        const id = await seedLegacyCard({ card_name: 'Audit Zard', card_number: '4/102', current_price: 100 });
+        await pool.query("UPDATE portfolio_cards SET variant_key = 'audit zard|base set|4|holo|english|unl' WHERE id = $1", [id]);
+
+        const original = await make({ r: 210, g: 70, b: 40 }, { r: 250, g: 200, b: 60 });
+        // Three photos of one card: shifted, dimmed, recompressed.
+        for (let i = 0; i < 3; i++) {
+            const shot = await sharp(original)
+                .extract({ left: 2 + i, top: 3 + i, width: 234 - i * 2, height: 328 - i * 2 })
+                .resize(240, 336).modulate({ brightness: 1 - i * 0.03 }).jpeg({ quality: 74 }).toBuffer();
+            await pool.query('INSERT INTO card_copies (card_id, condition, image_data) VALUES ($1, $2, $3)',
+                [id, 'Near Mint', url(shot)]);
+        }
+        // A genuinely different second copy.
+        const other = await make({ r: 140, g: 60, b: 150 }, { r: 60, g: 230, b: 190 }, 190);
+        await pool.query('INSERT INTO card_copies (card_id, condition, image_data) VALUES ($1, $2, $3)',
+            [id, 'Lightly Played', url(other)]);
+        // And one with no photo, which carries no evidence either way.
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Unknown']);
+
+        const { status, body } = await api('/api/portfolio/photo-audit');
+        assert.equal(status, 200);
+
+        const card = body.cards.find(c => c.card_id === id);
+        assert.ok(card, 'the card is reported');
+        assert.equal(card.quantity, 5, 'five copies are recorded');
+        assert.equal(card.duplicateCopies, 2, 'three photos of one card means two are surplus');
+        assert.equal(card.suggestedQuantity, 3, 'one from the group, plus the different one, plus the unphotographed one');
+        assert.equal(card.overstatedValue, 200, '2 surplus × $100');
+
+        assert.equal(card.groups.length, 1, 'exactly one suspected group');
+        assert.equal(card.groups[0].size, 3);
+        assert.ok(card.groups[0].sameBatch, 'seeded together, so one batch');
+        assert.ok(card.groups[0].copies.every(c => c.image_data),
+            'each copy comes back with its photo so the claim can be checked by looking');
+    });
+
+    test('the audit refuses to remove copies without confirmation', async () => {
+        const res = await api('/api/portfolio/photo-audit/resolve', {
+            method: 'POST', body: JSON.stringify({ removeCopyIds: [1, 2] }),
+        });
+        assert.equal(res.status, 400);
+        assert.match(res.body.error, /confirm/i);
+    });
+
+    /**
+     * The one outcome worse than a wrong count: a card Jack owns disappearing
+     * from the collection entirely.
+     */
+    test('the audit will not remove every copy of a card', async () => {
+        const id = await seedLegacyCard({ card_name: 'Last Copy', card_number: '1/102', current_price: 5 });
+        const a = await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2) RETURNING id', [id, 'Near Mint']);
+        const b = await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2) RETURNING id', [id, 'Near Mint']);
+
+        const res = await api('/api/portfolio/photo-audit/resolve', {
+            method: 'POST',
+            body: JSON.stringify({ confirm: true, removeCopyIds: [a.rows[0].id, b.rows[0].id] }),
+        });
+        assert.equal(res.status, 400);
+        assert.match(res.body.error, /every copy/i);
+
+        const left = await pool.query('SELECT COUNT(*)::int c FROM card_copies WHERE card_id = $1', [id]);
+        assert.equal(left.rows[0].c, 2, 'and nothing was removed');
+    });
+
+    test('the audit removes exactly the copies it was given', async () => {
+        const id = await seedLegacyCard({ card_name: 'Trim Me', card_number: '9/102', current_price: 5 });
+        const ids = [];
+        for (let i = 0; i < 3; i++) {
+            const r = await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2) RETURNING id', [id, 'Near Mint']);
+            ids.push(r.rows[0].id);
+        }
+        const res = await api('/api/portfolio/photo-audit/resolve', {
+            method: 'POST', body: JSON.stringify({ confirm: true, removeCopyIds: ids.slice(1) }),
+        });
+        assert.equal(res.status, 200);
+        assert.equal(res.body.removed, 2);
+
+        const left = await pool.query('SELECT id FROM card_copies WHERE card_id = $1', [id]);
+        assert.deepEqual(left.rows.map(r => r.id), [ids[0]], 'the one it was told to keep is the one that remains');
+    });
+
+    /**
      * A 403 from an egress rule and a 403 from an API mean opposite things:
      * one is fixed by an allowlist, the other by a new key. Reporting the wrong
      * one sends you off rotating a credential that was working fine.

@@ -1,7 +1,7 @@
 {
     "name": "jackspokemonpacks",
     "version": "2.0.0",
-    "description": "Jack's Pokemon Collection — scan, price and track Pokemon cards",
+    "description": "Jack's Pokémon Collection — scan, price and track Pokémon cards",
     "main": "server.js",
     "type": "module",
     "scripts": {
@@ -13,7 +13,6 @@
         "@google/generative-ai": "^0.21.0",
         "axios": "^1.18.1",
         "bcrypt": "^6.0.0",
-        "better-sqlite3": "^11.0.0",
         "cookie-parser": "^1.4.7",
         "dotenv": "^16.4.0",
         "express": "^4.21.0",
@@ -21,5 +20,8 @@
         "multer": "^2.1.1",
         "pg": "^8.20.0",
         "sharp": "^0.34.5"
+    },
+    "engines": {
+        "node": ">=20 <23"
     }
 }

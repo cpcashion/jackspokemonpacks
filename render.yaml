@@ -63,6 +63,16 @@ services:
       - key: JUSTTCG_API_KEY
         sync: false
 
+      # eBay OAuth credentials — the only source that reports what buyers are
+      # doing rather than a catalogue price. Production App ID and Cert ID from
+      # https://developer.ebay.com.
+      - key: EBAY_APP_ID
+        sync: false
+      - key: EBAY_CERT_ID
+        sync: false
+      - key: EBAY_MARKETPLACE
+        value: EBAY_US
+
       # ── Scheduling ──────────────────────────────────────────────
       # Shared secret for GET /api/cron/refresh-prices. Point a free external
       # scheduler (cron-job.org, or a GitHub Actions cron) at that endpoint with

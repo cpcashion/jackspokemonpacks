@@ -48,6 +48,7 @@ import {
 } from './lib/identity.js';
 import { auditHistoryRows } from './lib/history.js';
 import { typesFromCard, serializeTypes } from './lib/types.js';
+import { buildSearchQuery, compsFromListings } from './lib/ebay-comps.js';
 import {
     perceptualHash,
     decodeDataUrl,
@@ -78,6 +79,11 @@ const POKEMON_TCG_KEY = process.env.POKEMON_TCG_KEY || process.env.POKEMON_TCG_A
 const SCRYDEX_API_KEY = process.env.SCRYDEX_API_KEY || '';
 const SCRYDEX_TEAM_ID = process.env.SCRYDEX_TEAM_ID || '';
 const JUSTTCG_API_KEY = process.env.JUSTTCG_API_KEY || '';
+// eBay. App ID and Cert ID from https://developer.ebay.com — these are the
+// OAuth client credentials, not an API key; the app exchanges them for a token.
+const EBAY_APP_ID = process.env.EBAY_APP_ID || process.env.EBAY_CLIENT_ID || '';
+const EBAY_CERT_ID = process.env.EBAY_CERT_ID || process.env.EBAY_CLIENT_SECRET || '';
+const EBAY_MARKETPLACE = process.env.EBAY_MARKETPLACE || 'EBAY_US';
 
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE
@@ -1876,6 +1882,167 @@ async function fetchJustTCGPrice(cardName, cardSet, cardNumber) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  EBAY — where these cards actually change hands
+//
+//  Every other source here reports a catalogue price. eBay reports what people
+//  are doing. That makes it the most valuable signal available and also the
+//  most dangerous: the results for one card mix graded slabs, bulk lots,
+//  proxies, sealed product and other languages, and averaging them produces a
+//  number with no meaning. lib/ebay-comps.js does the filtering; this part
+//  only fetches.
+//
+//  Sold prices are not obtainable. eBay's Marketplace Insights API is the sole
+//  first-party source of completed sales and is a Limited Release closed to new
+//  applicants; the Finding API's findCompletedItems was decommissioned in
+//  February 2025. What the Browse API does give is live auctions with bids on
+//  them, which are real buyers committing real money — the closest thing to
+//  sold data we can legitimately reach.
+// ═══════════════════════════════════════════════════════════════
+
+let ebayToken = { value: '', expiresAt: 0 };
+
+/**
+ * Client-credentials token, cached until shortly before it expires.
+ *
+ * eBay tokens last two hours and minting one costs a round trip, so a refresh
+ * over a large collection would otherwise spend a meaningful fraction of its
+ * time re-authenticating.
+ */
+async function ebayAccessToken() {
+    if (!EBAY_APP_ID || !EBAY_CERT_ID) return null;
+    if (ebayToken.value && Date.now() < ebayToken.expiresAt) return ebayToken.value;
+
+    const basic = Buffer.from(`${EBAY_APP_ID}:${EBAY_CERT_ID}`).toString('base64');
+    const resp = await axios.post(
+        'https://api.ebay.com/identity/v1/oauth2/token',
+        'grant_type=client_credentials&scope=' + encodeURIComponent('https://api.ebay.com/oauth/api_scope'),
+        {
+            headers: {
+                Authorization: `Basic ${basic}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            timeout: 12000,
+        },
+    );
+
+    const expiresIn = Number(resp.data?.expires_in) || 7200;
+    ebayToken = {
+        value: resp.data?.access_token || '',
+        // A minute of headroom, so a token cannot expire mid-refresh.
+        expiresAt: Date.now() + (expiresIn - 60) * 1000,
+    };
+    noteSource('ebay', { ok: true, message: 'Authenticated' });
+    return ebayToken.value;
+}
+
+/**
+ * Live listings for one card: both Buy-It-Now and auctions.
+ *
+ * eBay returns only fixed-price listings unless auctions are asked for
+ * explicitly, and auctions are the half we care about most — so both are
+ * fetched and merged.
+ */
+async function fetchEbayListings(card) {
+    const token = await ebayAccessToken();
+    if (!token) return null;
+
+    const q = buildSearchQuery({
+        name: card.card_name_en || card.card_name,
+        number: normalizeCardNumber(card.card_number),
+        printedTotal: printedSetTotal(card.card_number),
+        language: normalizeLanguage(card.language),
+        isFirstEdition: isTruthy(card.is_first_edition),
+    });
+    if (!q) return null;
+
+    const headers = {
+        Authorization: `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE,
+        Accept: 'application/json',
+    };
+    // 183454 is Trading Card Singles. Constraining the category removes most of
+    // the sealed product and merchandise before the title filters have to.
+    const base = {
+        q,
+        category_ids: '183454',
+        limit: 100,
+        filter: 'conditionIds:{4000|3000|2750|1000|1500|2000|2500|5000|6000}',
+    };
+
+    const [fixed, auctions] = await Promise.allSettled([
+        axios.get('https://api.ebay.com/buy/browse/v1/item_summary/search', { params: base, headers, timeout: 15000 }),
+        axios.get('https://api.ebay.com/buy/browse/v1/item_summary/search', {
+            params: { ...base, filter: 'buyingOptions:{AUCTION}' }, headers, timeout: 15000,
+        }),
+    ]);
+
+    const listings = [];
+    for (const r of [fixed, auctions]) {
+        if (r.status === 'fulfilled') listings.push(...(r.value.data?.itemSummaries || []));
+    }
+    if (fixed.status === 'rejected' && auctions.status === 'rejected') throw fixed.reason;
+
+    noteSource('ebay', { ok: true, message: `${listings.length} listings` });
+    // The same item can appear in both responses.
+    const unique = new Map();
+    for (const item of listings) if (item?.itemId) unique.set(item.itemId, item);
+    return [...unique.values()];
+}
+
+/**
+ * eBay's contribution to a card's price, as quotes the aggregator understands.
+ *
+ * The condition of the copy is deliberately NOT passed in. eBay comps describe
+ * the printing, and lib/identity.js discounts each copy for its own condition
+ * afterwards — applying both would discount twice.
+ */
+async function collectEbayQuotes(card) {
+    let listings;
+    try {
+        listings = await fetchEbayListings(card);
+    } catch (err) {
+        const failure = describeAxiosError(err, { usesKey: true });
+        noteSource('ebay', failure);
+        throw new SourceUnavailable(failure);
+    }
+    if (!listings) return [];
+
+    const result = compsFromListings(listings, {
+        name: card.card_name_en || card.card_name,
+        number: normalizeCardNumber(card.card_number),
+        printedTotal: printedSetTotal(card.card_number),
+        language: normalizeLanguage(card.language),
+        isFirstEdition: isTruthy(card.is_first_edition),
+        // Graded slabs trade in a separate market; only match like with like.
+        graded: Boolean(card.graded),
+        grade: card.grade || null,
+    });
+
+    lastEbayWorkings.set(buildVariantKey(card), result);
+    if (!result.estimate) return [];
+
+    return [{
+        price: result.estimate.price,
+        currency: 'USD',
+        marketplace: 'ebay',
+        source: `ebay_${result.estimate.basis.replace(/\s+/g, '_')}`,
+        variant: '',
+        // A bid is a buyer committing to this exact card, which is a stronger
+        // claim about the printing than a catalogue lookup makes.
+        variantMatched: result.estimate.basis === 'auction bids',
+        basis: result.estimate.basis === 'auction bids' ? 'market' : 'listings',
+        url: '',
+        samples: result.estimate.samples,
+    }];
+}
+
+/** The last comp breakdown per card, so the UI can show the workings. */
+const lastEbayWorkings = new Map();
+export function ebayWorkingsFor(card) {
+    return lastEbayWorkings.get(buildVariantKey(card)) || null;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  PRICE RESOLUTION
 //
 //  Every source below is queried in parallel and returns "quotes". A quote is
@@ -1943,6 +2110,7 @@ const PRICE_SOURCE_LABELS = {
     tcgdex: 'TCGdex',
     scrydex: 'Scrydex',
     justtcg: 'JustTCG',
+    ebay: 'eBay (live listings and bids)',
 };
 
 /**
@@ -1985,6 +2153,12 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
             run: () => collectPokemonTcgQuotes(card, ctx),
         },
         { name: 'tcgdex', configured: true, run: () => collectTcgdexQuotes(card, ctx) },
+        {
+            name: 'ebay',
+            configured: Boolean(EBAY_APP_ID && EBAY_CERT_ID),
+            reason: 'no eBay credentials — set EBAY_APP_ID and EBAY_CERT_ID',
+            run: () => collectEbayQuotes(card),
+        },
         {
             name: 'scrydex',
             configured: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID) && !nonEnglish,
@@ -2632,6 +2806,18 @@ app.get('/api/diagnostics', requireAuth, async (req, res) => {
             });
             return `${(r.data?.data || []).length} results`;
         }, 'Check SCRYDEX_API_KEY and SCRYDEX_TEAM_ID'));
+    }
+    if (EBAY_APP_ID && EBAY_CERT_ID) {
+        checks.push(await probe('ebay', 'Live market (eBay)', async () => {
+            const token = await ebayAccessToken();
+            if (!token) throw new Error('Credentials were rejected');
+            const r = await axios.get('https://api.ebay.com/buy/browse/v1/item_summary/search', {
+                params: { q: 'pokemon charizard 4/102', category_ids: '183454', limit: 5 },
+                headers: { Authorization: `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': EBAY_MARKETPLACE },
+                timeout: 12000,
+            });
+            return `${r.data?.total ?? 0} listings found for a test card`;
+        }, 'Check EBAY_APP_ID and EBAY_CERT_ID are the PRODUCTION keyset, not sandbox'));
     }
     if (JUSTTCG_API_KEY) {
         checks.push(await probe('justtcg', 'Card prices (JustTCG)', async () => {
@@ -3372,6 +3558,13 @@ app.get('/api/health', requireAuth, async (req, res) => {
                 { name: 'TCGdex', live: true, detail: 'free, no key needed', key: null },
                 { name: 'Scrydex', live: Boolean(SCRYDEX_API_KEY && SCRYDEX_TEAM_ID), detail: 'needs SCRYDEX_API_KEY + SCRYDEX_TEAM_ID', key: 'SCRYDEX_API_KEY' },
                 { name: 'JustTCG', live: Boolean(JUSTTCG_API_KEY), detail: 'needs JUSTTCG_API_KEY', key: 'JUSTTCG_API_KEY' },
+                {
+                    name: 'eBay live market', live: Boolean(EBAY_APP_ID && EBAY_CERT_ID),
+                    detail: EBAY_APP_ID && EBAY_CERT_ID
+                        ? 'live listings and auction bids'
+                        : 'needs EBAY_APP_ID + EBAY_CERT_ID — the only source that sees what buyers are doing',
+                    key: 'EBAY_APP_ID',
+                },
             ],
             schedule,
             cards: {

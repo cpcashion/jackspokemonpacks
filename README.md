@@ -22,6 +22,7 @@ app with the scanner one tap away.
 | `DATABASE_URL` | yes | Postgres connection string (`POSTGRES_URL` also accepted) |
 | `GEMINI_API_KEY` | yes | Card identification from photos. Without it, scanning is disabled |
 | `POKEMON_TCG_KEY` | recommended | Raises the Pokémon TCG API rate limit. Works without a key, slower |
+| `EBAY_APP_ID` + `EBAY_CERT_ID` | recommended | Live listings and auction bids — the only source that sees what buyers are doing |
 | `SCRYDEX_API_KEY` + `SCRYDEX_TEAM_ID` | optional | An extra price source |
 | `JUSTTCG_API_KEY` | optional | An extra price source |
 | `PRICE_REFRESH_DAYS` | no | How often every card is re-checked. Defaults to 1 (daily) |
@@ -84,6 +85,38 @@ Settings → **Price tracking status** shows which sources are live, when prices
 last refreshed, when the next refresh is due, and how many cards carry a
 verified price.
 
+## eBay, and what "sold price" actually means here
+
+Every other source reports a catalogue figure. eBay reports what people are
+doing, which makes it the most valuable signal and also the easiest to get
+wrong: a search for one card returns graded slabs, bulk lots, proxies, sealed
+product and other languages alongside the card itself, and averaging that
+produces a number with no meaning.
+
+So `lib/ebay-comps.js` throws most of it away. A listing has to name the card
+*and* its number, be raw when the copy is raw and graded to the same grade when
+it is not, match on language and on 1st Edition, and not be a lot, a proxy, or
+sealed product. The rejections are counted and reported — "48 listings, 41
+rejected as graded slabs" is itself a true thing about that card's market.
+
+**Completed sales are not available.** eBay's Marketplace Insights API is the
+sole first-party source of sold data and is a Limited Release closed to new
+applicants; the Finding API's `findCompletedItems` was decommissioned in
+February 2025. Anyone claiming to read eBay sold comps through the public API is
+scraping. What the Browse API does expose is two different things, and the app
+keeps them apart:
+
+1. **Live auctions carrying bids.** A bid is a buyer committing real money —
+   revealed willingness to pay rather than a seller's hope. This is the closest
+   thing to sold data obtainable legitimately, and when bids exist they decide
+   the number.
+2. **Buy-It-Now asking prices.** Sellers list above what cards clear at, so the
+   middle of that distribution is systematically high. The app takes the 30th
+   percentile, and only when there are no bids to go on.
+
+Each price records which of the two it came from, so the number on screen can
+say whether it rests on buyers or on sellers.
+
 ## How pricing works
 
 The AI identifies the card. It never prices it — asked for a dollar value a
@@ -96,7 +129,10 @@ For each card:
    its marketplace, currency, and which printing it describes.
 2. Quotes are converted to USD. EUR Cardmarket prices are never compared with
    USD TCGplayer prices as though both were dollars.
-3. TCGplayer (the US market) wins when present; Cardmarket is the fallback.
+3. TCGplayer and eBay both describe the US market and are used together;
+   Cardmarket is the fallback when neither has a quote. A catalogue price and
+   live eBay bids agreeing is the strongest corroboration available, and
+   confidence rises accordingly.
 4. Within that, quotes matching the card's actual printing — holo, reverse
    holo, 1st edition, plain — beat quotes that do not. When the printing has to
    be guessed, the *cheapest* variant is used, never the dearest.
@@ -105,6 +141,10 @@ For each card:
 
 Every card records its confidence, the marketplace and variant used, the spread
 across sources, and each individual quote. Open a card to see all of it.
+
+Two things lower confidence rather than being hidden: a printing worked out from
+the card's rarity because the foil was not readable in the photo, and a price
+quoted off current listings because nothing has sold recently.
 
 Quotes are Near Mint. Each copy you own is discounted for its own condition
 (LP 85%, MP 70%, HP 50%, Damaged 35%), so three played copies are not valued as

@@ -210,7 +210,7 @@ document.querySelectorAll('[data-theme-set]').forEach((b) => {
 
 // ── NAVIGATION ───────────────────────────────────────────────────
 
-const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Identifying', settings: 'Settings' };
+const VIEW_TITLES = { collection: 'Collection', sets: 'Sets', review: 'Unpriced', settings: 'Settings' };
 
 /** The Sets tab shows two different groupings, so the heading follows suit. */
 function viewTitle(name) {
@@ -284,9 +284,21 @@ document.querySelectorAll('[data-sort]').forEach((b) => {
   });
 });
 
+/**
+ * A card the app has not managed to put a number on.
+ *
+ * Deliberately about the price and not about `needs_review`: an unconfirmed
+ * printing is priced as an estimate now, and an estimate is a value like any
+ * other. Only a card no marketplace would quote is actually still outstanding —
+ * and even that is waiting on a marketplace, not on the person holding it.
+ */
+function awaitingPrice(card) {
+  return !(Number(card.unit_price) > 0);
+}
+
 function visibleCards() {
   const q = state.query;
-  let cards = state.cards.filter((c) => (state.view === 'review' ? c.needs_review : !c.needs_review));
+  let cards = state.cards.filter((c) => (state.view === 'review' ? awaitingPrice(c) : !awaitingPrice(c)));
 
   if (q) {
     cards = cards.filter((c) =>
@@ -315,10 +327,11 @@ function render() {
 }
 
 function renderCounts() {
-  const reviewCount = state.cards.filter((c) => c.needs_review).length;
+  const reviewCount = state.cards.filter(awaitingPrice).length;
   $('navCollectionCount').textContent = state.stats.totalCopies ?? 0;
 
-  const setCount = new Set(state.cards.filter(c => !c.needs_review).map(c => c.card_set || 'Unknown set')).size;
+  // Counts what the Sets view actually lists, which is every set held.
+  const setCount = new Set(state.cards.map(c => c.card_set || 'Unknown set')).size;
   const navSets = $('navSetsCount');
   if (navSets) navSets.textContent = setCount;
 
@@ -479,8 +492,11 @@ function renderHero() {
     [String(s.totalCards || 0), 'unique', false],
     [String(s.duplicateCards || 0), 'duplicated', false],
   ];
+  // Not flagged as a problem: an estimate is a value, and this only says how
+  // much of the total above rests on one. `needsReview` is dropped — it counted
+  // the same cards as `unpriced` and reading it twice implied a queue of work.
+  if (s.estimatedCards) items.push([String(s.estimatedCards), 'estimated', false]);
   if (s.unpricedCopies) items.push([String(s.unpricedCopies), 'unpriced', true]);
-  if (s.needsReview) items.push([String(s.needsReview), 'to review', true]);
 
   for (const [value, label, alert] of items) {
     const fact = el('div', `hero-fact${alert ? ' alert' : ''}`);
@@ -702,7 +718,6 @@ function gridOf(cards) {
     // holo, so a "Holo" badge on all of them says nothing and just adds noise —
     // the printing is on the card's detail sheet where it matters.
     const flags = el('div', 'card-flags');
-    if (card.needs_review) flags.appendChild(el('span', 'flag flag-review', 'Identifying'));
     if (card.is_first_edition) flags.appendChild(el('span', 'flag flag-1st', '1st Ed'));
     // Language earns a badge precisely because it changes what a card is worth:
     // a Japanese Charizard and an English one are different cards in different
@@ -728,9 +743,18 @@ function gridOf(cards) {
     const priceRow = el('div', 'card-price-row');
     if (card.unit_price > 0) {
       priceRow.append(el('span', 'card-price', money(card.total_value)));
+      // An estimate shows its number and says so in the same breath. The tile
+      // used to show "Identifying…" here for any card whose printing was
+      // unconfirmed, which read as work in progress for something that was
+      // never going to progress on its own.
+      if (card.price_tier === 'estimated') {
+        const badge = el('span', 'card-est', 'est.');
+        badge.title = card.price_explanation || 'Estimated — the exact printing could not be confirmed.';
+        priceRow.append(badge);
+      }
       priceRow.append(el('span', `card-delta ${trendClass(change)}`, trendText(change)));
     } else {
-      priceRow.append(el('span', 'card-price unpriced', card.needs_review ? 'Identifying…' : 'No price found'));
+      priceRow.append(el('span', 'card-price unpriced', 'No price found'));
     }
     body.appendChild(priceRow);
 
@@ -762,7 +786,7 @@ function listOf(cards) {
     const nameCell = el('div');
     nameCell.append(el('div', 'row-name', card.card_name || 'Unknown'));
     const bits = [card.card_number, card.rarity].filter(Boolean).join(' · ');
-    nameCell.append(el('div', 'row-sub', card.needs_review ? 'Needs review' : bits || '—'));
+    nameCell.append(el('div', 'row-sub', bits || '—'));
     row.appendChild(nameCell);
 
     row.appendChild(el('div', 'row-set', card.card_set || '—'));
@@ -794,8 +818,10 @@ function renderSets() {
   host.innerHTML = '';
 
   const groups = new Map();
+  // Every card Jack owns is in its set, priced or not. Filtering by price here
+  // made the per-set counts disagree with the collection — a set of twelve
+  // showing eleven because one had no marketplace listing yet.
   for (const card of state.cards) {
-    if (card.needs_review) continue;
     const name = card.card_set || 'Unknown set';
     if (!groups.has(name)) groups.set(name, { name, cards: [], copies: 0, value: 0 });
     const g = groups.get(name);
@@ -924,8 +950,9 @@ function renderTypes() {
   let untyped = 0;
   let totalCards = 0;
 
+  // Unpriced cards included, for the same reason as the sets view: this is a
+  // count of what is held, and a card with no listing is still held.
   for (const card of state.cards) {
-    if (card.needs_review) continue;
     totalCards++;
     const types = String(card.types || '').split(',').map(t => t.trim()).filter(Boolean);
     if (!types.length) { untyped++; continue; }
@@ -1158,8 +1185,10 @@ function renderSheetBody() {
   const hero = el('div', 'sheet-hero');
   hero.appendChild(cardArt(card, 'sheet-art'));
 
+  const estimated = card.price_tier === 'estimated';
   const figures = el('div', 'sheet-figures');
-  figures.append(el('div', 'figure-label', card.quantity > 1 ? `${card.quantity} copies worth` : 'Market value'));
+  figures.append(el('div', 'figure-label',
+    card.quantity > 1 ? `${card.quantity} copies worth` : (estimated ? 'Estimated value' : 'Market value')));
   figures.append(el('div', 'figure-value', card.unit_price > 0 ? money(card.total_value) : '—'));
 
   if (card.unit_price > 0 && card.quantity > 1) {
@@ -1167,13 +1196,18 @@ function renderSheetBody() {
   } else if (card.unit_price > 0) {
     figures.append(el('div', 'figure-note', `${money(card.unit_price)} Near Mint · adjusted for condition`));
   } else {
-    figures.append(el('div', 'figure-note', card.needs_review
-      ? 'Not priced yet — the exact printing has not been pinned down, and a price we cannot attach to a printing would be another card\'s price. The app retries this on every refresh; you can also correct the number or set to settle it now.'
-      : card.is_non_english
-        // Being explicit matters here: the absence of a price is a deliberate
-        // choice, not a bug. English marketplaces quote English printings.
-        ? `No marketplace quotes a price for ${card.language_label} printings of this card. English prices are not shown as a stand-in, because they are not this card's price.`
-        : 'No market data found for this printing.'));
+    figures.append(el('div', 'figure-note', card.is_non_english
+      // Being explicit matters here: the absence of a price is a deliberate
+      // choice, not a bug. English marketplaces quote English printings.
+      ? `No marketplace quotes a price for ${card.language_label} printings of this card. English prices are not shown as a stand-in, because they are not this card's price.`
+      : 'No marketplace quotes a price for this card yet. The app tries again on every refresh.'));
+  }
+
+  // Where an estimate says what it is. The number is above, in the same place
+  // and the same size as any other value; this is the sentence that qualifies
+  // it, rather than a badge that withholds it.
+  if (estimated && card.price_explanation) {
+    figures.append(el('div', 'figure-note figure-note-est', card.price_explanation));
   }
 
   const pills = el('div', 'figure-pills');
@@ -1191,10 +1225,17 @@ function renderSheetBody() {
       pill.append(el('span', 'pill-dot'), el('span', null, `${Math.round(conf * 100)}% confidence`));
       pills.appendChild(pill);
       if (card.price_marketplace) pills.appendChild(el('span', 'pill', sourceLabel(card.price_marketplace)));
-      if (!card.price_variant_matched) pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
+      // Suppressed on an estimate: the sentence above already says the printing
+      // could not be confirmed, and saying it twice reads as two problems.
+      if (!card.price_variant_matched && !estimated) {
+        pills.appendChild(el('span', 'pill pill-warn', 'Printing assumed'));
+      }
     }
+    // One word for the tier, next to the confidence it already scaled. There
+    // is no separate "unconfirmed card" warning any more: an estimate is a
+    // priced card, and flagging it twice implied something was owed.
+    if (estimated) pills.appendChild(el('span', 'pill pill-warn', 'Estimated'));
   }
-  if (card.needs_review) pills.appendChild(el('span', 'pill pill-warn', 'Unconfirmed card'));
   if (card.has_mixed_conditions) pills.appendChild(el('span', 'pill', 'Mixed conditions'));
   if (pills.children.length) figures.appendChild(pills);
 
@@ -2150,11 +2191,13 @@ function closeScanner() {
   const saved = state.scanned.filter((s) => s.status === 'ok' || s.status === 'dupe');
   if (saved.length) loadCollection();
 
-  // Unconfirmed cards live in the Review tab, so the collection can look
-  // unchanged after a scan. Say where they went rather than leave you guessing.
-  const pending = saved.filter((s) => s.needsReview).length;
-  if (pending) {
-    toast(`${pending} card${pending === 1 ? '' : 's'} need${pending === 1 ? 's' : ''} confirming — see Needs review`, 'info', 6000);
+  // A card no marketplace would quote is the only thing left outstanding after
+  // a scan, and it is outstanding on the marketplace's side. Nothing is asked
+  // of the person here — this only says where the card went, because it will
+  // not appear in the collection totals until it has a price.
+  const unpriced = saved.filter((s) => s.needsReview).length;
+  if (unpriced) {
+    toast(`${unpriced} card${unpriced === 1 ? '' : 's'} saved with no price yet — the app keeps trying on each refresh`, 'info', 6000);
   }
 }
 
@@ -2454,7 +2497,7 @@ async function submitScan(blob, previewUrl, filename) {
     if (analysisScanId === id) {
       analysisSettle('done');
       analysisStep('save', first.needs_review ? 'warn' : 'done',
-        first.needs_review ? 'Saved to Needs review'
+        first.needs_review ? 'Added — no marketplace price yet'
           : first.is_new_copy ? `Added as copy ${first.quantity}` : 'Added to your collection',
         '', { moveToEnd: true });
       analysisFinish({
@@ -2462,7 +2505,9 @@ async function submitScan(blob, previewUrl, filename) {
         name: first.card_name || 'Unknown card',
         meta: [first.card_set, first.card_number, first.rarity].filter(Boolean).join(' · ') || '—',
         price: first.unit_price,
-        tag: first.needs_review ? 'Needs review' : first.is_new_copy ? `Copy ${first.quantity}` : 'Added',
+        tag: first.needs_review ? 'No price yet'
+          : first.price_tier === 'estimated' ? 'Added · est.'
+            : first.is_new_copy ? `Copy ${first.quantity}` : 'Added',
         dismissAfter: first.needs_review ? 0 : 5000,
       });
     }
@@ -2726,8 +2771,11 @@ function onScanProgress(ev) {
       analysisStep('verify', 'warn', ev.message || 'Could not confirm the printing');
       break;
 
-    case 'unverified':
-      analysisStep('save', 'warn', ev.message || 'Saved for review');
+    // Not a warning: the card is identified and about to be priced, just not
+    // against a confirmed printing. The old 'unverified' step said "saved for
+    // review", which announced a chore that no longer exists.
+    case 'estimating':
+      analysisStep('verify', 'skip', ev.message || 'Pricing as an estimate');
       break;
 
     case 'duplicate':
@@ -2735,11 +2783,7 @@ function onScanProgress(ev) {
       break;
 
     case 'pricing':
-      analysisStep('price', 'live', 'Checking marketplace prices');
-      break;
-
-    case 'pricing_skipped':
-      analysisStep('price', 'skip', ev.message || 'Not priced yet');
+      analysisStep('price', 'live', ev.message || 'Checking marketplace prices');
       break;
 
     // One line per source, so it is visible where each number came from and
@@ -2757,7 +2801,8 @@ function onScanProgress(ev) {
     case 'priced':
       analysisStep('price', 'done',
         `${money(ev.price)} — median of ${ev.quotesUsed} of ${ev.quotesSeen} quotes`,
-        ev.confidence > 0 ? `${Math.round(ev.confidence * 100)}% conf` : '',
+        [ev.tier === 'estimated' ? 'estimated' : '', ev.confidence > 0 ? `${Math.round(ev.confidence * 100)}% conf` : '']
+          .filter(Boolean).join(' · '),
         { moveToEnd: true });
       $('analysisPrice').textContent = money(ev.price);
       break;

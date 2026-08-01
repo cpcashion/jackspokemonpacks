@@ -480,6 +480,14 @@ a { color: inherit; text-decoration: none; }
 .card-price-row { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-top: 5px; }
 .card-price { font-family: var(--font-display); font-size: 14.5px; font-weight: 650; letter-spacing: -0.025em; }
 .card-price.unpriced { font-family: var(--font); font-size: 12px; font-weight: 500; color: var(--text-3); letter-spacing: 0; }
+/* An estimate is a value, so it is set beside the number rather than in place
+   of it — small and quiet, but never hiding the figure it qualifies. */
+.card-est {
+  font-family: var(--font); font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--text-3); padding: 1px 5px; border-radius: 5px;
+  background: color-mix(in srgb, var(--text-3) 12%, transparent);
+  flex: none; align-self: center;
+}
 .card-delta { font-size: 11.5px; font-weight: 600; }
 .card-unit { font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
 
@@ -720,6 +728,13 @@ a { color: inherit; text-decoration: none; }
 .figure-label { font-size: 11.5px; font-weight: 500; color: var(--text-3); }
 .figure-value { font-family: var(--font-display); font-size: 29px; font-weight: 650; letter-spacing: -0.035em; line-height: 1.1; margin-top: 2px; }
 .figure-note { font-size: 12.5px; color: var(--text-2); margin-top: 5px; line-height: 1.45; }
+/* The sentence that says why a value is an estimate. Set apart from the plain
+   note above it so it reads as a qualification of the figure, not as more
+   detail about it. */
+.figure-note-est {
+  margin-top: 7px; padding-left: 9px; font-size: 12px; color: var(--text-3);
+  border-left: 2px solid color-mix(in srgb, var(--warn, #d9822b) 45%, transparent);
+}
 .figure-pills { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 
 .section-title { font-size: 11.5px; font-weight: 600; color: var(--text-3); display: flex; align-items: center; justify-content: space-between; gap: 8px; }

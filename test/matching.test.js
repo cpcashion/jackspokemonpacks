@@ -218,6 +218,35 @@ test('a misread name is never confirmed, whatever else agrees', () => {
         'the name has to match; nothing else substitutes for it');
 });
 
+/**
+ * The guarantee the estimated tier rests on.
+ *
+ * Pricing an unconfirmed card is only defensible because the candidates it is
+ * priced against still have to survive the printed evidence. Candidate picking
+ * has no score floor — highest wins — so the filter in front of it is the only
+ * thing standing between an estimate and the $206 valuation of a common card.
+ *
+ * Dropping the refuted candidates is also what makes the label honest: the tier
+ * tells the user the number is "based on cards matching the name, number and
+ * language", and that has to be true.
+ */
+test('a candidate the card refutes is never priced against, confirmed or estimated', () => {
+    const card = { card_name: 'Steelix', card_set: 'Temporal Forces', card_number: '093/132', confidence: 0.95 };
+    const right = candidate();
+    const impostor = candidate({ set: { name: 'Temporal Forces', printedTotal: 162, total: 218, releaseDate: '2024/03/22' } });
+
+    // The filter the pricing path applies before ranking anything.
+    const usable = [right, impostor].filter(c => !compareCandidate(card, c).setSizeConflicts);
+    assert.equal(usable.length, 1, 'the impostor is removed before scoring, not merely outranked');
+    assert.equal(usable[0].set.printedTotal, 132);
+
+    // And when the impostor is the only thing on offer, nothing is priced —
+    // rather than the card being valued as something it demonstrably is not.
+    const onlyImpostor = [impostor].filter(c => !compareCandidate(card, c).setSizeConflicts);
+    assert.equal(onlyImpostor.length, 0,
+        'no price at all beats a price belonging to a different printing');
+});
+
 test('placeholder names are refused in any language', () => {
     for (const junk of ['Pokemon', 'unknown', 'Trainer', 'ポケモン', '宝可梦', '포켓몬', '']) {
         assert.equal(hasMeaningfulCardName(junk), false, `"${junk}" is not a card name`);

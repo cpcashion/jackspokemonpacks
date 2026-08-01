@@ -49,6 +49,7 @@ import {
 import { auditHistoryRows } from './lib/history.js';
 import { typesFromCard, serializeTypes } from './lib/types.js';
 import { buildSearchQuery, compsFromListings } from './lib/ebay-comps.js';
+import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
 import {
     perceptualHash,
     decodeDataUrl,
@@ -165,6 +166,13 @@ async function initDB() {
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_low REAL DEFAULT 0;
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_high REAL DEFAULT 0;
 
+        -- How much the number can be relied on ('confirmed' / 'estimated' /
+        -- 'unpriced') and the sentence the UI shows to explain it. Every card
+        -- that can be identified carries a price; this is how the app says how
+        -- sure it is, instead of withholding the price and asking a person.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_tier TEXT DEFAULT '';
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_explanation TEXT DEFAULT '';
+
         -- A non-English card is stored under the name printed on it. The English
         -- name of the same Pokémon is kept alongside so it stays searchable and
         -- so an English-language card database can be queried at all.
@@ -212,6 +220,7 @@ async function initDB() {
     await backfillCardCopies();
     await queueLegacyPricesForRecheck();
     await clearPricesOnUnconfirmedCards();
+    await queueUnpricedCardsForEstimates();
 }
 
 async function hasRun(key) {
@@ -292,6 +301,47 @@ async function clearPricesOnUnconfirmedCards() {
         console.log(`  [Migrate] Removed prices from ${ids.length} unconfirmed card(s) — they were matched loosely and could belong to a different printing`);
     }
     await markRun(KEY, ids.length);
+}
+
+/**
+ * Send every card with no price back to the front of the refresh queue.
+ *
+ * `clearPricesOnUnconfirmedCards` above stripped prices off cards whose
+ * printing was never confirmed, on the rule that an unconfirmed card gets no
+ * price at all. That rule is gone: those cards are priced as estimates now, and
+ * the ones it emptied have been sitting at no value ever since, along with
+ * every card a scheduled run skipped for the same reason.
+ *
+ * Clearing last_price_check is all that is needed — the refresh picks up
+ * never-checked cards first, and now prices them instead of stepping over them.
+ */
+async function queueUnpricedCardsForEstimates() {
+    const KEY = 'queue_unpriced_for_estimates_v1';
+    if (await hasRun(KEY)) return;
+
+    // Every price already in the database was produced under the old rule,
+    // which priced a card only after confirming its printing — so they are all
+    // confirmed prices and must be stamped as such. Without this they carry no
+    // tier, rank below everything in `shouldReplace`, and the first estimate to
+    // come along would overwrite a price that was correct. That is exactly the
+    // downward drift the tier ordering exists to prevent.
+    await pool.query(`
+        UPDATE portfolio_cards
+        SET price_tier = 'confirmed'
+        WHERE COALESCE(current_price, 0) > 0
+          AND COALESCE(price_confidence, 0) > 0
+          AND COALESCE(price_tier, '') = ''
+    `);
+
+    const res = await pool.query(`
+        UPDATE portfolio_cards
+        SET last_price_check = NULL
+        WHERE COALESCE(current_price, 0) = 0
+    `);
+    await markRun(KEY, res.rowCount);
+    if (res.rowCount) {
+        console.log(`  [Migrate] Queued ${res.rowCount} unpriced card(s) — they will be valued, as estimates where the printing cannot be confirmed`);
+    }
 }
 
 async function backfillVariantKeys() {
@@ -411,10 +461,21 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
             price_low              = $9,
             price_high             = $10,
             price_sources          = COALESCE($11::jsonb, '{}'::jsonb),
+            price_tier             = $12,
+            price_explanation      = $13,
             highest_recent_sale    = $10,
             best_sold_price        = $10,
             best_sold_source       = $3,
             last_price_check       = NOW()
+            -- needs_review is deliberately not touched here. It records that
+            -- the printing was never confirmed, which is still true of a card
+            -- priced as an estimate, and it is what makes the next refresh try
+            -- to confirm it again. Clearing it on a price would freeze every
+            -- estimate as an estimate forever.
+            --
+            -- Nothing shows it to the user: the app reports what it knows and
+            -- asks for nothing. getAllPortfolioCards reports "has no price"
+            -- under that name for the client, which is a different fact.
         WHERE id = $1
     `, [
         cardId,
@@ -428,6 +489,8 @@ async function updatePortfolioCardMarketData(cardId, marketData = {}) {
         Number(marketData.low) || 0,
         Number(marketData.high) || 0,
         JSON.stringify(marketData.allSourcePrices || {}),
+        marketData.tier || '',
+        marketData.explanation || '',
     ]);
 }
 
@@ -674,9 +737,22 @@ async function getAllPortfolioCards(userId) {
         SELECT pc.id, pc.user_id, pc.card_name, pc.card_name_en, pc.card_set, pc.set_code, pc.card_number,
             pc.rarity, pc.condition, pc.is_holo, pc.is_first_edition, pc.confidence,
             pc.image_url, pc.notes, pc.year, pc.language, pc.holo_type,
-            pc.variant_key, pc.needs_review, pc.verified_source, pc.types,
+            pc.variant_key, pc.verified_source, pc.types,
+            -- Two different facts, and conflating them is what put a card the
+            -- app had read perfectly into a queue for a person.
+            --
+            -- printing_confirmed is about identification and drives the retry:
+            -- an unconfirmed card is re-verified on every refresh, so an
+            -- estimate can become a market price when a database catches up.
+            --
+            -- needs_review is what the client displays, and it means only
+            -- "no price at all". An estimate is a value, so a card carrying one
+            -- is not outstanding — and even a card with no price is waiting on
+            -- a marketplace, never on the user.
+            (COALESCE(pc.needs_review, 0) = 0) AS printing_confirmed,
             pc.price_confidence, pc.price_marketplace, pc.price_variant,
             pc.price_variant_matched, pc.price_low, pc.price_high,
+            pc.price_tier, pc.price_explanation,
             pc.added_at, pc.current_price AS card_current_price, pc.price_source AS card_price_source,
             pc.price_source_url AS card_price_source_url,
             pc.price_sources, pc.last_price_check,
@@ -758,6 +834,19 @@ function decorateCardRow(row) {
         quantity: perCopy.length,
         unit_price: unitPrice,
         total_value: Number(totalValue.toFixed(2)),
+        // Two different facts, and conflating them is what put a card the app
+        // had read perfectly into a queue for a person.
+        //
+        // `printing_confirmed` (from the query) is about identification, and
+        // drives the retry: an unconfirmed card is re-verified on every refresh
+        // so an estimate can become a market price once a database catches up.
+        //
+        // `needs_review` is what the client displays and means only "no price
+        // at all". It is derived from the same `unitPrice` the app shows, so
+        // the label can never disagree with the number beside it. An estimate
+        // is a value, so a card carrying one is not outstanding — and a card
+        // with no price is waiting on a marketplace, never on the user.
+        needs_review: !(unitPrice > 0),
         has_mixed_conditions: new Set(perCopy.map(c => c.condition || 'Unknown')).size > 1,
         // Language belongs on screen for anything that is not English: a
         // Japanese Charizard and an English one are different cards worth
@@ -835,12 +924,22 @@ function computePortfolioStats(cards) {
     let needsReview = 0;
     let acquiredCost = 0;
     let unverified = 0;
+    let estimatedCards = 0;
+    let estimatedValue = 0;
 
     for (const card of cards) {
         totalValue += card.total_value;
         totalCopies += card.quantity;
         if (!(card.unit_price > 0)) unpriced += card.quantity;
-        if (card.needs_review) needsReview++;
+        // Outstanding means "no price", not "unconfirmed printing" — an
+        // unconfirmed card is priced as an estimate and counts in the total
+        // like any other. Read off the price rather than the flag so a row
+        // written before this change cannot report a chore that is already done.
+        if (!(card.unit_price > 0)) needsReview++;
+        if (card.price_tier === 'estimated') {
+            estimatedCards++;
+            estimatedValue += card.total_value;
+        }
         // Priced, but by the old engine — no confidence or source was recorded.
         if (card.unit_price > 0 && !(Number(card.price_confidence) > 0)) unverified++;
 
@@ -861,6 +960,11 @@ function computePortfolioStats(cards) {
         unpricedCopies: unpriced,
         unverifiedPrices: unverified,
         needsReview,
+        // How much of the total rests on estimates rather than confirmed
+        // printings. Shown in the app so a headline figure is never read as
+        // more certain than it is.
+        estimatedCards,
+        estimatedValue: Number(estimatedValue.toFixed(2)),
         totalValue: Number(totalValue.toFixed(2)),
         prevValue: Number(prevValue.toFixed(2)),
         acquiredCost: Number(acquiredCost.toFixed(2)),
@@ -1415,6 +1519,24 @@ async function verifyAndCanonicalizeCard(card, report = () => {}) {
         return verifyAgainstTcgdex(card, report);
     }
     return verifyAgainstPokemonTcg(card, report);
+}
+
+/**
+ * Verify, and keep hold of why it failed.
+ *
+ * The reason is not diagnostic noise: it is the sentence shown beside an
+ * estimated price — "Estimated — the closest Chinese (Simplified) match is
+ * numbered 051, not 120/105." The verifier already phrases these for a person,
+ * so this only stops them being thrown away, which is what used to happen right
+ * before the card was filed under "needs review" with no explanation at all.
+ */
+async function verifyWithReason(card, report = () => {}) {
+    let why = '';
+    const verified = await verifyAndCanonicalizeCard(card, (stage, payload = {}) => {
+        if (stage === 'verify_failed' && payload.message) why = payload.message;
+        report(stage, payload);
+    });
+    return { verified, why: verified ? '' : asReasonClause(why) };
 }
 
 /** Confirm a non-English printing against TCGdex in its own language. */
@@ -2066,7 +2188,20 @@ async function collectPokemonTcgQuotes(card, ctx) {
         if (failure) throw new SourceUnavailable(failure);
         return [];
     }
-    const { bestCandidate } = pickBestPokemonCardCandidate(card, candidates);
+
+    // Candidates the card itself refutes are dropped before anything is priced.
+    //
+    // This matters more now that an unconfirmed card is priced rather than
+    // skipped. "Highest score wins" has no floor, so without this a Steelix
+    // printed 093/132 could be priced against a different Steelix numbered 93
+    // in a 162-card set — the $206 valuation of a card worth cents. A set size
+    // that disagrees is proof of a different printing, not a weaker match, and
+    // an estimate that used one would make the label a lie: it promises a price
+    // based on cards matching the name, number and language.
+    const usable = candidates.filter(c => !compareCandidate(card, c).setSizeConflicts);
+    if (!usable.length) return [];
+
+    const { bestCandidate } = pickBestPokemonCardCandidate(card, usable);
     if (!bestCandidate) return [];
     return quotesFromPokemonTcgCandidate(bestCandidate, ctx);
 }
@@ -2249,6 +2384,67 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
     priceCache.set(key, { ...result, ts: Date.now() });
     return result;
 }
+
+/**
+ * Price a card and say how far to trust the answer.
+ *
+ * This is the only way anything should ask for a price. `lookupMarketPrice`
+ * knows what the marketplaces said; it does not know how sure we are that they
+ * were asked about the right card. That second question used to be answered by
+ * not calling it at all when the printing was unconfirmed, which is why cards
+ * the app had read perfectly showed no value and were parked in a review queue.
+ *
+ * Now every identifiable card gets a number, carrying the tier and the sentence
+ * that explains it. Nobody is asked to confirm anything.
+ */
+async function priceCard(card, { verified, why = '', onSource, fresh = false } = {}) {
+    const market = await lookupMarketPrice(card, { onSource, fresh });
+    const price = Number(market?.price) || 0;
+
+    // When there is no price the reason worth showing is why the lookup came
+    // back empty, not why verification fell short — the user cannot act on the
+    // latter and it would read as though the card is unpriceable.
+    const tier = tierFor({
+        verified,
+        price,
+        why: price > 0 ? why : (market?.sourcesUnavailable ? 'no price source could be reached' : why),
+    });
+
+    if (!(price > 0)) {
+        return {
+            ...(market || {}),
+            price: 0,
+            tier: tier.tier,
+            tierLabel: tier.label,
+            explanation: tier.explanation,
+        };
+    }
+
+    return {
+        ...market,
+        tier: tier.tier,
+        tierLabel: tier.label,
+        explanation: tier.explanation,
+        // Two uncertainties, both in the number the user sees: how well the
+        // sources agreed, and whether they were asked about the right card.
+        confidence: scaleConfidence(market.confidence, tier.tier),
+        sourceConfidence: market.confidence,
+    };
+}
+
+/**
+ * Save a price only when it is at least as trustworthy as the one already
+ * stored, so a refresh that happens to miss verification cannot quietly
+ * downgrade a card that was priced correctly yesterday.
+ */
+async function storePriceIfBetter(cardId, priced, existingTier) {
+    if (!(priced?.price > 0)) return false;
+    if (!shouldReplace(existingTier, priced.tier)) return false;
+    await insertPricePoint(cardId, priced.price, priced.source || 'market', priced.url || '');
+    await updatePortfolioCardMarketData(cardId, priced);
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  SSE (Server-Sent Events) for real-time updates
 // ═══════════════════════════════════════════════════════════════
@@ -2336,11 +2532,16 @@ async function refreshBatchPrices(batchSize = 5) {
     priceRefreshRunning = true;
 
     try {
-        // Pick the N cards that haven't been checked in the longest (or never)
+        // Pick the N cards that haven't been checked in the longest (or never).
+        //
+        // Unconfirmed cards are in scope here too. Excluding them meant the
+        // cards most in need of a price were the only ones a scheduled run
+        // never looked at. This path does not re-verify — that costs a lookup
+        // this batch has no time budget for, and the full refresh does it — so
+        // an unconfirmed card is priced as an estimate and re-verified there.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, types
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
-            WHERE COALESCE(needs_review, 0) = 0
             ORDER BY
                 last_price_check ASC NULLS FIRST,
                 CASE WHEN COALESCE(current_price, 0) = 0 THEN 0 ELSE 1 END ASC,
@@ -2362,11 +2563,14 @@ async function refreshBatchPrices(batchSize = 5) {
                     if (imageUrl) await updateCardImageUrl(card.id, imageUrl);
                 }
 
-                const result = await lookupMarketPrice(card, { fresh: true });
+                const result = await priceCard(card, {
+                    verified: !card.needs_review,
+                    why: 'the exact printing could not be confirmed',
+                    fresh: true,
+                });
                 if (result && result.price > 0) {
-                    await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
-                    await updatePortfolioCardMarketData(card.id, result);
-                    updated++;
+                    if (await storePriceIfBetter(card.id, result, card.price_tier)) updated++;
+                    else await markPriceChecked(card.id);
                 } else if (!result?.sourcesUnavailable) {
                     // Mark as checked so we don't re-check endlessly — but not
                     // when the sources were simply unreachable, since then
@@ -2408,7 +2612,7 @@ async function refreshAllPrices() {
         // improves, so the right behaviour is to quietly try again on every
         // scheduled run until it resolves.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, types
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
             ORDER BY COALESCE(needs_review, 0) DESC, last_price_check ASC NULLS FIRST, id ASC
         `);
@@ -2431,26 +2635,29 @@ async function refreshAllPrices() {
                 }
 
                 // An unconfirmed card gets one more attempt at being identified
-                // before it is priced. If it resolves it stops being a chore
-                // waiting for someone; if it does not, it is left unpriced and
-                // will be tried again on the next run.
+                // before it is priced — a database gains sets over time, so a
+                // card that could not be placed last week may place today.
+                //
+                // If it still does not, the refresh carries on and prices it as
+                // an estimate rather than skipping it. Skipping is what left
+                // cards sitting at no value indefinitely, each run quietly
+                // deciding to do nothing.
                 let subject = card;
+                let unverifiedReason = '';
                 if (card.needs_review) {
                     forgetCandidates(card);
-                    const verified = await verifyAndCanonicalizeCard({
+                    const { verified, why } = await verifyWithReason({
                         ...card,
                         confidence: Math.max(Number(card.confidence) || 0, 0.9),
                     });
-                    if (!verified) {
-                        await markPriceChecked(card.id);
-                        broadcast({ type: 'refresh_progress', done: i + 1, total: cards.length, updated, card_name: card.card_name });
-                        await pacePriceRequests();
-                        continue;
+                    if (verified) {
+                        await applyVerifiedIdentity(card.id, verified);
+                        subject = { ...card, ...verified, needs_review: 0 };
+                        resolved++;
+                        broadcastActivity('info', `Identified ${verified.card_name} (${verified.card_set}) — priced against that exact printing.`);
+                    } else {
+                        unverifiedReason = why || 'the exact printing could not be confirmed';
                     }
-                    await applyVerifiedIdentity(card.id, verified);
-                    subject = { ...card, ...verified };
-                    resolved++;
-                    broadcastActivity('info', `Identified ${verified.card_name} (${verified.card_set}) — it is no longer awaiting review.`);
                 }
 
                 // Cards added before types were captured get them here, on the
@@ -2463,12 +2670,23 @@ async function refreshAllPrices() {
                 // `fresh` matters here: the whole point of a refresh is to go
                 // out to the marketplaces again, and a warm in-process cache
                 // would otherwise turn the run into a no-op.
-                const result = await lookupMarketPrice(subject, { fresh: true });
+                const result = await priceCard(subject, {
+                    verified: !subject.needs_review,
+                    why: unverifiedReason,
+                    fresh: true,
+                });
                 if (result && result.price > 0) {
-                    await insertPricePoint(card.id, result.price, result.source || 'market', result.url || '');
-                    await updatePortfolioCardMarketData(card.id, result);
-                    updated++;
-                    broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.source})`);
+                    // `storePriceIfBetter` rather than a plain write: a refresh
+                    // that failed verification this time must not overwrite a
+                    // price that was confirmed on an earlier run, or the
+                    // collection total would drift downward with nothing to
+                    // show why.
+                    if (await storePriceIfBetter(card.id, result, card.price_tier)) {
+                        updated++;
+                        broadcastActivity('price_update', `${card.card_name}: $${result.price.toFixed(2)} (${result.tierLabel.toLowerCase()}, ${result.source})`);
+                    } else {
+                        await markPriceChecked(card.id);
+                    }
                 } else if (result?.sourcesUnavailable) {
                     // Do NOT mark it checked. A card skipped because every
                     // source was down has not been checked, and recording that
@@ -2937,7 +3155,11 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
             SET card_name = $2, card_name_en = $3, card_set = $4, set_code = $5,
                 card_number = $6, holo_type = $7,
                 language = $8, rarity = $9, is_first_edition = $10, is_holo = $11,
-                variant_key = $12, needs_review = 0, last_price_check = NULL
+                -- needs_review is not cleared here, only by a successful
+                -- re-verify below. An edit is a claim about the card, not a
+                -- confirmation of it, and the retry that would eventually turn
+                -- an estimate into a market price hangs off this flag.
+                variant_key = $12, last_price_check = NULL
             WHERE id = $1 AND user_id = $13
         `, [
             cardId, merged.card_name, merged.card_name_en, merged.card_set, merged.set_code,
@@ -2955,34 +3177,42 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
             await clearStalePrice(cardId);
         }
 
-        // The corrected fields are honoured as given, but the price still has to
-        // be earned: a printing we cannot confirm gets no price rather than the
-        // price of whatever the loose search happened to match. That mismatch is
-        // how a common card came to be valued in the hundreds.
+        // The correction is honoured as given and the card is re-verified
+        // against it, because a confirmed printing is worth far more than an
+        // estimate. Failing to confirm no longer costs the card its price
+        // though — someone who has just typed in the right set and number
+        // should not be told their correction produced nothing.
         forgetCandidates(merged);
-        const verified = await verifyAndCanonicalizeCard({ ...merged, confidence: 0.95 });
+        const { verified, why } = await verifyWithReason({ ...merged, confidence: 0.95 });
         let priceNote = '';
 
-        if (!verified) {
-            // The correction is kept, but the flag means "printing unconfirmed"
-            // and that is still true — so it goes back on rather than leaving an
-            // unpriced card sitting in the collection with no explanation.
-            await pool.query('UPDATE portfolio_cards SET needs_review = 1 WHERE id = $1', [cardId]);
-            await markPriceChecked(cardId);
-            priceNote = isNonEnglish(merged.language)
-                ? `Saved your correction, but this ${languageLabel(merged.language)} printing still could not be found in the card database, so it stays in Needs review and unpriced.`
-                : 'Saved your correction, but the printing still could not be confirmed, so it stays in Needs review and unpriced rather than being given another card\'s price.';
-        } else {
+        const subject = verified ? { ...merged, ...verified } : merged;
+        if (verified) {
             await applyVerifiedIdentity(cardId, verified);
-            const market = await lookupMarketPrice({ ...merged, ...verified }, { fresh: true });
-            if (market && market.price > 0) {
-                await insertPricePoint(cardId, market.price, market.source, market.url || '');
-                await updatePortfolioCardMarketData(cardId, market);
-                priceNote = `Confirmed and priced at $${market.price.toFixed(2)}.`;
-            } else {
-                await markPriceChecked(cardId);
-                priceNote = 'Confirmed, but no marketplace quotes a price for this printing.';
-            }
+        } else {
+            // Set explicitly rather than left alone: a card edited into a
+            // printing that cannot be confirmed is unconfirmed now, even if it
+            // was confirmed a moment ago, and the refresh should keep trying.
+            await pool.query('UPDATE portfolio_cards SET needs_review = 1 WHERE id = $1', [cardId]);
+        }
+
+        const market = await priceCard(subject, {
+            verified: Boolean(verified),
+            why: why || 'the exact printing could not be confirmed',
+            fresh: true,
+        });
+
+        if (market?.price > 0) {
+            await insertPricePoint(cardId, market.price, market.source, market.url || '');
+            await updatePortfolioCardMarketData(cardId, market);
+            priceNote = verified
+                ? `Confirmed and priced at $${market.price.toFixed(2)}.`
+                : `Saved your correction and priced at $${market.price.toFixed(2)}. ${market.explanation}`;
+        } else {
+            await markPriceChecked(cardId);
+            priceNote = verified
+                ? 'Confirmed, but no marketplace quotes a price for this printing.'
+                : 'Saved your correction, but no marketplace quotes a price for this card yet. It will be tried again on the next refresh.';
         }
 
         const after = await pool.query('SELECT current_price, price_source, price_confidence, needs_review FROM portfolio_cards WHERE id = $1', [cardId]);
@@ -3146,55 +3376,44 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
         const card = owned.rows[0];
         const previousPrice = Number(card.current_price) || 0;
 
-        // A card awaiting review has never had its printing confirmed, so
-        // re-pricing it means re-verifying it first. Two reasons:
+        // Re-pricing a card that was never confirmed means re-verifying it
+        // first: the fields may have been corrected by hand since, and a
+        // confirmed printing is worth far more than an estimate.
         //
-        //  1. Without this, re-pricing could never clear the review flag, so a
-        //     card corrected in the app stayed in Needs review forever.
-        //  2. Pricing an unconfirmed card matches loosely on name and number
-        //     and will happily return the price of a different printing. That
-        //     is how a common card ended up valued in the hundreds. A price we
-        //     cannot attach to a specific printing is not worth having.
+        // But failing to confirm no longer ends the request. It used to return
+        // `status:'unconfirmed'` with no price at all, on the theory that a
+        // price we cannot pin to a printing is not worth having — which left
+        // the user pressing Re-price on a card that had been read perfectly and
+        // watching nothing happen. It is priced either way now; only the label
+        // differs.
         let subject = card;
         let clearedReview = false;
+        let unverifiedReason = card.price_explanation || '';
         if (card.needs_review) {
             forgetCandidates(card);
-            const verified = await verifyAndCanonicalizeCard({
+            const { verified, why } = await verifyWithReason({
                 ...card,
                 // The stored confidence is the AI's read of the photo. Re-verifying
                 // works from the fields as they now stand, which the person may
                 // have corrected by hand, so it must not be gated on that.
                 confidence: Math.max(Number(card.confidence) || 0, 0.9),
             });
-            if (!verified) {
-                await markPriceChecked(cardId);
-                broadcast({ type: 'portfolio_updated' });
-                return res.json({
-                    success: true,
-                    status: 'unconfirmed',
-                    message: isNonEnglish(card.language)
-                        ? `Still cannot confirm this ${languageLabel(card.language)} printing. Check the card number and set, then try again — it is left unpriced rather than given the price of a different card.`
-                        : 'Still cannot confirm which printing this is, so it is left unpriced rather than given the price of a different card. Check the name, set and number.',
-                    price: previousPrice,
-                    previousPrice,
-                    delta: 0,
-                    changed: false,
-                    needsReview: true,
-                    source: 'unconfirmed',
-                    quotesUsed: 0,
-                    quotesSeen: 0,
-                    sources: [],
-                });
+            if (verified) {
+                await applyVerifiedIdentity(cardId, verified);
+                subject = { ...card, ...verified, needs_review: 0 };
+                clearedReview = true;
+            } else {
+                unverifiedReason = why || 'the exact printing could not be confirmed';
             }
-
-            await applyVerifiedIdentity(cardId, verified);
-            subject = { ...card, ...verified, needs_review: 0 };
-            clearedReview = true;
         }
 
         // `fresh` clears both the price cache and the candidate memo: the point
         // of asking is to get a new answer, not a fast one.
-        const market = await lookupMarketPrice(subject, { fresh: true });
+        const market = await priceCard(subject, {
+            verified: !subject.needs_review,
+            why: unverifiedReason,
+            fresh: true,
+        });
         const price = Number(market?.price) || 0;
 
         if (price > 0) {
@@ -3238,7 +3457,12 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
         if (clearedReview) {
             message = `Confirmed as ${subject.card_name}`
                 + `${subject.card_set ? ` (${subject.card_set}${subject.card_number ? ` ${subject.card_number}` : ''})` : ''}`
-                + ` and moved out of Needs review. ${message}`;
+                + `. ${message}`;
+        } else if (market?.tier === 'estimated' && price > 0) {
+            // Said once, plainly, so the number is not mistaken for a confirmed
+            // market price — and so pressing Re-price again is understood to be
+            // pointless rather than untried.
+            message = `${message} ${market.explanation}`;
         }
 
         broadcast({ type: 'portfolio_updated' });
@@ -3256,6 +3480,12 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
             source: market?.source || 'not_found',
             marketplace: market?.marketplace || '',
             confidence: market?.confidence || 0,
+            tier: market?.tier || 'unpriced',
+            tierLabel: market?.tierLabel || '',
+            explanation: market?.explanation || '',
+            // Only a card with no price at all is still waiting on anything,
+            // and even then it is waiting on a marketplace, not on the user.
+            needsReview: !(price > 0) && Boolean(card.needs_review),
             quotesUsed: market?.quotesUsed || 0,
             quotesSeen: market?.quotesSeen || 0,
             sources: market?.sources || [],
@@ -3293,31 +3523,39 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
         (async () => {
             let confirmed = 0;
             let priced = 0;
+            let estimated = 0;
             let stillUnknown = 0;
 
             for (let i = 0; i < rows.length; i++) {
                 const card = rows[i];
                 try {
                     forgetCandidates(card);
-                    const verified = await verifyAndCanonicalizeCard({
+                    const { verified, why } = await verifyWithReason({
                         ...card,
                         confidence: Math.max(Number(card.confidence) || 0, 0.9),
                     });
 
-                    if (!verified) {
-                        stillUnknown++;
-                        await markPriceChecked(card.id).catch(() => {});
-                    } else {
+                    if (verified) {
                         await applyVerifiedIdentity(card.id, verified);
                         confirmed++;
-                        const market = await lookupMarketPrice({ ...card, ...verified }, { fresh: true });
-                        if (market?.price > 0) {
-                            await insertPricePoint(card.id, market.price, market.source, market.url || '');
-                            await updatePortfolioCardMarketData(card.id, market);
-                            priced++;
-                        } else {
-                            await markPriceChecked(card.id);
-                        }
+                    }
+
+                    // Priced either way. A card that cannot be confirmed is not
+                    // a card we know nothing about — the name, number and
+                    // language are all in hand, which is enough for an estimate
+                    // and far more useful than another run of nothing.
+                    const market = await priceCard(verified ? { ...card, ...verified } : card, {
+                        verified: Boolean(verified),
+                        why: why || 'the exact printing could not be confirmed',
+                        fresh: true,
+                    });
+
+                    if (await storePriceIfBetter(card.id, market, card.price_tier)) {
+                        priced++;
+                        if (market.tier === 'estimated') estimated++;
+                    } else {
+                        if (!(market?.price > 0)) stillUnknown++;
+                        await markPriceChecked(card.id).catch(() => {});
                     }
                 } catch (err) {
                     console.error(`  [Recheck] ${card.card_name}:`, err.message);
@@ -3334,7 +3572,9 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
 
             broadcastActivity('recheck_complete',
                 `Re-checked ${rows.length} card${rows.length === 1 ? '' : 's'}: `
-                + `${confirmed} confirmed, ${priced} priced, ${stillUnknown} still unidentified.`);
+                + `${confirmed} confirmed against an exact printing, ${priced} priced`
+                + `${estimated ? ` (${estimated} as estimates)` : ''}`
+                + `${stillUnknown ? `, ${stillUnknown} with no marketplace price yet` : ''}.`);
             broadcast({ type: 'portfolio_updated' });
         })().catch(err => console.error('Recheck error:', err))
             .finally(() => { reviewRecheckRunning = false; });
@@ -3757,7 +3997,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
             });
             report('verifying', { ...photo, message: 'Confirming the printing against the card database' });
 
-            const verified = await verifyAndCanonicalizeCard(rawCard, report);
+            const { verified, why: unverifiedReason } = await verifyWithReason(rawCard, report);
             const card = verified || { ...rawCard, needs_review: true };
 
             if (verified) {
@@ -3788,14 +4028,23 @@ async function processPortfolioUpload(files, userId, options = {}) {
                     });
                     continue;
                 }
-                broadcastActivity('info', `Saved "${card.card_name}" for review — could not confirm it in the card database.`);
-                report('unverified', { ...photo, card_name: card.card_name, message: 'Saving for review — the printing could not be confirmed' });
+                // Not a failure and not a chore for anyone: the card is
+                // identified, the exact printing is not, and it will be priced
+                // as an estimate with that reason attached.
+                broadcastActivity('info', `Added "${card.card_name}" — pricing as an estimate, ${unverifiedReason || 'the exact printing could not be confirmed'}.`);
+                report('estimating', {
+                    ...photo,
+                    card_name: card.card_name,
+                    reason: unverifiedReason,
+                    message: `Pricing as an estimate — ${unverifiedReason || 'the exact printing could not be confirmed'}`,
+                });
             }
 
             const saved = await saveScannedCard(card, {
                 userId,
                 thumbDataUrl,
                 needsReview: !verified,
+                unverifiedReason,
                 forceSeparate: options.forceSeparate === true,
                 report: (stage, payload) => report(stage, { ...photo, ...payload }),
             });
@@ -3819,7 +4068,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
  * Persist one identified card: either as a new printing or as another copy of a
  * printing already held.
  */
-async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceSeparate, report = () => {} }) {
+async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unverifiedReason = '', forceSeparate, report = () => {} }) {
     const variantKey = buildVariantKey(card);
     const existing = forceSeparate ? null : await findCardByVariant(variantKey, userId);
 
@@ -3898,38 +4147,47 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
         notes: card.notes || '',
     });
 
-    // Unverified cards are not priced: without a confirmed printing any number
-    // would be a guess, and a guessed price is worse than no price.
+    // Every card that could be read gets priced. Whether the exact printing was
+    // confirmed decides how the number is *labelled*, not whether it exists —
+    // withholding it left cards the app had read at 100% confidence showing no
+    // value and silently missing from the collection total.
     let market = null;
-    if (!needsReview) {
-        report('pricing', { message: 'Checking marketplace prices' });
-        try {
-            market = await lookupMarketPrice(card, {
-                onSource: (entry) => report('price_source', entry),
-            });
-        } catch (err) {
-            console.error(`  [Pricing] Inline lookup failed for ${card.card_name}:`, err.message);
-        }
-        if (market?.price > 0) {
-            report('priced', {
-                price: market.price,
-                source: market.source,
-                marketplace: market.marketplace || '',
-                confidence: market.confidence,
-                low: market.low,
-                high: market.high,
-                quotesUsed: market.quotesUsed,
-                quotesSeen: market.quotesSeen,
-            });
-        } else {
-            report('unpriced', {
-                message: market?.sourcesUnavailable
-                    ? 'No price source could be reached — this card will be priced on the next refresh.'
-                    : 'No marketplace listing found for this printing yet.',
-            });
-        }
+    report('pricing', {
+        message: needsReview
+            ? 'Checking marketplace prices — the exact printing is unconfirmed, so this will be an estimate'
+            : 'Checking marketplace prices',
+    });
+    try {
+        market = await priceCard(card, {
+            verified: !needsReview,
+            why: unverifiedReason || 'the exact printing could not be confirmed',
+            onSource: (entry) => report('price_source', entry),
+        });
+    } catch (err) {
+        console.error(`  [Pricing] Inline lookup failed for ${card.card_name}:`, err.message);
+    }
+
+    if (market?.price > 0) {
+        report('priced', {
+            price: market.price,
+            source: market.source,
+            marketplace: market.marketplace || '',
+            confidence: market.confidence,
+            tier: market.tier,
+            tier_label: market.tierLabel,
+            explanation: market.explanation,
+            low: market.low,
+            high: market.high,
+            quotesUsed: market.quotesUsed,
+            quotesSeen: market.quotesSeen,
+        });
     } else {
-        report('pricing_skipped', { message: 'Not priced until the printing is confirmed' });
+        report('unpriced', {
+            tier: 'unpriced',
+            message: market?.sourcesUnavailable
+                ? 'No price source could be reached — this card will be priced on the next refresh.'
+                : 'No marketplace listing found for this printing yet.',
+        });
     }
 
     if (market && market.price > 0) {
@@ -3969,10 +4227,15 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, forceS
         price_source_url: market?.url || '',
         price_confidence: market?.confidence || 0,
         price_marketplace: market?.marketplace || '',
-        needs_review: Boolean(needsReview),
-        message: needsReview
-            ? `Saved "${card.card_name}" for review — not found in the card database`
-            : undefined,
+        price_tier: market?.tier || 'unpriced',
+        price_tier_label: market?.tierLabel || '',
+        price_explanation: market?.explanation || '',
+        // A priced card needs nothing from anyone. The tier says how sure the
+        // number is, which is what a review would have established anyway.
+        needs_review: Boolean(needsReview) && !(market?.price > 0),
+        message: market?.price > 0
+            ? undefined
+            : `Added "${card.card_name}" — no marketplace price yet, it will be tried again on the next refresh`,
     };
 }
 

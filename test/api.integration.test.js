@@ -246,21 +246,29 @@ if (!DB) {
         assert.equal(edited.status, 200);
         assert.equal(edited.body.identityChanged, true);
 
-        const row = await pool.query('SELECT variant_key, needs_review, current_price FROM portfolio_cards WHERE id = $1', [id]);
+        const row = await pool.query(
+            'SELECT variant_key, needs_review, current_price, price_tier FROM portfolio_cards WHERE id = $1', [id]);
         assert.match(row.rows[0].variant_key, /base set 2\|1\|reverse/);
 
-        // The correction is always kept, but a price has to be earned. An edit
-        // used to clear the review flag and then price the card off a loose
-        // name+number search, which is how a common card came to be valued in
-        // the hundreds. Now the flag tracks whether the printing was actually
-        // confirmed, and an unconfirmed card is left unpriced on purpose.
+        // An edit is a claim about the card, not a confirmation of it. The
+        // stored flag tracks whether the printing was actually confirmed —
+        // which is what makes the next refresh try again — and it must agree
+        // with what the reply told the user.
         assert.equal(edited.body.confirmed, row.rows[0].needs_review === 0,
-            'the review flag and the confirmed flag must agree');
+            'the stored flag and the reply must agree on whether the printing was confirmed');
+
         if (!edited.body.confirmed) {
-            assert.equal(Number(row.rows[0].current_price), 0,
-                'an unconfirmed printing must not carry a price');
+            // The correction is kept and the card is still valued. It used to
+            // be left at zero here, so someone who had just typed in the right
+            // set and number saw their correction produce nothing.
             assert.match(edited.body.message, /Saved your correction/,
-                'and the edit must say it was kept');
+                'the edit must say it was kept');
+            if (Number(row.rows[0].current_price) > 0) {
+                assert.equal(row.rows[0].price_tier, 'estimated',
+                    'a price on an unconfirmed printing must be labelled an estimate');
+                assert.match(edited.body.message, /Estimated/,
+                    'and the reply must not present it as a market price');
+            }
         }
     });
 
@@ -445,14 +453,20 @@ if (!DB) {
     });
 
     /**
-     * "I repriced the ones that need review, but it's still saying needs review."
+     * "There's no value being found for new cards... the user shouldn't ever
+     * have to manually review cards or confirm pricing."
      *
-     * Re-pricing never re-verified, so the flag could not clear — and it priced
-     * against a loose name+number match, which is how a card worth cents was
-     * valued in the hundreds. Now an unconfirmed card is re-verified first and,
-     * if it still cannot be confirmed, left unpriced on purpose.
+     * This has been wrong in both directions. Re-pricing first matched loosely
+     * on name and number and valued a card worth cents in the hundreds; the
+     * correction refused to price anything unconfirmed, which left cards the
+     * app had read perfectly showing nothing at all and parked in a queue.
+     *
+     * The rule now: re-verify first, because a confirmed printing is worth far
+     * more than an estimate — but a card that still cannot be confirmed is
+     * priced anyway and labelled `estimated`. Nothing is ever handed back to
+     * the user to confirm.
      */
-    test('re-pricing a card in review re-verifies it rather than guessing a price', async () => {
+    test('re-pricing a card in review prices it either way, and says which', async () => {
         const id = await seedLegacyCard({
             card_name: 'Steelix', card_set: 'Temporal Forces', card_number: '093/132',
             needs_review: 1, current_price: 0,
@@ -462,22 +476,33 @@ if (!DB) {
         const { status, body } = await api(`/api/portfolio/${id}/reprice`, { method: 'POST' });
         assert.equal(status, 200);
 
-        const row = await pool.query('SELECT needs_review, current_price FROM portfolio_cards WHERE id = $1', [id]);
+        const row = await pool.query(
+            'SELECT needs_review, current_price, price_tier, price_explanation FROM portfolio_cards WHERE id = $1', [id]);
+        const stored = row.rows[0];
+        const price = Number(stored.current_price);
 
-        if (body.status === 'unconfirmed') {
-            // The important half: it refused to invent a price for a card whose
-            // printing it could not pin down.
-            assert.equal(Number(row.rows[0].current_price), 0,
-                'an unconfirmed card must not be given a price');
-            assert.equal(row.rows[0].needs_review, 1, 'and stays flagged');
-            assert.match(body.message, /confirm/i, 'and says what it could not do');
-            assert.equal(body.needsReview, true);
+        assert.ok(['confirmed', 'estimated', 'unpriced'].includes(body.tier), `bad tier ${body.tier}`);
+
+        if (price > 0) {
+            // The point of the whole change: a value exists, and the card is
+            // no longer anybody's chore.
+            assert.equal(stored.needs_review, 0, 'a priced card is not awaiting review');
+            assert.equal(body.needsReview, false);
+            assert.ok(['confirmed', 'estimated'].includes(stored.price_tier), stored.price_tier);
+
+            if (stored.price_tier === 'estimated') {
+                assert.ok(stored.price_explanation, 'an estimate must say why it is one');
+                assert.match(body.message, /estimated/i, 'and the reply must not present it as a market price');
+            } else {
+                assert.equal(body.clearedReview, true, 'confirming must clear the flag');
+            }
         } else {
-            // If it did confirm, the flag must have cleared — the bug was that
-            // it never could.
-            assert.equal(row.rows[0].needs_review, 0,
-                'a card that verified must leave Needs review');
-            assert.equal(body.clearedReview, true);
+            // No price is only acceptable when nothing quoted one — and even
+            // then it is the marketplaces that are outstanding, not the user.
+            assert.ok(['not_found', 'sources_unavailable'].includes(body.status), body.status);
+            assert.equal(body.tier, 'unpriced');
+            assert.doesNotMatch(body.message, /review/i,
+                'a missing price must never be described as something for the user to do');
         }
     });
 
@@ -623,5 +648,57 @@ if (!DB) {
         // the load on the card database.
         const again = await api('/api/portfolio/recheck-review', { method: 'POST' });
         assert.equal(again.status, 409);
+    });
+
+    /**
+     * The complaint, stated plainly: "there's no value being found for new
+     * cards that get uploaded in the app... the user shouldn't ever have to
+     * manually review cards or confirm pricing."
+     *
+     * The collection total is the number the app exists to produce, and it was
+     * silently excluding every card whose printing could not be pinned down.
+     * This asserts the property that fixes it: a card with a price counts, and
+     * a card with no price is never presented as work for the person holding
+     * it.
+     */
+    test('the collection total counts estimates, and nothing is a chore for the user', async () => {
+        const { body } = await api('/api/portfolio');
+        const cards = body.cards || [];
+        const stats = body.stats || {};
+
+        let expected = 0;
+        for (const card of cards) {
+            expected += Number(card.total_value) || 0;
+
+            if (Number(card.unit_price) > 0) {
+                assert.equal(card.needs_review, false,
+                    `"${card.card_name}" is priced, so nothing about it is outstanding`);
+                // A price with no confidence predates the current engine and so
+                // has no tier; the app labels those "Not verified yet" and
+                // re-prices them. Anything the current engine produced must
+                // carry a tier.
+                if (Number(card.price_confidence) > 0) {
+                    assert.ok(['confirmed', 'estimated'].includes(card.price_tier),
+                        `"${card.card_name}" was priced by the current engine but has tier "${card.price_tier}"`);
+                }
+            } else {
+                assert.equal(card.needs_review, true,
+                    `"${card.card_name}" has no price, which is the only thing left outstanding`);
+            }
+            if (card.price_tier === 'estimated') {
+                assert.ok(card.price_explanation,
+                    `"${card.card_name}" is an estimate and must say why`);
+            }
+        }
+
+        assert.ok(Math.abs(Number(stats.totalValue) - expected) < 0.05,
+            `the headline total (${stats.totalValue}) must include every priced card (${expected.toFixed(2)})`);
+
+        // And it must say how much of that total is an estimate rather than a
+        // confirmed market price, so the figure is never read as more certain
+        // than it is.
+        const estimated = cards.filter(c => c.price_tier === 'estimated');
+        assert.equal(stats.estimatedCards, estimated.length);
+        assert.ok(Number(stats.estimatedValue) <= Number(stats.totalValue) + 0.01);
     });
 }

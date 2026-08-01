@@ -2040,7 +2040,7 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
     }));
 
     const quotes = settled.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
-    const result = await aggregateQuotes(quotes, { axios });
+    const result = await aggregateQuotes(quotes, { axios, context: ctx });
     const asked = sources.filter(s => s.state !== 'skipped');
     const allAskedFailed = asked.length > 0 && asked.every(s => s.state === 'failed');
 

@@ -56,16 +56,53 @@ test('variant pick: unlimited holo does NOT take the 1st edition price', () => {
     assert.equal(picked.price, 300);
 });
 
-test('variant pick: unknown printing falls back to the CHEAPEST variant, flagged inexact', () => {
+/**
+ * This used to take the cheapest variant, on the theory that under-valuing is
+ * the safer error. It is not: a Base Set Charizard whose foil the camera could
+ * not read priced as its $2.50 non-holo twin — wrong by two orders of
+ * magnitude, and reported with no visible doubt. When the printing is genuinely
+ * unknown the median is the honest estimate, and the flag says it was a guess.
+ */
+test('variant pick: unknown printing takes the median, not the cheapest', () => {
     const prices = { holofoil: { market: 180 }, normal: { market: 2.5 } };
     const picked = pickTcgplayerVariantPrice(prices, { printing: 'unknown' });
-    assert.equal(picked.price, 2.5, 'guessing must not guess expensive');
-    assert.equal(picked.variantMatched, false);
+    assert.equal(picked.price, 91.25, 'the midpoint, not the floor');
+    assert.equal(picked.variantMatched, false, 'and it is flagged as a guess');
+    assert.equal(picked.variantsConsidered, 2);
+});
+
+/**
+ * If only one printing of a card exists, there was never an ambiguity to
+ * resolve — so it counts as matched and keeps full confidence.
+ */
+test('variant pick: a card with one printing is not treated as ambiguous', () => {
+    const picked = pickTcgplayerVariantPrice({ holofoil: { market: 412.5 } }, { printing: 'unknown' });
+    assert.equal(picked.price, 412.5);
+    assert.equal(picked.variantMatched, true);
 });
 
 test('variant pick: never uses the `high` asking price', () => {
-    const picked = pickTcgplayerVariantPrice({ normal: { high: 999, low: 4 } }, { printing: 'normal' });
-    assert.equal(picked.price, 4);
+    const picked = pickTcgplayerVariantPrice({ normal: { high: 999, mid: 40 } }, { printing: 'normal' });
+    assert.equal(picked.price, 40);
+});
+
+/**
+ * `low` is the cheapest active listing — in practice a damaged copy, a
+ * mispriced one, or a seller with no feedback. Presenting it as a market price
+ * under-stated cards silently, so it is no longer used at all: a card with only
+ * a low price has no usable quote and says so.
+ */
+test('variant pick: `low` is never presented as a market price', () => {
+    assert.equal(pickTcgplayerVariantPrice({ normal: { low: 4 } }, { printing: 'normal' }), null);
+    assert.equal(pickTcgplayerVariantPrice({ normal: { lowPrice: 4 } }, { printing: 'normal' }), null);
+
+    // market wins over mid, and both are labelled with what they are.
+    assert.deepEqual(
+        pickTcgplayerVariantPrice({ normal: { market: 12, mid: 20, low: 3 } }, { printing: 'normal' }),
+        { price: 12, variant: 'normal', variantMatched: true, basis: 'market' });
+    assert.deepEqual(
+        pickTcgplayerVariantPrice({ normal: { mid: 20, low: 3 } }, { printing: 'normal' }),
+        { price: 20, variant: 'normal', variantMatched: true, basis: 'listings' });
 });
 
 test('variant pick: returns null when there are no prices at all', () => {
@@ -186,14 +223,36 @@ test('median handles empty, odd and even inputs', () => {
 });
 
 test('priceContextFor reads printing and edition off a card row', () => {
-    assert.deepEqual(
-        priceContextFor({ holo_type: 'Reverse Holo', is_first_edition: 1 }),
-        { printing: 'reverse', isFirstEdition: true },
-    );
-    assert.deepEqual(
-        priceContextFor({ holo_type: 'Unknown', is_holo: 0, is_first_edition: false }),
-        { printing: 'normal', isFirstEdition: false },
-    );
+    const reverse = priceContextFor({ holo_type: 'Reverse Holo', is_first_edition: 1 });
+    assert.equal(reverse.printing, 'reverse');
+    assert.equal(reverse.isFirstEdition, true);
+    assert.equal(reverse.printingInferred, false, 'it was read off the card');
+
+    const plain = priceContextFor({ holo_type: 'Unknown', is_holo: 0, is_first_edition: false });
+    assert.equal(plain.printing, 'normal');
+    assert.equal(plain.isFirstEdition, false);
+});
+
+/**
+ * The foil pattern is the hardest thing to read off a photograph — it depends
+ * on the angle the light happened to hit the card — and getting it wrong is the
+ * most expensive mistake this engine can make. The rarity is printed as a
+ * symbol and comes back from the card databases as a string, so it settles what
+ * the photo could not.
+ */
+test('priceContextFor infers the printing from rarity when the photo could not', () => {
+    const holo = priceContextFor({ holo_type: 'Unknown', rarity: 'Rare Holo' });
+    assert.equal(holo.printing, 'holo', 'a Rare Holo is holo whatever the photo showed');
+    assert.equal(holo.printingInferred, true, 'but the app knows it inferred that');
+    assert.match(holo.printingBasis, /rarity/i, 'and can say why');
+
+    assert.equal(priceContextFor({ holo_type: 'Unknown', rarity: 'Illustration Rare' }).printing, 'holo');
+    assert.equal(priceContextFor({ holo_type: 'Unknown', rarity: 'Secret Rare' }).printing, 'holo');
+    assert.equal(priceContextFor({ holo_type: 'Unknown', rarity: 'Common' }).printing, 'normal');
+
+    // "Rare" alone is genuinely ambiguous — plenty of plain rares are non-holo.
+    const ambiguous = priceContextFor({ holo_type: 'Unknown', rarity: 'Rare' });
+    assert.equal(ambiguous.printing, 'unknown', 'it does not invent certainty it lacks');
 });
 
 // ── identity ───────────────────────────────────────────────────────────────

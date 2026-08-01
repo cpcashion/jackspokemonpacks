@@ -427,12 +427,26 @@ function renderHero() {
   const windowChange = first && last ? ((last - first) / first) * 100 : null;
   const windowDelta = first && last ? last - first : null;
 
+  // How much history actually exists, as opposed to how much was asked for.
+  // A "90 days" label over four days of data is not a small inaccuracy — it
+  // reads as a collection that sat flat for three months and then jumped, which
+  // is a claim the data does not support.
+  const coverage = series.length >= 2
+    ? (series[series.length - 1].t - series[0].t) / 86400000
+    : 0;
+  const asked = state.heroRange;
+  const shortOfRange = asked > 0 && coverage > 0 && coverage < asked * 0.9;
+
   const changeEl = $('heroChange');
   changeEl.innerHTML = '';
   if (windowChange === null) {
     changeEl.append(el('span', 'muted', 'Tracking starts as prices are recorded'));
   } else {
-    const label = state.heroRange === 0 ? 'all time' : `past ${state.heroRange} days`;
+    // Say the window the numbers are actually from, not the button that was
+    // pressed to ask for them.
+    const label = shortOfRange
+      ? `past ${Math.max(1, Math.round(coverage))} day${Math.round(coverage) === 1 ? '' : 's'} — all the history there is`
+      : asked === 0 ? 'all time' : `past ${asked} days`;
     changeEl.append(
       el('span', trendClass(windowChange), `${windowDelta >= 0 ? '+' : '−'}${money(Math.abs(windowDelta)).slice(1)}`),
       el('span', trendClass(windowChange), trendText(windowChange)),
@@ -445,6 +459,18 @@ function renderHero() {
   chartHost.appendChild(series.length >= 2
     ? areaChart(series, windowChange === null || windowChange >= 0)
     : el('div', 'empty-note', 'The value chart fills in as daily prices are recorded.'));
+
+  // Grey out ranges the data cannot reach, so pressing 90D on four days of
+  // history is visibly a request the app cannot honour rather than a chart that
+  // silently means something else.
+  document.querySelectorAll('#heroRanges button').forEach((b) => {
+    const range = Number(b.dataset.range);
+    const unreachable = range > 0 && coverage > 0 && coverage < range * 0.9;
+    b.classList.toggle('thin', unreachable);
+    b.title = unreachable
+      ? `Only ${Math.round(coverage)} days of history recorded so far`
+      : '';
+  });
 
   const facts = $('heroFacts');
   facts.innerHTML = '';

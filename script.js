@@ -160,6 +160,10 @@ async function loadCollection() {
   state.stats = data.stats || {};
   state.pricing = data.pricing || state.pricing;
 
+  // Deliberately not awaited: the source photos are a side panel, and the
+  // collection should not wait on them to draw.
+  loadSourcePhotos();
+
   // Drawing is separate from loading. A rendering fault is a bug in the app,
   // not a problem with the collection, and saying so sends you looking in the
   // wrong place.
@@ -1798,18 +1802,55 @@ $('recheckReviewBtn').addEventListener('click', async (e) => {
 });
 
 /**
- * Go back through the original bulk uploads and pull out the cards that were
- * dropped. Those photos were whole binder pages; the scanner of the day kept
- * one card from each and discarded the rest.
+ * The photographs the collection was built from.
+ *
+ * These are pictures of whole binder pages — six or eight cards across — that
+ * an earlier scanner filed as single cards. They are no longer in the
+ * collection at all, because they are not cards; they are shown here as what
+ * they are, with the one action that matters attached to them.
  */
-$('rescanGridsBtn')?.addEventListener('click', async (e) => {
+async function loadSourcePhotos() {
+  const panel = $('sourcePhotoPanel');
+  if (!panel) return;
+  try {
+    const r = await api('/api/portfolio/source-photos');
+    const pending = (r.photos || []).filter(p => !p.done);
+    panel.hidden = pending.length === 0;
+    if (!pending.length) return;
+
+    // No card count is claimed until a photo has actually been read: a 2x1
+    // spread and a 6x3 are the same shape, so the number cannot be known from
+    // the outside, and inventing one would be the sort of confident wrong
+    // figure this app keeps having to remove.
+    $('sourcePhotoText').textContent = r.recognitionReady
+      ? `${pending.length} photo${pending.length === 1 ? '' : 's'} of your collection ${pending.length === 1 ? 'is' : 'are'} still whole. `
+        + 'Each holds a page of cards. Reading them adds every card inside as its own entry, priced and filed by set and type.'
+      : `${pending.length} photo${pending.length === 1 ? '' : 's'} of your collection ${pending.length === 1 ? 'is' : 'are'} still whole, `
+        + 'but card recognition is not configured on the server, so they cannot be read yet.';
+
+    const strip = $('sourcePhotoStrip');
+    strip.innerHTML = '';
+    for (const photo of pending.slice(0, 12)) {
+      const img = el('img', 'source-thumb');
+      img.src = photo.image_data;
+      img.alt = 'A page of cards waiting to be read';
+      img.loading = 'lazy';
+      strip.appendChild(img);
+    }
+    $('extractSourceBtn').disabled = !r.recognitionReady;
+  } catch {
+    panel.hidden = true;
+  }
+}
+
+$('extractSourceBtn')?.addEventListener('click', async (e) => {
   const btn = e.currentTarget;
   const original = btn.textContent;
   btn.disabled = true;
-  btn.textContent = 'Looking…';
+  btn.textContent = 'Reading…';
   try {
-    const r = await api('/api/portfolio/rescan-grids', { method: 'POST' });
-    toast(r.message || 'Looking through your scan photos…', 'info', 6000);
+    const r = await api('/api/portfolio/extract-source-photos', { method: 'POST' });
+    toast(r.message || 'Reading your photos…', 'info', 7000);
   } catch (err) {
     toast(err.message, 'error', 6000);
   } finally {
@@ -1818,15 +1859,15 @@ $('rescanGridsBtn')?.addEventListener('click', async (e) => {
   }
 });
 
-/** Live progress for the grid re-scan, alongside the other long jobs. */
-function showGridRescanProgress(payload) {
+/** Live progress while the source photos are being read. */
+function showExtractProgress(payload) {
   const note = $('syncNote');
   if (!note) return;
   if (!payload) { note.textContent = ''; note.classList.remove('busy'); return; }
   note.classList.add('busy');
   note.textContent = payload.added
-    ? `Photo ${payload.done} of ${payload.total} — ${payload.added} card${payload.added === 1 ? '' : 's'} recovered`
-    : `Checking photo ${payload.done} of ${payload.total}`;
+    ? `${payload.message} — ${payload.added} card${payload.added === 1 ? '' : 's'} added so far`
+    : payload.message;
 }
 
 /** Live progress for the bulk re-check, in the same place as a refresh. */
@@ -2890,10 +2931,10 @@ function connectEvents() {
       if (payload.type === 'scan_progress') onScanProgress(payload);
       if (payload.type === 'refresh_progress') showRefreshProgress(payload);
       if (payload.type === 'recheck_progress') showRecheckProgress(payload);
-      if (payload.type === 'grid_rescan_progress') showGridRescanProgress(payload);
+      if (payload.type === 'extract_progress') showExtractProgress(payload);
       if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
       if (payload.activityType === 'recheck_complete') { toast(payload.message, 'success', 8000); showRecheckProgress(null); }
-      if (payload.activityType === 'grid_rescan_complete') { toast(payload.message, 'success', 10000); showGridRescanProgress(null); }
+      if (payload.activityType === 'extract_complete') { toast(payload.message, 'success', 10000); showExtractProgress(null); loadSourcePhotos(); }
       if (payload.activityType === 'error') toast(payload.message, 'error', 7000);
     };
     source.onerror = () => {

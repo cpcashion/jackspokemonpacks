@@ -651,32 +651,63 @@ if (!DB) {
     });
 
     /**
-     * The original bulk uploads were photos of whole binder pages, and the
-     * scanner of the day kept one card from each and dropped the rest. The
-     * recovery pass has to be safe to run repeatedly on a live collection, so
-     * these pin its guarantees rather than its output — which depends on a
-     * vision model this suite deliberately does not call.
+     * The complaint that produced all of this: photographs of whole binder
+     * pages sitting in the collection as single, unpriceable "cards".
+     *
+     * They are not cards. A row flagged as a source photo must be absent from
+     * the collection, from its totals, from the set and type groupings and from
+     * the Unpriced tab — every one of which reads from the same query.
      */
-    test('the grid re-scan refuses honestly when recognition is not configured', async () => {
+    test('a photo of many cards is not listed as a card anywhere', async () => {
+        const id = await seedLegacyCard({ card_name: 'Binder page 3', card_number: '', current_price: 0 });
+        await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+        // A real stored photo: a row with no image has nothing to show and
+        // nothing to read, and is deliberately not offered as work.
+        await pool.query('UPDATE portfolio_cards SET image_data = $2 WHERE id = $1',
+            [id, 'data:image/jpeg;base64,/9j/4AAQSkZJRg==']);
+
+        const before = await api('/api/portfolio');
+        assert.ok(before.body.cards.some(c => c.id === id), 'it starts out listed');
+        const countedBefore = before.body.stats.totalCards;
+
+        await pool.query('UPDATE portfolio_cards SET is_source_photo = 1 WHERE id = $1', [id]);
+
+        const after = await api('/api/portfolio');
+        assert.equal(after.body.cards.some(c => c.id === id), false,
+            'a source photo must never appear in the collection');
+        assert.equal(after.body.stats.totalCards, countedBefore - 1,
+            'nor be counted in it');
+
+        // And it is still there, as what it actually is.
+        const photos = await api('/api/portfolio/source-photos');
+        assert.equal(photos.status, 200);
+        assert.ok(photos.body.photos.some(p => p.id === id),
+            'it is served as a source photo instead');
+
+        const stillThere = await pool.query('SELECT id FROM portfolio_cards WHERE id = $1', [id]);
+        assert.equal(stillThere.rows.length, 1, 'and the row itself was never deleted');
+    });
+
+    test('the extraction refuses honestly when recognition is not configured', async () => {
         // The suite runs the server with GEMINI_API_KEY empty, so this is the
-        // real path: it must say so rather than reporting a successful re-scan
+        // real path: it must say so rather than reporting a successful pass
         // that quietly did nothing.
-        const { status, body } = await api('/api/portfolio/rescan-grids', { method: 'POST' });
+        const { status, body } = await api('/api/portfolio/extract-source-photos', { method: 'POST' });
         assert.equal(status, 503);
         assert.match(body.error, /recognition/i);
     });
 
-    test('the grid re-scan never removes or duplicates what is already held', async () => {
+    test('extraction never removes or duplicates what is already held', async () => {
         const before = await pool.query(
             'SELECT COUNT(*)::int cards, (SELECT COUNT(*)::int FROM card_copies) copies FROM portfolio_cards');
 
-        await api('/api/portfolio/rescan-grids', { method: 'POST' });
+        await api('/api/portfolio/extract-source-photos', { method: 'POST' });
         await new Promise(r => setTimeout(r, 400));
 
         const after = await pool.query(
             'SELECT COUNT(*)::int cards, (SELECT COUNT(*)::int FROM card_copies) copies FROM portfolio_cards');
 
-        // Recovery only ever adds. A pass that cannot run must leave the
+        // Extraction only ever adds. A pass that cannot run must leave the
         // collection exactly as it found it — losing a card Jack owns would be
         // far worse than failing to find one.
         assert.ok(after.rows[0].cards >= before.rows[0].cards, 'no card row was removed');

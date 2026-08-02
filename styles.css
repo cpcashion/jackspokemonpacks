@@ -1267,3 +1267,16 @@ a { color: inherit; text-decoration: none; }
   .card-name { font-size: 13px; }
   .card-price { font-size: 14px; }
 }
+
+/* The photographs the collection was built from: pages of cards that have not
+   been read out yet. Shown as a scrolling strip because their number matters
+   more than any one of them, and they are wide by nature. */
+.source-strip {
+  display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
+  scrollbar-width: thin; -webkit-overflow-scrolling: touch;
+}
+.source-thumb {
+  height: 84px; width: auto; flex: none; border-radius: 8px;
+  border: 1px solid var(--line, rgba(128,128,128,0.25));
+  object-fit: cover;
+}

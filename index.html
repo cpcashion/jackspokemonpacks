@@ -180,6 +180,15 @@
 
     <!-- ── REVIEW ── -->
     <section class="view" id="view-review">
+      <!-- The original bulk uploads: photographs of whole binder pages. These
+           are not cards and are kept out of the collection entirely; this is
+           where the cards inside them get read out. -->
+      <div class="panel glass" id="sourcePhotoPanel" hidden>
+        <div class="section-title" style="margin-bottom: 6px;">Photos waiting to be read</div>
+        <div class="setting-desc" id="sourcePhotoText" style="margin-bottom: 12px;"></div>
+        <div id="sourcePhotoStrip" class="source-strip"></div>
+        <button class="btn btn-primary btn-sm" id="extractSourceBtn" style="margin-top: 12px;">Read every card in them</button>
+      </div>
       <div class="banner glass">
         <span class="banner-icon"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
         <div class="banner-body">
@@ -218,13 +227,6 @@
             <div class="setting-desc">Re-checks every card against the market APIs. Takes a while for a large collection.</div>
           </div>
           <button class="btn btn-glass btn-sm" id="settingsRefreshBtn">Refresh</button>
-        </div>
-        <div class="setting">
-          <div class="setting-body">
-            <div class="setting-title">Find cards missed in earlier photos</div>
-            <div class="setting-desc">The first uploads were photos of whole binder pages, and the scanner of the day kept one card from each and dropped the rest. This re-reads those photos and adds what was missed. It works from the stored thumbnail, so a card number too small to read may come back as an estimate — re-uploading the original photo now splits it perfectly.</div>
-          </div>
-          <button class="btn btn-glass btn-sm" id="rescanGridsBtn">Find them</button>
         </div>
         <div class="setting">
           <div class="setting-body">

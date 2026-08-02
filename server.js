@@ -51,6 +51,7 @@ import { typesFromCard, serializeTypes } from './lib/types.js';
 import { buildSearchQueries, compsFromListings } from './lib/ebay-comps.js';
 import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
 import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook } from './lib/card-crop.js';
+import { spreadPhotoIds } from './lib/source-photo.js';
 import {
     perceptualHash,
     decodeDataUrl,
@@ -174,6 +175,20 @@ async function initDB() {
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_tier TEXT DEFAULT '';
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS price_explanation TEXT DEFAULT '';
 
+        -- This row is not a card. It is a photograph of many cards — a binder
+        -- page or a tabletop layout — that an earlier scanner mistook for a
+        -- single card and filed in the collection. Rows carrying this flag are
+        -- excluded from the collection, its totals and its counts, and exist
+        -- only as the source the real cards are extracted from.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS is_source_photo INTEGER DEFAULT 0;
+        -- How many cards a look at the photo actually found, and whether the
+        -- extraction has been done. Nulls mean "not examined yet".
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS source_cards_found INTEGER;
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS source_extracted_at TIMESTAMP;
+        -- Which source photo a card came out of, so the spread it belongs to
+        -- can be shown and a re-extraction cannot duplicate it.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS source_photo_id INTEGER;
+
         -- A non-English card is stored under the name printed on it. The English
         -- name of the same Pokémon is kept alongside so it stays searchable and
         -- so an English-language card database can be queried at all.
@@ -222,6 +237,7 @@ async function initDB() {
     await queueLegacyPricesForRecheck();
     await clearPricesOnUnconfirmedCards();
     await queueUnpricedCardsForEstimates();
+    await flagSpreadPhotos();
 }
 
 async function hasRun(key) {
@@ -343,6 +359,52 @@ async function queueUnpricedCardsForEstimates() {
     if (res.rowCount) {
         console.log(`  [Migrate] Queued ${res.rowCount} unpriced card(s) — they will be valued, as estimates where the printing cannot be confirmed`);
     }
+}
+
+/**
+ * Get the photographs of whole binder pages out of the collection.
+ *
+ * These rows are the app's original sin: pictures of twenty cards, each saved
+ * as one card, sitting in the collection unpriced because no marketplace sells
+ * "a photograph of twenty cards". They were never cards and they should never
+ * have been listed as such.
+ *
+ * Shape decides it, and only in one direction. A Pokémon card is upright, and
+ * so is any photograph of one; a row of six or eight cards is wider than it is
+ * tall by construction. So a landscape photo is certainly not one card, while a
+ * portrait one might be a tall spread and is left for the vision pass to judge.
+ * Being cautious here costs a row staying visible a while longer. Being
+ * confident here would hide a card Jack owns.
+ *
+ * Nothing is deleted. The row becomes a source photo, keeps its image, and the
+ * cards inside it are extracted into rows of their own.
+ */
+async function flagSpreadPhotos() {
+    const KEY = 'flag_spread_photos_v1';
+    if (await hasRun(KEY)) return;
+
+    const { rows } = await pool.query(`
+        SELECT id, image_data FROM portfolio_cards
+        WHERE COALESCE(is_source_photo, 0) = 0 AND image_data IS NOT NULL AND image_data <> ''
+    `);
+
+    const sized = [];
+    for (const row of rows) {
+        const buffer = dataUrlToBuffer(row.image_data);
+        if (!buffer) continue;
+        try {
+            const meta = await sharp(buffer).metadata();
+            sized.push({ id: row.id, width: meta.width || 0, height: meta.height || 0 });
+        } catch { /* an unreadable thumbnail decides nothing */ }
+    }
+
+    const ids = spreadPhotoIds(sized);
+    if (ids.length) {
+        await pool.query(
+            'UPDATE portfolio_cards SET is_source_photo = 1 WHERE id = ANY($1::int[])', [ids]);
+        console.log(`  [Migrate] ${ids.length} row(s) are photos of several cards, not cards — moved out of the collection`);
+    }
+    await markRun(KEY, ids.length);
 }
 
 async function backfillVariantKeys() {
@@ -636,7 +698,7 @@ async function findDuplicateGroups(userId) {
                MIN(card_number)                     AS card_number,
                SUM((SELECT COUNT(*) FROM card_copies cc WHERE cc.card_id = pc.id))::int AS copy_count
         FROM portfolio_cards pc
-        WHERE user_id = $1 AND variant_key <> ''
+        WHERE user_id = $1 AND variant_key <> '' AND COALESCE(is_source_photo, 0) = 0
         GROUP BY variant_key
         HAVING COUNT(*) > 1
         ORDER BY COUNT(*) DESC
@@ -808,7 +870,11 @@ async function getAllPortfolioCards(userId) {
             ORDER BY ph.recorded_at DESC
             LIMIT 1
         ) month_ref ON true
-        WHERE pc.user_id = $1
+        -- Source photos are excluded here, which is what takes them out of the
+        -- collection, the totals, the set and type groupings and the Unpriced
+        -- tab all at once. They are pictures of many cards, not cards, and are
+        -- served separately by /api/portfolio/source-photos.
+        WHERE pc.user_id = $1 AND COALESCE(pc.is_source_photo, 0) = 0
     `, [userId]);
 
     return res.rows.map(decorateCardRow).sort((a, b) => b.total_value - a.total_value);
@@ -2685,6 +2751,8 @@ async function refreshBatchPrices(batchSize = 5) {
         const res = await pool.query(`
             SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
+            -- A source photo is not a card: never listed, never priced.
+            WHERE COALESCE(is_source_photo, 0) = 0
             ORDER BY
                 last_price_check ASC NULLS FIRST,
                 CASE WHEN COALESCE(current_price, 0) = 0 THEN 0 ELSE 1 END ASC,
@@ -2757,6 +2825,8 @@ async function refreshAllPrices() {
         const res = await pool.query(`
             SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
+            -- A source photo is not a card: never listed, never priced.
+            WHERE COALESCE(is_source_photo, 0) = 0
             ORDER BY COALESCE(needs_review, 0) DESC, last_price_check ASC NULLS FIRST, id ASC
         `);
         const cards = res.rows;
@@ -3656,7 +3726,9 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
     reviewRecheckRunning = true;
     try {
         const { rows } = await pool.query(
-            'SELECT * FROM portfolio_cards WHERE user_id = $1 AND COALESCE(needs_review, 0) = 1 ORDER BY id ASC',
+            `SELECT * FROM portfolio_cards
+             WHERE user_id = $1 AND COALESCE(needs_review, 0) = 1 AND COALESCE(is_source_photo, 0) = 0
+             ORDER BY id ASC`,
             [req.user.id]);
 
         res.json({ success: true, started: rows.length, message: `Re-checking ${rows.length} card${rows.length === 1 ? '' : 's'}…` });
@@ -3741,126 +3813,178 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
  * this only reports; the correction is a separate, explicit call.
  */
 /**
- * Recover the cards lost inside the original bulk uploads.
+ * The source photos: pictures of many cards, listed as photos rather than cards.
  *
- * The collection was built from photos of binder pages and tabletop grids — a
- * dozen or more cards per frame. The scanner of the day took the first card the
- * model named, saved it with the whole grid as its picture, and dropped the
- * rest. So a photo of sixteen cards became one row, illustrated by a picture of
- * sixteen cards, and fifteen cards Jack owns were never in the app at all.
- *
- * This re-reads those stored photos and adds what is missing. It is careful
- * about two things:
- *
- *  - Nothing is deleted. The original row stays; it is only re-illustrated with
- *    a crop of its own card once we know where that card sits in the frame.
- *  - Cards are matched against the collection by variant key, the same identity
- *    the scanner uses, so re-running this cannot double anything. A card already
- *    present is left alone rather than added as another copy — the grid is one
- *    photograph of one shelf, not evidence of a second copy.
+ * These are what the collection was built from — binder pages and tabletop
+ * layouts, six or eight cards across. They are deliberately absent from
+ * /api/portfolio, so the app can show them as what they are: material still
+ * waiting to be read, not twenty-card "cards" that no marketplace can price.
  */
-app.post('/api/portfolio/rescan-grids', requireAuth, async (req, res) => {
-    if (gridRescanRunning) return res.status(409).json({ error: 'A re-scan is already running.' });
+app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT pc.id, pc.image_data, pc.source_cards_found, pc.source_extracted_at, pc.added_at,
+                   (SELECT COUNT(*)::int FROM portfolio_cards c WHERE c.source_photo_id = pc.id) AS extracted
+            FROM portfolio_cards pc
+            -- A row with no stored image has nothing to show and nothing to
+            -- read, so it is not offered as work.
+            WHERE pc.user_id = $1 AND COALESCE(pc.is_source_photo, 0) = 1
+              AND pc.image_data IS NOT NULL AND pc.image_data <> ''
+            ORDER BY pc.id ASC
+        `, [req.user.id]);
+
+        res.json({
+            success: true,
+            photos: rows.map(r => ({
+                id: r.id,
+                image_data: r.image_data,
+                cards_found: r.source_cards_found,
+                extracted: r.extracted,
+                done: Boolean(r.source_extracted_at),
+            })),
+            pending: rows.filter(r => !r.source_extracted_at).length,
+            recognitionReady: Boolean(geminiModel),
+        });
+    } catch (err) {
+        console.error('Source photos error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Read every card out of every source photo.
+ *
+ * This is the job the original uploads were for: a picture of a shelf goes in,
+ * and every card in it comes out identified, cropped to itself and priced.
+ *
+ * Three properties it has to hold to be safe to run on a live collection:
+ *
+ *  - It only ever adds. A photo it cannot read leaves the collection exactly as
+ *    it found it; losing a card Jack owns is far worse than failing to find one.
+ *  - Cards are matched by the same variant key the scanner uses, so re-running
+ *    it cannot double anything. One photograph is evidence of one shelf, not of
+ *    a second copy of everything on it.
+ *  - A row that turns out to hold exactly one card was never a spread at all —
+ *    the shape test guessed wrong — so it goes back into the collection as the
+ *    card it always was.
+ */
+app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) => {
+    if (gridRescanRunning) return res.status(409).json({ error: 'An extraction is already running.' });
     if (!geminiModel) return res.status(503).json({ error: 'Card recognition is not configured on this server.' });
 
     gridRescanRunning = true;
     try {
-        // Only rows whose picture is a photo taken by the scanner. A card whose
-        // art came from a database has no frame to re-read.
         const { rows } = await pool.query(`
-            SELECT id, card_name, card_set, card_number, image_data
-            FROM portfolio_cards
-            WHERE user_id = $1 AND image_data IS NOT NULL AND image_data <> ''
+            SELECT id, image_data FROM portfolio_cards
+            WHERE user_id = $1 AND COALESCE(is_source_photo, 0) = 1 AND source_extracted_at IS NULL
+              AND image_data IS NOT NULL AND image_data <> ''
             ORDER BY id ASC
         `, [req.user.id]);
 
         res.json({
             success: true,
             started: rows.length,
-            message: `Looking through ${rows.length} scan photo${rows.length === 1 ? '' : 's'} for cards that were missed…`,
+            message: rows.length
+                ? `Reading ${rows.length} photo${rows.length === 1 ? '' : 's'} — every card in them will be added and priced…`
+                : 'No source photos are waiting to be read.',
         });
 
         (async () => {
-            let photosWithExtras = 0;
             let added = 0;
-            let alreadyHad = 0;
-            let reillustrated = 0;
+            let alreadyHeld = 0;
+            let cardsSeen = 0;
+            let restored = 0;
+            let unreadable = 0;
 
             for (let i = 0; i < rows.length; i++) {
                 const row = rows[i];
+                broadcast({
+                    type: 'extract_progress',
+                    done: i, total: rows.length, added, cardsSeen,
+                    message: `Reading photo ${i + 1} of ${rows.length}`,
+                });
+
                 try {
                     const buffer = dataUrlToBuffer(row.image_data);
-                    if (!buffer) continue;
+                    if (!buffer) { unreadable++; continue; }
 
                     const vision = await analyzeImageBuffer(buffer, 'image/jpeg');
-                    const cards = vision?.ok ? (vision.analysis?.cards || []) : [];
-                    if (cards.length <= 1) continue;
+                    if (!vision?.ok) { unreadable++; continue; }
 
-                    photosWithExtras++;
-                    broadcastActivity('info',
-                        `Photo of "${row.card_name}" actually shows ${cards.length} cards — adding the ones that were missed.`);
+                    let cards = (vision.analysis?.cards || []).filter(c => hasMeaningfulCardName(c.card_name));
+                    if (!cards.length) { unreadable++; continue; }
 
-                    // The row that already exists is whichever card in the frame
-                    // matches it. Re-illustrating it with its own crop is what
-                    // stops the collection showing the same grid fifteen times.
-                    const ownIndex = cards.findIndex(c =>
-                        normalizeText(c.card_name) === normalizeText(row.card_name)
-                        || normalizeCardNumber(c.card_number) === normalizeCardNumber(row.card_number));
-
-                    if (ownIndex >= 0) {
-                        const crop = await cropCardThumbnail(buffer, cards[ownIndex].box_2d);
-                        if (crop) {
-                            await pool.query('UPDATE portfolio_cards SET image_data = $2 WHERE id = $1', [row.id, crop]);
-                            reillustrated++;
-                        }
+                    // The shape test only rules a single card out, never in, so
+                    // a row it flagged that holds exactly one card was a card
+                    // all along. Put it back rather than stranding it.
+                    if (cards.length === 1) {
+                        await pool.query(
+                            'UPDATE portfolio_cards SET is_source_photo = 0, source_cards_found = 1, source_extracted_at = NOW() WHERE id = $1',
+                            [row.id]);
+                        restored++;
+                        continue;
                     }
 
-                    for (let j = 0; j < cards.length; j++) {
-                        if (j === ownIndex) continue;
-                        const rawCard = cards[j];
+                    // Weakly-read cards get a second look at the crop, which is
+                    // the only way a card number in small type survives being
+                    // one twentieth of a frame.
+                    const refined = await refineWeakCards(buffer, cards, 'image/jpeg');
+                    cards = refined.cards;
+                    cardsSeen += cards.length;
+
+                    broadcastActivity('info', `Photo ${i + 1}: ${cards.length} cards found — adding them.`);
+
+                    for (const rawCard of cards) {
                         if (!hasMeaningfulCardName(rawCard.card_name)) continue;
 
                         const { verified, why } = await verifyWithReason(rawCard);
                         const card = verified || { ...rawCard, needs_review: true };
 
-                        // Already in the collection: leave it be. One photograph
-                        // is evidence of one shelf, not of a second copy.
                         const existing = await findCardByVariant(buildVariantKey(card), req.user.id);
-                        if (existing) { alreadyHad++; continue; }
+                        if (existing) { alreadyHeld++; continue; }
 
                         const crop = await cropCardThumbnail(buffer, rawCard.box_2d);
-                        await saveScannedCard(card, {
+                        const saved = await saveScannedCard(card, {
                             userId: req.user.id,
                             thumbDataUrl: crop || '',
                             needsReview: !verified,
                             unverifiedReason: why,
                             forceSeparate: true,
                         });
+                        if (saved?.id) {
+                            await pool.query(
+                                'UPDATE portfolio_cards SET source_photo_id = $2 WHERE id = $1', [saved.id, row.id]);
+                        }
                         added++;
-                        broadcastActivity('card_added_detail', `➕ ${card.card_name} (found in an earlier photo)`);
+                        broadcastActivity('card_added_detail', `➕ ${card.card_name}`, saved);
                     }
+
+                    await pool.query(
+                        'UPDATE portfolio_cards SET source_cards_found = $2, source_extracted_at = NOW() WHERE id = $1',
+                        [row.id, cards.length]);
                 } catch (err) {
-                    console.error(`  [GridRescan] card ${row.id}:`, err.message);
+                    console.error(`  [Extract] photo ${row.id}:`, err.message);
+                    unreadable++;
                 }
 
-                broadcast({
-                    type: 'grid_rescan_progress',
-                    done: i + 1, total: rows.length, added, alreadyHad, photosWithExtras,
-                    card_name: row.card_name,
-                });
+                broadcast({ type: 'portfolio_updated' });
             }
 
-            broadcastActivity('grid_rescan_complete',
-                photosWithExtras
-                    ? `${photosWithExtras} photo${photosWithExtras === 1 ? '' : 's'} held more than one card: added ${added}, `
-                      + `${alreadyHad} were already in the collection, ${reillustrated} re-illustrated with their own card.`
-                    : 'Every scan photo held a single card — nothing was missed.');
+            const parts = [];
+            if (added) parts.push(`${added} card${added === 1 ? '' : 's'} added`);
+            if (alreadyHeld) parts.push(`${alreadyHeld} already in the collection`);
+            if (restored) parts.push(`${restored} turned out to be single cards and went back`);
+            if (unreadable) parts.push(`${unreadable} could not be read`);
+            broadcastActivity('extract_complete',
+                parts.length
+                    ? `Read ${rows.length} photo${rows.length === 1 ? '' : 's'}: ${parts.join(', ')}.`
+                    : 'Nothing new was found in those photos.');
             broadcast({ type: 'portfolio_updated' });
-        })().catch(err => console.error('Grid rescan error:', err))
+        })().catch(err => console.error('Extraction error:', err))
             .finally(() => { gridRescanRunning = false; });
     } catch (err) {
         gridRescanRunning = false;
-        console.error('Grid rescan error:', err);
+        console.error('Extraction error:', err);
         if (!res.headersSent) res.status(500).json({ error: err.message });
     }
 });
@@ -3872,7 +3996,7 @@ app.get('/api/portfolio/photo-audit', requireAuth, async (req, res) => {
                    pc.card_name, pc.card_set, pc.card_number, pc.current_price
             FROM card_copies cc
             JOIN portfolio_cards pc ON pc.id = cc.card_id
-            WHERE pc.user_id = $1
+            WHERE pc.user_id = $1 AND COALESCE(pc.is_source_photo, 0) = 0
             ORDER BY cc.card_id ASC, cc.id ASC
         `, [req.user.id]);
 

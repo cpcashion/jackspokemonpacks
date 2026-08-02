@@ -274,6 +274,27 @@ test('variant key: printings that price differently stay distinct', () => {
     assert.equal(keys.size, 4);
 });
 
+/**
+ * A price resting on one or two live listings is worth showing — a scarce card
+ * is not a worthless one — but it must not be presented as confidently as a
+ * price backed by a market. The flag travels from the eBay comps engine through
+ * the aggregator to the number on screen, and a spread operator quietly dropping
+ * it somewhere in between is exactly the kind of silent regression that would
+ * put a 90%-confident price on two anecdotes.
+ */
+test('aggregate: a price built on one or two listings is marked down', async () => {
+    const base = {
+        price: 40, currency: 'USD', marketplace: 'ebay', source: 'ebay_asking_prices',
+        variant: '', variantMatched: false, basis: 'listings', url: '',
+    };
+    const solid = await aggregateQuotes([base], { axios: axiosStub });
+    const scarce = await aggregateQuotes([{ ...base, thin: true }], { axios: axiosStub });
+
+    assert.equal(scarce.price, 40, 'the price itself is unchanged — it is real');
+    assert.ok(scarce.confidence < solid.confidence,
+        `thin evidence must lower confidence (${scarce.confidence} vs ${solid.confidence})`);
+});
+
 test('normalizeCardNumber copes with the formats the APIs disagree about', () => {
     assert.equal(normalizeCardNumber('004/102'), '4');
     assert.equal(normalizeCardNumber('4'), '4');

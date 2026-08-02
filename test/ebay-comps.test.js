@@ -20,6 +20,7 @@ import {
     estimateFromComps,
     compsFromListings,
     buildSearchQuery,
+    buildSearchQueries,
     quantile,
 } from '../lib/ebay-comps.js';
 
@@ -288,7 +289,128 @@ test('the search query names the card without over-specifying', () => {
     assert.equal(buildSearchQuery(ZARD), 'pokemon Charizard 4/102');
     assert.equal(buildSearchQuery({ ...ZARD, isFirstEdition: true }), 'pokemon Charizard 4/102 1st edition');
     assert.equal(buildSearchQuery({ ...ZARD, language: 'japanese' }), 'pokemon Charizard 4/102 japanese');
-    // The set name is deliberately absent: sellers do not all write it, and
-    // including it drops honest listings.
+    // The set name is deliberately absent from the first query: sellers do not
+    // all write it, and including it drops honest listings. It gets its own
+    // rung further down the ladder instead.
     assert.ok(!buildSearchQuery(ZARD).includes('Base Set'));
+});
+
+/**
+ * The Mega Zygarde bug, which is the reason any of this is a ladder.
+ *
+ * That card had 1,415 completed sales at a $75 median and the app reported no
+ * price at all. Its number is printed "120/088" — a numerator larger than the
+ * denominator, which set-total padding makes common on modern secret rares —
+ * and the single query we sent asked for "120/88". eBay matches title text, so
+ * it found nothing, and one empty search was the whole answer.
+ */
+test('the printed number is searched exactly as printed, padding and all', () => {
+    const zygarde = {
+        name: 'Mega Zygarde ex',
+        number: '120',
+        rawNumber: '120/088',
+        printedTotal: 88,
+        setName: 'Perfect Order',
+        language: 'english',
+    };
+    const queries = buildSearchQueries(zygarde).map(x => x.q);
+
+    assert.ok(queries[0].includes('120/088'),
+        `the first search must use the number as printed, got "${queries[0]}"`);
+    assert.ok(queries.some(q => q.includes('120/88')),
+        'and the unpadded form is still tried, for sellers who trim the zeroes');
+    assert.ok(queries.some(q => q.includes('Perfect Order')),
+        'and the set name, for titles that carry no number at all');
+});
+
+/**
+ * Our language slugs are internal names. "chinese-simplified" appears in no
+ * listing title ever written, so sending it as a search term guaranteed zero
+ * results for every Chinese card in the collection.
+ */
+test('language is searched in the words sellers actually type', () => {
+    const base = { name: 'Rockruff', number: '120', rawNumber: '120/105', printedTotal: 105, setName: 'Cyber Judge' };
+    for (const [slug, word] of [['chinese-simplified', 'chinese'], ['chinese-traditional', 'chinese'], ['japanese', 'japanese'], ['korean', 'korean']]) {
+        const queries = buildSearchQueries({ ...base, language: slug }).map(x => x.q);
+        assert.ok(queries.some(q => q.includes(word)), `"${word}" is what a seller writes`);
+        // Only meaningful where the slug is not already the word a seller uses.
+        if (slug !== word) {
+            assert.ok(queries.every(q => !q.includes(slug)), `"${slug}" must never be sent as a search term`);
+        }
+    }
+});
+
+/**
+ * Every rung after the first is looser, and looseness has to be paid for
+ * somewhere. The set-name rungs waive the number requirement, so the set name
+ * has to appear in the title instead — a bare name matches every printing of
+ * that Pokémon ever made and can never be enough.
+ */
+test('a looser search demands the set name in place of the number', () => {
+    const card = { name: 'Charizard', number: '4', rawNumber: '4/102', printedTotal: 102, setName: 'Base Set', language: 'english' };
+    const looser = buildSearchQueries(card).filter(x => x.requireNumber === false);
+    assert.ok(looser.length, 'there is a rung that does not require the number');
+    assert.ok(looser.every(x => x.strict === false), 'and it is marked as not strict');
+
+    // With the number waived, the set name carries the match.
+    const withSet = titleMatchesCard('Pokemon Charizard Base Set Holo', { ...card, setName: 'Base Set', requireNumber: false });
+    assert.equal(withSet.confident, true, 'name plus set name is acceptable on a loose rung');
+
+    const bareName = titleMatchesCard('Pokemon Charizard Holo Rare', { ...card, setName: 'Base Set', requireNumber: false });
+    assert.equal(bareName.confident, false, 'a bare name is never enough, on any rung');
+});
+
+/**
+ * A name in a non-Latin script had every character stripped by the loose-match
+ * builder, leaving a regex that matched any title at all — so a Japanese card
+ * would accept comps for entirely unrelated cards.
+ */
+test('a CJK name is matched literally rather than matching everything', () => {
+    const card = { name: '\u30ea\u30b6\u30fc\u30c9\u30f3', number: '4', printedTotal: 102, language: 'japanese' };
+    assert.equal(titleMatchesCard('\u30dd\u30b1\u30e2\u30f3 \u30ea\u30b6\u30fc\u30c9\u30f3 4/102', card).confident, true,
+        'the Japanese name present in the title matches');
+    assert.equal(titleMatchesCard('Pokemon Blastoise 2/102 Holo', card).name, false,
+        'a title without that name must not match — it used to match everything');
+});
+
+/**
+ * When every search has been tried and two live listings is all that exists,
+ * two listings is the answer. "No price found" on a card with real listings
+ * was the worse error, and it is the one the user reported.
+ */
+/**
+ * "Traditional Chinese" contains the word "Chinese", so the looser pattern
+ * matched it first and every Traditional listing was filed as Simplified. That
+ * both hid Traditional cards from their own comps and let them contaminate the
+ * Simplified ones — two different printings at two different prices, averaged.
+ */
+test('Traditional and Simplified Chinese are told apart', () => {
+    const language = t => classifyTitle(t).language;
+    assert.equal(language('Pokemon Charizard Traditional Chinese 4/102'), 'chinese-traditional');
+    assert.equal(language('Pokemon Charizard Chinese Traditional 4/102'), 'chinese-traditional');
+    assert.equal(language('Pokemon Charizard Taiwan 4/102'), 'chinese-traditional');
+    assert.equal(language('Pokemon Charizard Simplified Chinese 4/102'), 'chinese-simplified');
+    assert.equal(language('Pokemon Charizard Chinese 4/102'), 'chinese-simplified');
+    // And the others are unaffected.
+    assert.equal(language('Pokemon Charizard Japanese 4/102'), 'japanese');
+    assert.equal(language('Pokemon Charizard 4/102'), 'english');
+});
+
+test('a scarce card is priced cautiously rather than not at all', () => {
+    const listings = [
+        { title: 'Pokemon Charizard 4/102 Base Set', price: { value: '900' } },
+        { title: 'Pokemon Charizard 4/102 Base Set Holo', price: { value: '1100' } },
+    ];
+
+    // The default is still to refuse: two asks is an anecdote, and the caller
+    // should widen the search before settling.
+    assert.equal(compsFromListings(listings, ZARD).estimate, null);
+
+    // Once the ladder is exhausted, the anecdote is quoted — the cheaper of
+    // the two, since a single ask is a hope rather than a price.
+    const thin = compsFromListings(listings, ZARD, { thin: true });
+    assert.ok(thin.estimate, 'a price is produced rather than nothing');
+    assert.equal(thin.estimate.price, 900, 'the cheapest, being the one a buyer reaches first');
+    assert.equal(thin.estimate.thin, true, 'and it is flagged so its confidence is cut');
+    assert.match(thin.estimate.note, /2 live listings/);
 });

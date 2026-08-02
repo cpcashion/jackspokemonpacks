@@ -1797,6 +1797,38 @@ $('recheckReviewBtn').addEventListener('click', async (e) => {
   }
 });
 
+/**
+ * Go back through the original bulk uploads and pull out the cards that were
+ * dropped. Those photos were whole binder pages; the scanner of the day kept
+ * one card from each and discarded the rest.
+ */
+$('rescanGridsBtn')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Looking…';
+  try {
+    const r = await api('/api/portfolio/rescan-grids', { method: 'POST' });
+    toast(r.message || 'Looking through your scan photos…', 'info', 6000);
+  } catch (err) {
+    toast(err.message, 'error', 6000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
+/** Live progress for the grid re-scan, alongside the other long jobs. */
+function showGridRescanProgress(payload) {
+  const note = $('syncNote');
+  if (!note) return;
+  if (!payload) { note.textContent = ''; note.classList.remove('busy'); return; }
+  note.classList.add('busy');
+  note.textContent = payload.added
+    ? `Photo ${payload.done} of ${payload.total} — ${payload.added} card${payload.added === 1 ? '' : 's'} recovered`
+    : `Checking photo ${payload.done} of ${payload.total}`;
+}
+
 /** Live progress for the bulk re-check, in the same place as a refresh. */
 function showRecheckProgress(payload) {
   const note = $('syncNote');
@@ -2727,8 +2759,27 @@ function onScanProgress(ev) {
       analysisStep('ai', 'live', 'Identifying the card');
       break;
 
+    // A binder page or a tabletop grid. Every card in it is being added, so the
+    // panel says how many are coming rather than appearing to stall on the
+    // first one for a minute.
+    case 'multi_card':
+      analysisStep('ai', 'done', `${ev.count} cards in this photo`);
+      analysisStep('multi', 'live', ev.message || `Adding all ${ev.count}`);
+      break;
+
+    case 'closer_look':
+      analysisStep('closer', 'live', ev.message || 'Re-reading the small ones close up');
+      break;
+
+    case 'closer_look_done':
+      analysisStep('closer', 'done', ev.message || 'Read more clearly close up');
+      break;
+
     case 'identified': {
       const c = ev.card || {};
+      // In a multi-card photo each card is illustrated by its own crop, so the
+      // panel shows the card being worked on rather than the whole page.
+      if (ev.image_data) { $('analysisImg').hidden = false; $('analysisImg').src = ev.image_data; }
       const pctText = c.confidence > 0 ? `${Math.round(c.confidence * 100)}% sure` : '';
       // A non-English card is named twice: what is printed on it, and the
       // English name that makes it findable in a card database.
@@ -2839,8 +2890,10 @@ function connectEvents() {
       if (payload.type === 'scan_progress') onScanProgress(payload);
       if (payload.type === 'refresh_progress') showRefreshProgress(payload);
       if (payload.type === 'recheck_progress') showRecheckProgress(payload);
+      if (payload.type === 'grid_rescan_progress') showGridRescanProgress(payload);
       if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
       if (payload.activityType === 'recheck_complete') { toast(payload.message, 'success', 8000); showRecheckProgress(null); }
+      if (payload.activityType === 'grid_rescan_complete') { toast(payload.message, 'success', 10000); showGridRescanProgress(null); }
       if (payload.activityType === 'error') toast(payload.message, 'error', 7000);
     };
     source.onerror = () => {

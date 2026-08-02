@@ -48,8 +48,9 @@ import {
 } from './lib/identity.js';
 import { auditHistoryRows } from './lib/history.js';
 import { typesFromCard, serializeTypes } from './lib/types.js';
-import { buildSearchQuery, compsFromListings } from './lib/ebay-comps.js';
+import { buildSearchQueries, compsFromListings } from './lib/ebay-comps.js';
 import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
+import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook } from './lib/card-crop.js';
 import {
     perceptualHash,
     decodeDataUrl,
@@ -1173,6 +1174,10 @@ if (GEMINI_KEY && GEMINI_KEY !== 'your_gemini_api_key_here') {
  */
 const CARD_ID_PROMPT = `You are an expert Pokemon TCG card identifier. Identify every physical Pokemon card visible in this image.
 
+MANY OF THESE IMAGES CONTAIN SEVERAL CARDS AT ONCE — a binder page, a grid laid out on a table, a fan of cards. Return one entry for EVERY card you can see, not just the most prominent one. A photo of sixteen cards must return sixteen entries. Work through the image systematically, row by row, so none is skipped. Two cards showing the same Pokemon are two entries, not one.
+
+For each card also return box_2d: the card's bounding box in the image as [ymin, xmin, ymax, xmax], each value 0-1000 relative to the image size. This is what lets each card be cropped out and shown on its own, so give it for every card even when there is only one. Bound the card itself, not the sleeve or the binder pocket around it.
+
 Pokemon cards are printed in English, Japanese, Korean, Simplified Chinese, Traditional Chinese, French, German, Spanish, Italian, Portuguese, Dutch, Polish, Russian, Thai and Indonesian. Read whichever language the card is actually in. Never refuse a card because it is not in English.
 
 Read these directly off the card. Do not infer them from the artwork or from what is typical:
@@ -1203,6 +1208,7 @@ Rules:
 Return ONLY valid JSON (no markdown fences):
 {
   "cards": [{
+    "box_2d": [ymin, xmin, ymax, xmax],
     "card_name": "name exactly as printed, in its own script",
     "card_name_en": "official English name of the same Pokemon",
     "card_set": "Set name or empty string",
@@ -1749,6 +1755,92 @@ async function prepareImageForAi(buffer) {
     }
 }
 
+/** Decode a stored `data:` thumbnail back to bytes. */
+function dataUrlToBuffer(dataUrl) {
+    const m = /^data:([^;]+);base64,(.+)$/s.exec(String(dataUrl || ''));
+    if (!m) return null;
+    try {
+        const buf = Buffer.from(m[2], 'base64');
+        return buf.length ? buf : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Cut one card out of a photo of several.
+ *
+ * Returns null rather than throwing on any failure: a card shown under the
+ * whole grid is a cosmetic problem, and failing the scan over it would be a
+ * real one. The caller falls back to the full-frame thumbnail.
+ */
+async function cropCardThumbnail(buffer, box, { width = 400, height = 560 } = {}) {
+    try {
+        const meta = await sharp(buffer).metadata();
+        const region = boxToRegion(box, meta.width, meta.height);
+        if (!region) return null;
+        const out = await sharp(buffer)
+            .rotate()
+            .extract(region)
+            .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 82, mozjpeg: true })
+            .toBuffer();
+        return `data:image/jpeg;base64,${out.toString('base64')}`;
+    } catch (err) {
+        console.error('  [Crop] Could not cut card from photo:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Cards in a grid photo get a fraction of the frame each, and the scan pipeline
+ * downscales to 1280px before the model ever sees it. Sixteen cards across that
+ * is roughly 320px per card, which is not enough for a card number set in small
+ * type — so the weakly-read ones are cut out of the ORIGINAL, full-resolution
+ * buffer and read again on their own.
+ *
+ * Capped, because each re-read is a separate model call: a binder page of
+ * thirty cards must not turn into thirty-one requests.
+ */
+const CLOSER_LOOK_LIMIT = 8;
+
+async function refineWeakCards(buffer, cards, mime, report = () => {}) {
+    const weak = needsCloserLook(cards).slice(0, CLOSER_LOOK_LIMIT);
+    if (!weak.length) return { cards, refined: 0 };
+
+    report('closer_look', {
+        count: weak.length,
+        message: `Re-reading ${weak.length} card${weak.length === 1 ? '' : 's'} close up`,
+    });
+
+    const out = [...cards];
+    let refined = 0;
+
+    for (const { card, index } of weak) {
+        try {
+            const meta = await sharp(buffer).metadata();
+            const region = boxToRegion(card.box_2d, meta.width, meta.height, 0.06);
+            if (!region) continue;
+            const crop = await sharp(buffer).rotate().extract(region)
+                .resize(AI_IMAGE_MAX_EDGE, AI_IMAGE_MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 90, mozjpeg: true })
+                .toBuffer();
+
+            const closer = await analyzeImageBuffer(crop, 'image/jpeg');
+            const first = closer?.ok ? closer.analysis?.cards?.[0] : null;
+            if (!first) continue;
+
+            out[index] = mergeCloserLook(card, first);
+            refined++;
+        } catch (err) {
+            console.error(`  [Closer look] ${card?.card_name || 'card'}:`, err.message);
+        }
+    }
+
+    if (refined) report('closer_look_done', { refined, message: `Read ${refined} more clearly close up` });
+    return { cards: out, refined };
+}
+
 async function convertToJpeg(buffer, filePath) {
     try {
         const converted = await sharp(buffer)
@@ -2058,23 +2150,15 @@ async function ebayAccessToken() {
 }
 
 /**
- * Live listings for one card: both Buy-It-Now and auctions.
+ * Live listings for one search string: both Buy-It-Now and auctions.
  *
  * eBay returns only fixed-price listings unless auctions are asked for
  * explicitly, and auctions are the half we care about most — so both are
  * fetched and merged.
  */
-async function fetchEbayListings(card) {
+async function fetchEbayListings(card, q) {
     const token = await ebayAccessToken();
     if (!token) return null;
-
-    const q = buildSearchQuery({
-        name: card.card_name_en || card.card_name,
-        number: normalizeCardNumber(card.card_number),
-        printedTotal: printedSetTotal(card.card_number),
-        language: normalizeLanguage(card.language),
-        isFirstEdition: isTruthy(card.is_first_edition),
-    });
     if (!q) return null;
 
     const headers = {
@@ -2119,42 +2203,100 @@ async function fetchEbayListings(card) {
  * afterwards — applying both would discount twice.
  */
 async function collectEbayQuotes(card) {
-    let listings;
-    try {
-        listings = await fetchEbayListings(card);
-    } catch (err) {
-        const failure = describeAxiosError(err, { usesKey: true });
-        noteSource('ebay', failure);
-        throw new SourceUnavailable(failure);
-    }
-    if (!listings) return [];
-
-    const result = compsFromListings(listings, {
+    const subject = {
         name: card.card_name_en || card.card_name,
         number: normalizeCardNumber(card.card_number),
+        rawNumber: card.card_number || '',
         printedTotal: printedSetTotal(card.card_number),
+        setName: card.card_set || '',
         language: normalizeLanguage(card.language),
         isFirstEdition: isTruthy(card.is_first_edition),
         // Graded slabs trade in a separate market; only match like with like.
         graded: Boolean(card.graded),
         grade: card.grade || null,
-    });
+    };
 
-    lastEbayWorkings.set(buildVariantKey(card), result);
-    if (!result.estimate) return [];
+    const queries = buildSearchQueries(subject);
+    if (!queries.length) return [];
 
+    // Walk the ladder until something holds.
+    //
+    // A single query was the whole bug behind "no price found" on a card with
+    // 1,415 completed sales: eBay matches title text, sellers write the number
+    // in several shapes, and one guess at which shape missed. Each rung is
+    // tried in turn and the first that yields a defensible estimate wins, so
+    // the common case still costs exactly one round trip.
+    //
+    // Every listing seen along the way is kept. If no rung produces an estimate
+    // on its own, the pooled set gets one last pass with the thin-evidence rule
+    // enabled — because two real listings at $8 is a better answer than none.
+    let best = null;
+    let bestQuery = '';
+    const seen = new Map();
+    const attempts = [];
+    let lastError = null;
+
+    for (const { q, requireNumber, strict } of queries) {
+        let listings;
+        try {
+            listings = await fetchEbayListings(card, q);
+        } catch (err) {
+            lastError = err;
+            attempts.push({ q, error: describeAxiosError(err, { usesKey: true }).message });
+            continue;
+        }
+        if (!listings) return [];
+
+        for (const item of listings) if (item?.itemId) seen.set(item.itemId, item);
+
+        const result = compsFromListings(listings, { ...subject, requireNumber });
+        attempts.push({ q, strict, considered: result.considered, accepted: result.accepted, priced: Boolean(result.estimate) });
+
+        if (result.estimate) {
+            best = { ...result, strict, query: q };
+            bestQuery = q;
+            break;
+        }
+    }
+
+    // Nothing was reachable at all — that is an outage, not a priceless card,
+    // and the two must not look alike.
+    if (!best && lastError && !seen.size) {
+        const failure = describeAxiosError(lastError, { usesKey: true });
+        noteSource('ebay', failure);
+        throw new SourceUnavailable(failure);
+    }
+
+    if (!best && seen.size) {
+        const pooled = compsFromListings([...seen.values()], { ...subject, requireNumber: false }, { thin: true });
+        if (pooled.estimate) best = { ...pooled, strict: false, query: `${queries.length} searches pooled` };
+        else best = pooled;
+    }
+
+    if (best) {
+        lastEbayWorkings.set(buildVariantKey(card), { ...best, attempts });
+    }
+    if (!best?.estimate) return [];
+
+    const { estimate } = best;
+    const fromBids = estimate.basis === 'auction bids';
     return [{
-        price: result.estimate.price,
+        price: estimate.price,
         currency: 'USD',
         marketplace: 'ebay',
-        source: `ebay_${result.estimate.basis.replace(/\s+/g, '_')}`,
+        source: `ebay_${estimate.basis.replace(/\s+/g, '_')}`,
         variant: '',
         // A bid is a buyer committing to this exact card, which is a stronger
-        // claim about the printing than a catalogue lookup makes.
-        variantMatched: result.estimate.basis === 'auction bids',
-        basis: result.estimate.basis === 'auction bids' ? 'market' : 'listings',
-        url: '',
-        samples: result.estimate.samples,
+        // claim about the printing than a catalogue lookup makes — but only
+        // when the search that found it demanded the printed number. A looser
+        // rung found a card by name and set, which is not the same claim.
+        variantMatched: fromBids && best.strict === true,
+        basis: fromBids ? 'market' : 'listings',
+        url: bestQuery ? `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(bestQuery)}` : '',
+        samples: estimate.samples,
+        // Carried through so the aggregator can discount a price that rests on
+        // one or two listings rather than a market.
+        thin: Boolean(estimate.thin),
     }];
 }
 
@@ -2490,6 +2632,7 @@ function scanReporter(scanId) {
 
 let priceRefreshRunning = false;
 let reviewRecheckRunning = false;
+let gridRescanRunning = false;
 
 /**
  * How long to wait between cards during a bulk refresh.
@@ -3597,6 +3740,131 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
  * Read-only. Deleting a copy someone owns is worse than leaving a duplicate, so
  * this only reports; the correction is a separate, explicit call.
  */
+/**
+ * Recover the cards lost inside the original bulk uploads.
+ *
+ * The collection was built from photos of binder pages and tabletop grids — a
+ * dozen or more cards per frame. The scanner of the day took the first card the
+ * model named, saved it with the whole grid as its picture, and dropped the
+ * rest. So a photo of sixteen cards became one row, illustrated by a picture of
+ * sixteen cards, and fifteen cards Jack owns were never in the app at all.
+ *
+ * This re-reads those stored photos and adds what is missing. It is careful
+ * about two things:
+ *
+ *  - Nothing is deleted. The original row stays; it is only re-illustrated with
+ *    a crop of its own card once we know where that card sits in the frame.
+ *  - Cards are matched against the collection by variant key, the same identity
+ *    the scanner uses, so re-running this cannot double anything. A card already
+ *    present is left alone rather than added as another copy — the grid is one
+ *    photograph of one shelf, not evidence of a second copy.
+ */
+app.post('/api/portfolio/rescan-grids', requireAuth, async (req, res) => {
+    if (gridRescanRunning) return res.status(409).json({ error: 'A re-scan is already running.' });
+    if (!geminiModel) return res.status(503).json({ error: 'Card recognition is not configured on this server.' });
+
+    gridRescanRunning = true;
+    try {
+        // Only rows whose picture is a photo taken by the scanner. A card whose
+        // art came from a database has no frame to re-read.
+        const { rows } = await pool.query(`
+            SELECT id, card_name, card_set, card_number, image_data
+            FROM portfolio_cards
+            WHERE user_id = $1 AND image_data IS NOT NULL AND image_data <> ''
+            ORDER BY id ASC
+        `, [req.user.id]);
+
+        res.json({
+            success: true,
+            started: rows.length,
+            message: `Looking through ${rows.length} scan photo${rows.length === 1 ? '' : 's'} for cards that were missed…`,
+        });
+
+        (async () => {
+            let photosWithExtras = 0;
+            let added = 0;
+            let alreadyHad = 0;
+            let reillustrated = 0;
+
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                try {
+                    const buffer = dataUrlToBuffer(row.image_data);
+                    if (!buffer) continue;
+
+                    const vision = await analyzeImageBuffer(buffer, 'image/jpeg');
+                    const cards = vision?.ok ? (vision.analysis?.cards || []) : [];
+                    if (cards.length <= 1) continue;
+
+                    photosWithExtras++;
+                    broadcastActivity('info',
+                        `Photo of "${row.card_name}" actually shows ${cards.length} cards — adding the ones that were missed.`);
+
+                    // The row that already exists is whichever card in the frame
+                    // matches it. Re-illustrating it with its own crop is what
+                    // stops the collection showing the same grid fifteen times.
+                    const ownIndex = cards.findIndex(c =>
+                        normalizeText(c.card_name) === normalizeText(row.card_name)
+                        || normalizeCardNumber(c.card_number) === normalizeCardNumber(row.card_number));
+
+                    if (ownIndex >= 0) {
+                        const crop = await cropCardThumbnail(buffer, cards[ownIndex].box_2d);
+                        if (crop) {
+                            await pool.query('UPDATE portfolio_cards SET image_data = $2 WHERE id = $1', [row.id, crop]);
+                            reillustrated++;
+                        }
+                    }
+
+                    for (let j = 0; j < cards.length; j++) {
+                        if (j === ownIndex) continue;
+                        const rawCard = cards[j];
+                        if (!hasMeaningfulCardName(rawCard.card_name)) continue;
+
+                        const { verified, why } = await verifyWithReason(rawCard);
+                        const card = verified || { ...rawCard, needs_review: true };
+
+                        // Already in the collection: leave it be. One photograph
+                        // is evidence of one shelf, not of a second copy.
+                        const existing = await findCardByVariant(buildVariantKey(card), req.user.id);
+                        if (existing) { alreadyHad++; continue; }
+
+                        const crop = await cropCardThumbnail(buffer, rawCard.box_2d);
+                        await saveScannedCard(card, {
+                            userId: req.user.id,
+                            thumbDataUrl: crop || '',
+                            needsReview: !verified,
+                            unverifiedReason: why,
+                            forceSeparate: true,
+                        });
+                        added++;
+                        broadcastActivity('card_added_detail', `➕ ${card.card_name} (found in an earlier photo)`);
+                    }
+                } catch (err) {
+                    console.error(`  [GridRescan] card ${row.id}:`, err.message);
+                }
+
+                broadcast({
+                    type: 'grid_rescan_progress',
+                    done: i + 1, total: rows.length, added, alreadyHad, photosWithExtras,
+                    card_name: row.card_name,
+                });
+            }
+
+            broadcastActivity('grid_rescan_complete',
+                photosWithExtras
+                    ? `${photosWithExtras} photo${photosWithExtras === 1 ? '' : 's'} held more than one card: added ${added}, `
+                      + `${alreadyHad} were already in the collection, ${reillustrated} re-illustrated with their own card.`
+                    : 'Every scan photo held a single card — nothing was missed.');
+            broadcast({ type: 'portfolio_updated' });
+        })().catch(err => console.error('Grid rescan error:', err))
+            .finally(() => { gridRescanRunning = false; });
+    } catch (err) {
+        gridRescanRunning = false;
+        console.error('Grid rescan error:', err);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/photo-audit', requireAuth, async (req, res) => {
     try {
         const { rows } = await pool.query(`
@@ -3980,9 +4248,40 @@ async function processPortfolioUpload(files, userId, options = {}) {
             continue;
         }
 
-        for (const rawCard of analysis.cards) {
+        // A photo of a binder page or a tabletop grid. Every card in it is a
+        // card Jack owns, so every one is added — and each gets its own picture
+        // cut out of the frame, rather than fifteen rows all illustrated by the
+        // same photo of sixteen cards.
+        let scanCards = analysis.cards;
+        const multi = isMultiCard(scanCards);
+        if (multi) {
+            report('multi_card', {
+                ...photo,
+                count: scanCards.length,
+                message: `${scanCards.length} cards in this photo — adding each one`,
+            });
+            broadcastActivity('info', `Found ${scanCards.length} cards in photo ${index + 1}.`);
+
+            // Read from the ORIGINAL buffer, not the downscaled copy the first
+            // pass used: the whole reason a card in a grid reads poorly is that
+            // it only had a fraction of those pixels to begin with.
+            const refined = await refineWeakCards(buffer, scanCards, sendMime,
+                (stage, payload) => report(stage, { ...photo, ...payload }));
+            scanCards = refined.cards;
+        }
+
+        for (const rawCard of scanCards) {
+            // Each card is illustrated by itself where the model said where it
+            // is; a full-frame thumbnail stands in when it did not.
+            let cardThumb = thumbDataUrl;
+            if (multi) {
+                const cropped = await cropCardThumbnail(buffer, rawCard.box_2d);
+                if (cropped) cardThumb = cropped;
+            }
+
             report('identified', {
                 ...photo,
+                image_data: cardThumb,
                 card: {
                     card_name: rawCard.card_name || '',
                     card_name_en: rawCard.card_name_en || '',
@@ -4024,7 +4323,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
                         status: 'rejected',
                         reason: 'unreadable_card',
                         message: 'Could not read the card name. Try again with less glare.',
-                        image_data: thumbDataUrl,
+                        image_data: cardThumb,
                     });
                     continue;
                 }
@@ -4042,7 +4341,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
 
             const saved = await saveScannedCard(card, {
                 userId,
-                thumbDataUrl,
+                thumbDataUrl: cardThumb,
                 needsReview: !verified,
                 unverifiedReason,
                 forceSeparate: options.forceSeparate === true,

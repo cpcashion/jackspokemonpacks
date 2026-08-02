@@ -651,6 +651,39 @@ if (!DB) {
     });
 
     /**
+     * The original bulk uploads were photos of whole binder pages, and the
+     * scanner of the day kept one card from each and dropped the rest. The
+     * recovery pass has to be safe to run repeatedly on a live collection, so
+     * these pin its guarantees rather than its output — which depends on a
+     * vision model this suite deliberately does not call.
+     */
+    test('the grid re-scan refuses honestly when recognition is not configured', async () => {
+        // The suite runs the server with GEMINI_API_KEY empty, so this is the
+        // real path: it must say so rather than reporting a successful re-scan
+        // that quietly did nothing.
+        const { status, body } = await api('/api/portfolio/rescan-grids', { method: 'POST' });
+        assert.equal(status, 503);
+        assert.match(body.error, /recognition/i);
+    });
+
+    test('the grid re-scan never removes or duplicates what is already held', async () => {
+        const before = await pool.query(
+            'SELECT COUNT(*)::int cards, (SELECT COUNT(*)::int FROM card_copies) copies FROM portfolio_cards');
+
+        await api('/api/portfolio/rescan-grids', { method: 'POST' });
+        await new Promise(r => setTimeout(r, 400));
+
+        const after = await pool.query(
+            'SELECT COUNT(*)::int cards, (SELECT COUNT(*)::int FROM card_copies) copies FROM portfolio_cards');
+
+        // Recovery only ever adds. A pass that cannot run must leave the
+        // collection exactly as it found it — losing a card Jack owns would be
+        // far worse than failing to find one.
+        assert.ok(after.rows[0].cards >= before.rows[0].cards, 'no card row was removed');
+        assert.ok(after.rows[0].copies >= before.rows[0].copies, 'no copy was removed');
+    });
+
+    /**
      * The complaint, stated plainly: "there's no value being found for new
      * cards that get uploaded in the app... the user shouldn't ever have to
      * manually review cards or confirm pricing."

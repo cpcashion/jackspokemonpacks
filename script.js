@@ -630,9 +630,18 @@ async function checkForSplitRows() {
   }
 }
 
+/**
+ * The picture to show for a card.
+ *
+ * Database artwork is preferred, but ONLY when the printing was confirmed: it
+ * is a picture of a card, and on an unconfirmed match it may be a picture of a
+ * different one. Your own photograph is always a picture of your actual card,
+ * so it wins whenever the identity is not settled.
+ */
 function cardArt(card, cls) {
   const wrap = el('div', cls);
-  if (card.image_url) {
+  const artworkTrustworthy = card.image_url && card.printing_confirmed !== false;
+  if (artworkTrustworthy) {
     const img = el('img');
     img.loading = 'lazy';
     img.decoding = 'async';
@@ -1295,11 +1304,16 @@ function renderSheetBody() {
   } else if (card.unit_price > 0) {
     figures.append(el('div', 'figure-note', `${money(card.unit_price)} Near Mint · adjusted for condition`));
   } else {
-    figures.append(el('div', 'figure-note', card.is_non_english
-      // Being explicit matters here: the absence of a price is a deliberate
-      // choice, not a bug. English marketplaces quote English printings.
-      ? `No marketplace quotes a price for ${card.language_label} printings of this card. English prices are not shown as a stand-in, because they are not this card's price.`
-      : 'No marketplace quotes a price for this card yet. The app tries again on every refresh.'));
+    // The server names the sources it asked and the ones it could not, which is
+    // the difference between "this card has no market" and "the only source
+    // that lists it was never contacted". A generic sentence hid the second
+    // case entirely.
+    figures.append(el('div', 'figure-note', card.price_explanation
+      || (card.is_non_english
+        // Being explicit matters here: the absence of a price is a deliberate
+        // choice, not a bug. English marketplaces quote English printings.
+        ? `No marketplace quotes a price for ${card.language_label} printings of this card. English prices are not shown as a stand-in, because they are not this card's price.`
+        : 'No marketplace quotes a price for this card yet. The app tries again on every refresh.')));
   }
 
   // Where an estimate says what it is. The number is above, in the same place
@@ -2048,6 +2062,24 @@ async function loadAccounting() {
     const total = el('div', 'acct-row acct-total');
     total.append(el('div', 'acct-dot'), el('div', 'acct-label', 'Total'), el('div', 'acct-value', money(a.total)));
     host.appendChild(total);
+
+    // The raw row counts and the database they came from, so the figures above
+    // can be checked against the Neon console without taking the app's word.
+    try {
+      const r = await api('/api/portfolio/reconcile');
+      const note = el('div', 'acct-note');
+      note.append(el('b', null, 'Straight from the database'));
+      const list = el('div', 'acct-list');
+      const c = r.counts;
+      list.append(
+        el('div', 'acct-item', `${c.cards_listed} card rows (${c.copies} copies, ${c.distinct_printings} distinct printings)`),
+        el('div', 'acct-item', `${c.source_photos} source photos, ${c.price_points} price points recorded`),
+        el('div', 'acct-item muted', `${r.database.name} on ${r.database.host || 'the configured host'}`),
+        el('div', 'acct-item muted', 'These are plain COUNT(*) figures — compare them with the Neon console. If they disagree, the two are different databases or branches.'),
+      );
+      note.appendChild(list);
+      host.appendChild(note);
+    } catch { /* the books still stand without it */ }
 
     if (a.withoutPhoto.length) {
       const note = el('div', 'acct-note');

@@ -239,6 +239,8 @@ async function initDB() {
     await queueUnpricedCardsForEstimates();
     await flagSpreadPhotos();
     await withdrawUnreachablePrices();
+    await rebuildIdentityAndMerge();
+    await dropUnconfirmedArtwork();
 }
 
 async function hasRun(key) {
@@ -459,6 +461,111 @@ async function flagSpreadPhotos() {
         console.log(`  [Migrate] ${ids.length} row(s) are photos of several cards, not cards — moved out of the collection`);
     }
     await markRun(KEY, ids.length);
+}
+
+/**
+ * Rebuild every card's identity, and fold together the rows that were split.
+ *
+ * Identity used to include the set NAME, which nothing prints — the model infers
+ * it from a symbol, and infers inconsistently. One Meganium numbered 010/132 was
+ * read once as "Scarlet & Violet-Temporal Forces" and once as "Paldea Evolved",
+ * so it became two cards: two rows, two entries in the count, two prices in the
+ * total, for one piece of cardboard.
+ *
+ * Copies need more care than rows do. Merging two rows normally combines their
+ * copies, because two rows usually mean two physical cards — but not here. These
+ * pairs came from the same shelf being read twice: once by the original scan and
+ * once by the extraction pass, which was supposed to skip cards already held and
+ * failed to only because the keys disagreed. A copy created that way is evidence
+ * of the same card, not a second one.
+ *
+ * So the rule is: keep the copies of the row that was there first, and drop the
+ * copies of a colliding row that extraction created. Anything else — two genuine
+ * scans on different days — keeps both, because then two cards really might be
+ * on the shelf and over-counting is the recoverable error.
+ */
+/**
+ * Take back the artwork attached to cards whose printing was never confirmed.
+ *
+ * Artwork used to be fetched by a loose search that fell back to "first result
+ * with an image", so a Tyrunt numbered 070 that could not be placed was
+ * illustrated with the artwork of a Tyrunt numbered 044/086 — a different card,
+ * shown in preference to the photograph Jack actually took, and looking every
+ * bit as authoritative as a correct one.
+ *
+ * A picture of the wrong card is worse than no picture: it is a confident claim
+ * about what you own. These revert to the scan photo, which is always a picture
+ * of the real thing, and artwork returns if and when the printing is confirmed.
+ */
+async function dropUnconfirmedArtwork() {
+    const KEY = 'drop_unconfirmed_artwork_v1';
+    if (await hasRun(KEY)) return;
+
+    const res = await pool.query(`
+        UPDATE portfolio_cards
+        SET image_url = ''
+        WHERE COALESCE(needs_review, 0) = 1
+          AND COALESCE(image_url, '') <> ''
+    `);
+    await markRun(KEY, res.rowCount);
+    if (res.rowCount) {
+        console.log(`  [Migrate] Removed artwork from ${res.rowCount} unconfirmed card(s) — it may have been a different printing`);
+    }
+}
+
+async function rebuildIdentityAndMerge() {
+    const KEY = 'variant_key_without_set_name_v1';
+    if (await hasRun(KEY)) return;
+
+    const { rows } = await pool.query(`
+        SELECT id, card_name, card_set, set_code, card_number, holo_type, is_holo,
+               language, is_first_edition, variant_key
+        FROM portfolio_cards
+    `);
+
+    let rekeyed = 0;
+    for (const row of rows) {
+        const key = buildVariantKey(row);
+        if (key !== row.variant_key) {
+            await pool.query('UPDATE portfolio_cards SET variant_key = $1 WHERE id = $2', [key, row.id]);
+            rekeyed++;
+        }
+    }
+    if (rekeyed) console.log(`  [Migrate] Re-derived identity for ${rekeyed} card(s) from what is printed on them`);
+
+    // Rows that extraction created and that now collide with an older row are
+    // the same physical card seen twice, so the whole row goes — not merely its
+    // copies. Emptying a row instead would achieve nothing: the merge below
+    // deliberately gives any copy-less row a copy back, on the principle that a
+    // row represents a card Jack owns, and the two steps would cancel out.
+    // Deleting the row removes it from the merge's consideration entirely, and
+    // card_copies and price_history cascade with it.
+    const collided = await pool.query(`
+        DELETE FROM portfolio_cards dupe
+        USING portfolio_cards orig
+        WHERE orig.user_id = dupe.user_id
+          AND orig.variant_key = dupe.variant_key
+          AND orig.id < dupe.id
+          AND dupe.source_photo_id IS NOT NULL
+          AND dupe.variant_key <> ''
+          AND COALESCE(dupe.is_source_photo, 0) = 0
+    `);
+    if (collided.rowCount) {
+        console.log(`  [Migrate] Removed ${collided.rowCount} row(s) that extraction added for cards already held`);
+    }
+
+    const users = await pool.query('SELECT DISTINCT user_id FROM portfolio_cards');
+    let merged = 0;
+    let removed = 0;
+    for (const { user_id } of users.rows) {
+        const result = await mergeDuplicateGroups(user_id);
+        merged += result.mergedGroups;
+        removed += result.removedRows;
+    }
+    if (removed) {
+        console.log(`  [Migrate] Folded ${removed} duplicate row(s) into ${merged} card(s) — one row per printed card`);
+    }
+    await markRun(KEY, removed);
 }
 
 async function backfillVariantKeys() {
@@ -873,7 +980,10 @@ async function getAllPortfolioCards(userId) {
             pc.added_at, pc.current_price AS card_current_price, pc.price_source AS card_price_source,
             pc.price_source_url AS card_price_source_url,
             pc.price_sources, pc.last_price_check,
-            CASE WHEN pc.image_data IS NOT NULL AND pc.image_data != '' AND (pc.image_url IS NULL OR pc.image_url = '') THEN true ELSE false END AS has_local_image,
+            -- Simply "is there a scan photo". This used to be false whenever
+            -- artwork existed, which left the client no way to fall back to
+            -- the real photograph when the artwork could not be trusted.
+            (pc.image_data IS NOT NULL AND pc.image_data <> '') AS has_local_image,
             -- Is there a photograph of this card at all: either the scan that
             -- created it, or one attached to a copy. This is the difference
             -- between a card in the binder and a card the app merely believes
@@ -1139,6 +1249,19 @@ function computePortfolioStats(cards) {
 //  TCGDEX IMAGE LOOKUP (free, no API key)
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * Artwork for one card — or nothing.
+ *
+ * This used to end with "fallback: use first result with image", which meant a
+ * search for a Tyrunt numbered 070 could return the artwork of a Tyrunt
+ * numbered 044/086. That picture then went into image_url, and because the app
+ * shows artwork in preference to the photo you took, the card in your
+ * collection was illustrated by a different card entirely.
+ *
+ * A picture of the wrong card is worse than no picture at all: it is a claim,
+ * made confidently, that this is what you own. So the number has to agree, or
+ * nothing comes back.
+ */
 async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber, lang = 'en') {
     try {
         const searchName = encodeURIComponent(cardName.trim());
@@ -1180,10 +1303,9 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber, lang = 'e
             }
         }
 
-        // Fallback: use first result with image
-        const firstWithImage = results.find(r => r.image);
-        if (firstWithImage) return firstWithImage.image + '/high.webp';
-        
+        // No fallback. If neither the printed number nor the set name picked a
+        // card out, we do not know which of these printings is in your hand,
+        // and guessing produces a picture of somebody else's card.
         return null;
     } catch (err) {
         console.error(`  [TCGdex] Error looking up "${cardName}":`, err.message);
@@ -1304,9 +1426,15 @@ async function fetchCardImageFromPokemonTCG(cardName, cardSet, cardNumber) {
         }
         const resp = await axios.get('https://api.pokemontcg.io/v2/cards', { params, headers, timeout: 8000 });
         const results = resp.data?.data || [];
-        if (results.length > 0) {
-           return results[0].images?.large || results[0].images?.small || null;
-        }
+        // Taking results[0] blindly is how a card ends up illustrated by a
+        // different printing of the same Pokemon. The printed number decides it,
+        // denominator included: a card reading 070/086 did not come from a set
+        // of 165, whatever else matches.
+        const fits = results.find(c => {
+            const m = compareCandidate({ card_name: cardName, card_set: cardSet, card_number: cardNumber }, c);
+            return m.name && !m.setSizeConflicts && (m.number || m.setName);
+        });
+        if (fits) return fits.images?.large || fits.images?.small || null;
     } catch (err) {
         console.error(`  [ImageScrape] Pokemon TCG API Failed for "${cardName}":`, err.message);
     }
@@ -2401,6 +2529,9 @@ async function collectEbayQuotes(card) {
         rawNumber: card.card_number || '',
         printedTotal: printedSetTotal(card.card_number),
         setName: card.card_set || '',
+        // Printed on the card, unlike the set name, and the only identifier a
+        // promo or a brand-new subset has.
+        setCode: card.set_code || '',
         language: normalizeLanguage(card.language),
         isFirstEdition: isTruthy(card.is_first_edition),
         // Graded slabs trade in a separate market; only match like with like.
@@ -2756,7 +2887,7 @@ async function priceCard(card, { verified, why = '', answered = true, onSource, 
             price: 0,
             tier: tier.tier,
             tierLabel: tier.label,
-            explanation: tier.explanation,
+            explanation: tier.unreached ? tier.explanation : explainNoPrice(market),
             unreached: Boolean(tier.unreached),
         };
     }
@@ -2771,6 +2902,51 @@ async function priceCard(card, { verified, why = '', answered = true, onSource, 
         confidence: scaleConfidence(market.confidence, tier.tier),
         sourceConfidence: market.confidence,
     };
+}
+
+/**
+ * Say why a card has no price, naming the sources rather than the outcome.
+ *
+ * "No marketplace quotes a price for this card yet" is true and useless. It
+ * reads as a fact about the card when it is usually a fact about the server:
+ * a card printed in 2026 will not be in any free catalogue for months, and eBay
+ * — the one source that lists it the day it exists — is skipped entirely when
+ * no credentials are configured. Somebody looking at that message has no way to
+ * know the only source that could have helped was never asked.
+ */
+function explainNoPrice(market) {
+    const sources = market?.sources || [];
+    if (!sources.length) return 'No price yet — no price source was reached.';
+
+    const label = (s) => (s.label || s.name).replace(/\s*\(.*\)$/, '');
+    /** "a", "a and b", "a, b and c" — a list a person would actually write. */
+    const listOf = (names) => names.length <= 1
+        ? (names[0] || '')
+        : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+    const missingKeys = sources.filter(s => s.state === 'skipped' && /credential|API key|no key/i.test(s.reason || ''));
+    const failed = sources.filter(s => s.state === 'failed');
+    const empty = sources.filter(s => s.state === 'empty' || s.state === 'answered');
+
+    // The actionable case first: a source that could have answered was never
+    // asked, because the server is missing its keys.
+    if (missingKeys.length) {
+        const names = listOf(missingKeys.map(label));
+        return `No price yet — ${names} ${missingKeys.length === 1 ? 'was' : 'were'} not asked, because `
+            + `${missingKeys.length === 1 ? 'its' : 'their'} credentials are not configured on the server. `
+            + `${empty.length ? `The ${empty.length} source${empty.length === 1 ? '' : 's'} that were asked have no listing for this printing. ` : ''}`
+            + 'A card this new is often only on eBay.';
+    }
+
+    if (failed.length && !empty.length) {
+        return `No price yet — every source failed to answer (${listOf(failed.map(label))}). The app will try again.`;
+    }
+
+    const asked = sources.filter(s => s.state !== 'skipped').map(label);
+    if (asked.length) {
+        return `No price yet — ${listOf(asked)} ${asked.length === 1 ? 'has' : 'have'} no listing for this exact printing. `
+            + 'The app tries again on every refresh.';
+    }
+    return 'No price yet — no price source was available to ask.';
 }
 
 /**
@@ -2900,8 +3076,10 @@ async function refreshBatchPrices(batchSize = 5) {
 
         for (const card of cards) {
             try {
-                // Back-fill missing images
-                if (!card.image_url || card.image_url.includes('undefined')) {
+                // Artwork only for a confirmed printing: the picture is shown
+                // in preference to Jack's own photo, so on an unconfirmed card
+                // it would assert an identity nothing has established.
+                if (!card.needs_review && (!card.image_url || card.image_url.includes('undefined'))) {
                     let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
                     if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
                     if (imageUrl) await updateCardImageUrl(card.id, imageUrl);
@@ -2971,7 +3149,10 @@ async function refreshAllPrices() {
         for (let i = 0; i < cards.length; i++) {
             const card = cards[i];
             try {
-                if (!card.image_url || card.image_url.includes('undefined')) {
+                // Artwork only for a confirmed printing: the picture is shown
+                // in preference to Jack's own photo, so on an unconfirmed card
+                // it would assert an identity nothing has established.
+                if (!card.needs_review && (!card.image_url || card.image_url.includes('undefined'))) {
                     let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
                     if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
                     if (imageUrl) {
@@ -4050,6 +4231,64 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
  * A card with no photo was never scanned — it came out of a spread photo, or an
  * import — and that is the first thing to check when an entry looks wrong.
  */
+/**
+ * The raw row counts, straight from SQL, next to the database they came from.
+ *
+ * Because the app said 1,474 cards while the Neon console showed 657 rows, and
+ * there was no way to tell which was wrong — or whether the two were even
+ * looking at the same database. Render and the Neon console can easily point at
+ * different branches, and nothing in the app said which one it had connected to.
+ *
+ * Every number here is a plain COUNT(*) with no joins, no filters and no
+ * derivation, so it can be compared against the console directly. The host and
+ * database name are reported too; the credentials are not.
+ */
+app.get('/api/portfolio/reconcile', requireAuth, async (req, res) => {
+    try {
+        const counts = await pool.query(`
+            SELECT
+                (SELECT COUNT(*)::int FROM portfolio_cards)                                          AS rows_all_users,
+                (SELECT COUNT(*)::int FROM portfolio_cards WHERE user_id = $1)                       AS rows_yours,
+                (SELECT COUNT(*)::int FROM portfolio_cards WHERE user_id = $1
+                   AND COALESCE(is_source_photo,0) = 1)                                              AS source_photos,
+                (SELECT COUNT(*)::int FROM portfolio_cards WHERE user_id = $1
+                   AND COALESCE(is_source_photo,0) = 0)                                              AS cards_listed,
+                (SELECT COUNT(*)::int FROM card_copies cc JOIN portfolio_cards pc ON pc.id = cc.card_id
+                   WHERE pc.user_id = $1 AND COALESCE(pc.is_source_photo,0) = 0)                     AS copies,
+                (SELECT COUNT(DISTINCT variant_key)::int FROM portfolio_cards
+                   WHERE user_id = $1 AND COALESCE(is_source_photo,0) = 0 AND variant_key <> '')     AS distinct_printings,
+                (SELECT COUNT(*)::int FROM price_history)                                            AS price_points,
+                (SELECT COUNT(*)::int FROM users)                                                    AS users
+        `, [req.user.id]);
+
+        // Which database this process is actually talking to. Answering from
+        // the live connection rather than from the environment variable, so a
+        // stale or overridden setting cannot misreport it.
+        const where = await pool.query(
+            'SELECT current_database() AS db, inet_server_addr()::text AS addr, version() AS version');
+        let host = '';
+        try {
+            const url = new URL(process.env.DATABASE_URL || '');
+            host = url.host;   // host:port only; no user, no password
+        } catch { /* not a URL we can parse; leave it blank rather than guess */ }
+
+        res.json({
+            success: true,
+            counts: counts.rows[0],
+            database: {
+                host,
+                name: where.rows[0].db,
+                server: (where.rows[0].version || '').split(' ').slice(0, 2).join(' '),
+            },
+            note: 'Every count is a plain SELECT COUNT(*) — compare them against the Neon console directly. '
+                + 'If they disagree, the two are looking at different databases or branches.',
+        });
+    } catch (err) {
+        console.error('Reconcile error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/accounting', requireAuth, async (req, res) => {
     try {
         const cards = await getAllPortfolioCards(req.user.id);
@@ -4828,16 +5067,26 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unveri
         };
     }
 
-    let imageUrl = card.image_url || '';
-    try {
-        // A Japanese card should show Japanese artwork, so TCGdex is asked in
-        // the card's own language first.
-        if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)) || '';
-        // The English fallbacks only make sense with an English name to search.
-        const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
-        if (!imageUrl && english) imageUrl = await fetchCardImageFromTCGdex(english, card.card_set, card.card_number) || '';
-        if (!imageUrl && english) imageUrl = await fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) || '';
-    } catch { /* the scan photo stands in until a refresh finds artwork */ }
+    // Artwork is only fetched for a card whose printing was actually confirmed.
+    //
+    // The picture is shown in preference to the photo you took, so it is a
+    // claim about what you own — and on an unconfirmed card that claim has
+    // nothing behind it. A Tyrunt numbered 070 that could not be placed was
+    // being illustrated with a different Tyrunt's artwork, which looked exactly
+    // as authoritative as a correct one. Your own photograph is always a
+    // picture of your actual card, so it stands until the printing is settled.
+    let imageUrl = needsReview ? '' : (card.image_url || '');
+    if (!needsReview) {
+        try {
+            // A Japanese card should show Japanese artwork, so TCGdex is asked in
+            // the card's own language first.
+            if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)) || '';
+            // The English fallbacks only make sense with an English name to search.
+            const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
+            if (!imageUrl && english) imageUrl = await fetchCardImageFromTCGdex(english, card.card_set, card.card_number) || '';
+            if (!imageUrl && english) imageUrl = await fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) || '';
+        } catch { /* the scan photo stands in until a refresh finds artwork */ }
+    }
 
     const cardId = await insertPortfolioCard({
         card_name: card.card_name,

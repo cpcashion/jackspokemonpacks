@@ -15,7 +15,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCardNumber, printedSetTotal, normalizeCardNumber } from '../lib/identity.js';
+import { parseCardNumber, printedSetTotal, normalizeCardNumber, buildVariantKey } from '../lib/identity.js';
 import {
     compareCandidate,
     isLikelyVerifiedMatch,
@@ -245,6 +245,65 @@ test('a candidate the card refutes is never priced against, confirmed or estimat
     const onlyImpostor = [impostor].filter(c => !compareCandidate(card, c).setSizeConflicts);
     assert.equal(onlyImpostor.length, 0,
         'no price at all beats a price belonging to a different printing');
+});
+
+/**
+ * How 657 cards came to present as 1,474.
+ *
+ * A card's identity used to include its set NAME — the one field on a scan that
+ * nothing prints. The model infers it from a symbol and infers inconsistently:
+ * one Meganium numbered 010/132 was read once as "Scarlet & Violet-Temporal
+ * Forces" and once as "Paldea Evolved". Two names meant two identities, so one
+ * piece of cardboard became two rows, two entries in the count and two prices
+ * in the total.
+ *
+ * These pairs are read straight off the collection's own database.
+ */
+test('one printed card is one card, whatever the set was guessed to be', () => {
+    const pairs = [
+        ['Meganium', '010/132', 'Scarlet & Violet-Temporal Forces', 'Paldea Evolved'],
+        ['Cyclizar', '070/091', 'Scarlet & Violet-Paldea Evolved', 'Paradox Rift'],
+        ['Raichu', '019/091', 'Scarlet & Violet-Paldea Evolved', 'Paradox Rift'],
+        ['Mankey', '107/198', 'Scarlet & Violet-Paradox Rift', 'Scarlet & Violet'],
+        ['Pawmot', '034/094', 'Scarlet & Violet-Twilight Masquerade', 'Paldean Fates'],
+    ];
+    for (const [name, number, setA, setB] of pairs) {
+        const a = buildVariantKey({ card_name: name, card_set: setA, card_number: number, is_holo: 1, language: 'English' });
+        const b = buildVariantKey({ card_name: name, card_set: setB, card_number: number, is_holo: 1, language: 'English' });
+        assert.equal(a, b, `${name} ${number} must be one card, not one per guessed set name`);
+        assert.ok(!/scarlet|paldea|paradox|masquerade/.test(a),
+            `the guessed set name must not appear in the key at all: ${a}`);
+    }
+});
+
+/**
+ * The denominator is what makes that safe. It is printed on the card, it is the
+ * set's own size, and it is what tells two same-named, same-numbered cards
+ * apart — the exact confusion that once valued a common Steelix at $206.
+ */
+test('cards that really are different stay different', () => {
+    const key = (over) => buildVariantKey({ card_name: 'Steelix', card_number: '093/132', is_holo: 1, language: 'English', ...over });
+    const base = key({});
+
+    assert.notEqual(base, key({ card_number: '093/162' }), 'a different set size is a different card');
+    assert.notEqual(base, key({ card_number: '094/132' }), 'a different number is a different card');
+    assert.notEqual(base, key({ language: 'Japanese' }), 'a different language is a different market');
+    assert.notEqual(base, key({ holo_type: 'Reverse Holo' }), 'a different printing is a different price');
+    assert.notEqual(base, key({ is_first_edition: true }), '1st Edition is its own printing');
+    assert.notEqual(base, key({ card_name: 'Onix' }), 'and a different Pokemon is obviously different');
+});
+
+/**
+ * Promos carry no denominator, so the printed set code stands in — also on the
+ * card, and unlike the set name, not a guess.
+ */
+test('promos are told apart by their printed set code', () => {
+    const tyrunt = (over) => buildVariantKey({ card_name: 'Tyrunt', card_number: '070', is_holo: 1, language: 'English', ...over });
+
+    assert.notEqual(tyrunt({ set_code: 'MEP' }), tyrunt({ set_code: 'SVP' }),
+        'two promo sets numbered alike are two cards');
+    assert.equal(tyrunt({ set_code: 'MEP', card_set: 'Promo' }), tyrunt({ set_code: 'MEP', card_set: 'Mega Evolution Promos' }),
+        'but the guessed set name still changes nothing');
 });
 
 test('placeholder names are refused in any language', () => {

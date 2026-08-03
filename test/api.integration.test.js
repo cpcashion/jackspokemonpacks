@@ -248,7 +248,14 @@ if (!DB) {
 
         const row = await pool.query(
             'SELECT variant_key, needs_review, current_price, price_tier FROM portfolio_cards WHERE id = $1', [id]);
-        assert.match(row.rows[0].variant_key, /base set 2\|1\|reverse/);
+        // Identity follows the printing, not the set name: the edit changed
+        // Base Set to Base Set 2 AND non-holo to reverse holo, and only the
+        // second of those is a different card. The denominator stands in for
+        // the set, so a renamed set alone would leave identity untouched.
+        assert.match(row.rows[0].variant_key, /^alakazam\|of102\|1\|reverse\|english\|unl$/,
+            `identity must come from what is printed, got "${row.rows[0].variant_key}"`);
+        assert.ok(!/base set/.test(row.rows[0].variant_key),
+            'and the guessed set name must not appear in it');
 
         // An edit is a claim about the card, not a confirmation of it. The
         // stored flag tracks whether the printing was actually confirmed —
@@ -747,6 +754,67 @@ if (!DB) {
             assert.equal(item.tier, 'confirmed', `${item.card_name} is in the confirmed bucket`);
             assert.ok(item.unit_price > 0);
         }
+    });
+
+    /**
+     * "Why is the app showing a different amount of cards than the Neon
+     * database?" — there was no way to tell which was right, or whether the two
+     * were even looking at the same place. Every figure here is a plain
+     * COUNT(*) that can be compared against the console directly.
+     */
+    test('the reconciliation counts match the database exactly', async () => {
+        const { status, body } = await api('/api/portfolio/reconcile');
+        assert.equal(status, 200);
+
+        const truth = await pool.query(`
+            SELECT (SELECT COUNT(*)::int FROM portfolio_cards WHERE user_id = 1)                    AS yours,
+                   (SELECT COUNT(*)::int FROM portfolio_cards WHERE user_id = 1
+                      AND COALESCE(is_source_photo,0) = 0)                                          AS listed,
+                   (SELECT COUNT(*)::int FROM card_copies cc JOIN portfolio_cards pc ON pc.id = cc.card_id
+                      WHERE pc.user_id = 1 AND COALESCE(pc.is_source_photo,0) = 0)                  AS copies
+        `);
+        const t = truth.rows[0];
+        assert.equal(body.counts.rows_yours, t.yours);
+        assert.equal(body.counts.cards_listed, t.listed);
+        assert.equal(body.counts.copies, t.copies);
+
+        // And the listed count is exactly what the collection endpoint returns,
+        // so the app and the database can never quietly disagree.
+        const listed = (await api('/api/portfolio')).body.cards.length;
+        assert.equal(body.counts.cards_listed, listed,
+            'the collection shows exactly the rows the database holds');
+
+        assert.ok(body.database.name, 'it says which database it is connected to');
+        assert.ok(!JSON.stringify(body).includes('password'), 'and never leaks credentials');
+    });
+
+    /**
+     * How 657 cards presented as 1,474: identity included the set NAME, which
+     * nothing prints and the model guesses inconsistently. Two guesses for one
+     * card meant two rows, two entries in the count, two prices in the total.
+     */
+    test('one printed card is one row, whatever the set was guessed to be', async () => {
+        const a = await seedLegacyCard({
+            card_name: 'Dupe Meganium', card_set: 'Scarlet & Violet-Temporal Forces',
+            card_number: '010/132', current_price: 20,
+        });
+        const b = await seedLegacyCard({
+            card_name: 'Dupe Meganium', card_set: 'Paldea Evolved',
+            card_number: '010/132', current_price: 20,
+        });
+        for (const id of [a, b]) {
+            await pool.query('INSERT INTO card_copies (card_id, condition) VALUES ($1, $2)', [id, 'Near Mint']);
+        }
+
+        const keys = await pool.query(
+            'SELECT DISTINCT variant_key FROM portfolio_cards WHERE id = ANY($1::int[])', [[a, b]]);
+        // Seeded rows get their keys from the boot backfill, so compute directly.
+        const { buildVariantKey } = await import('../lib/identity.js');
+        const rows = await pool.query('SELECT * FROM portfolio_cards WHERE id = ANY($1::int[])', [[a, b]]);
+        const computed = new Set(rows.rows.map(buildVariantKey));
+        assert.equal(computed.size, 1,
+            `two spellings of one set must give one identity, got ${[...computed].join(' / ')}`);
+        void keys;
     });
 
     /**

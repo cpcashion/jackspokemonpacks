@@ -2158,6 +2158,33 @@ async function loadHealth() {
         h.cards.verified === h.cards.total ? 'good' : 'warn'],
     ];
 
+    // What a refresh will actually get through, and when.
+    //
+    // Seeing "662 unpriced" with nothing else on screen reads as an app that
+    // has given up. It hasn't: eBay allows a fixed number of calls a day and a
+    // large collection takes more than one day to work through, which is a
+    // schedule rather than a failure — but only if it says so.
+    const ebay = h.sources.find((s) => /eBay/i.test(s.name));
+    if (h.cards.unpriced > 0) {
+      const n = h.cards.unpriced;
+      const cards = `${n} card${n === 1 ? '' : 's'}`;
+      // About four calls per card in practice: most answer on the first search,
+      // which costs two, and the rest walk further down the ladder.
+      const today = ebay?.quota ? Math.floor(ebay.quota.remainingForBulk / 4) : null;
+      let detail = cards;
+      if (today === null) detail = cards;
+      else if (today <= 0) detail = `${cards} — none until eBay's daily allowance resets at midnight UTC`;
+      else if (today >= n) detail = `${cards} — today's allowance covers all of them`;
+      else detail = `${cards} — about ${today} today, the rest as the allowance resets each day`;
+      rows.push(['Still to be priced', detail, 'warn']);
+    }
+    if (ebay?.quota) {
+      rows.push(["eBay calls used today",
+        `${ebay.quota.used} of ${ebay.quota.limit}`
+          + (ebay.quota.exhausted ? ' — spent, resets at midnight UTC' : ''),
+        ebay.quota.exhausted ? 'warn' : 'good']);
+    }
+
     // Label above value: these values are sentences, not figures, and squeezing
     // them into a right-aligned column truncates the labels on a phone.
     for (const [label, value, tone] of rows) {

@@ -1211,6 +1211,69 @@ document.addEventListener('keydown', (e) => {
   else if (state.openCardId) closeSheet();
 });
 
+/**
+ * Answer "did I actually photograph this card?" for one card.
+ *
+ * The picture on a card tile is not evidence. When the app matches a card to a
+ * database it downloads that database's official artwork and shows it in
+ * preference to any photo taken during the scan — so a card the app inferred
+ * and a card physically photographed look exactly alike. That is what made a
+ * Rayquaza VMAX nobody remembers owning indistinguishable from the rest of the
+ * collection.
+ *
+ * The scan photo is the evidence. This says plainly whether one exists, shows
+ * it when it does, and names the host the artwork was fetched from when it
+ * does not.
+ */
+async function loadProvenance(cardId, panel) {
+  const host = panel.querySelector('.prov-body');
+  try {
+    const p = await api(`/api/portfolio/${cardId}/provenance`);
+    host.innerHTML = '';
+
+    const line = (label, value, tone) => {
+      const row = el('div', 'prov-row');
+      row.append(el('div', 'prov-label', label), el('div', `prov-value${tone ? ' prov-' + tone : ''}`, value));
+      host.appendChild(row);
+    };
+
+    if (p.scan_photo) {
+      line('Your photo', `on file (${p.scan_photo_count})`, 'good');
+    } else {
+      // The finding that matters. Stated first and stated plainly.
+      line('Your photo', 'none on file — this card was never photographed', 'bad');
+    }
+
+    line('Picture shown',
+      p.picture_shown === 'database'
+        ? `stock artwork from ${p.artwork_from || 'a card database'} — not your card`
+        : p.picture_shown === 'your photo' ? 'your own scan photo' : 'none');
+
+    if (p.from_spread) line('Extracted from', `one of your multi-card photos (#${p.from_spread})`);
+    if (p.identified_by) line('Identified by', p.identified_by);
+    if (p.read_confidence > 0) line('Read confidence', `${Math.round(p.read_confidence * 100)}%`);
+    if (p.added_at) line('Added', new Date(p.added_at).toLocaleString());
+
+    if (!p.scan_photo) {
+      const note = el('div', 'prov-note');
+      note.textContent = 'No photograph of this card was ever stored, so there is no evidence it was scanned. '
+        + 'It came from a bad read of a multi-card photo, or from an import. If you do not own it, delete it.';
+      host.appendChild(note);
+    } else {
+      // Show the actual photo, which is the proof rather than a claim about it.
+      const shot = el('img', 'prov-photo');
+      shot.alt = 'The photo taken when this card was scanned';
+      shot.loading = 'lazy';
+      fetch(`/api/portfolio/${cardId}/image`)
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => { if (d?.image_data) { shot.src = d.image_data; host.appendChild(shot); } })
+        .catch(() => {});
+    }
+  } catch (err) {
+    host.textContent = `Could not check: ${err.message}`;
+  }
+}
+
 function renderSheetBody() {
   const card = cardById(state.openCardId);
   const body = $('sheetBody');
@@ -1284,6 +1347,15 @@ function renderSheetBody() {
 
   hero.appendChild(figures);
   body.appendChild(hero);
+
+  // Where this card came from. Loaded after the sheet is drawn so it never
+  // delays it; the panel fills itself in.
+  const provenance = el('div', 'panel glass');
+  provenance.id = 'provenancePanel';
+  provenance.append(el('div', 'section-title', 'Where this card came from'));
+  provenance.append(el('div', 'prov-body', 'Checking…'));
+  body.appendChild(provenance);
+  loadProvenance(card.id, provenance);
 
   // Copies
   const copiesPanel = el('div', 'panel glass');

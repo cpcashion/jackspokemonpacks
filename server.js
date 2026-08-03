@@ -3442,6 +3442,76 @@ app.get('/api/portfolio/:id/history', requireAuth, async (req, res) => {
 });
 
 // Get card image (base64 fallback for cards without image_url)
+/**
+ * Where one card came from, and whether anything of Jack's is behind it.
+ *
+ * This exists because of a question the app could not answer: "I don't think I
+ * own that card — did I upload that image?" Nothing on screen distinguished a
+ * card photographed in the room from a card the app inferred and then
+ * illustrated with stock artwork downloaded from a database. The two looked
+ * identical, so a wrong entry was indistinguishable from a right one.
+ *
+ * They are different things and this says which:
+ *
+ *   picture_shown  what the tile and sheet display. `database` means official
+ *                  artwork fetched from api.pokemontcg.io or tcgdex.net — a
+ *                  picture of the card, not a picture of YOUR card.
+ *   scan_photo     whether a photograph taken during a scan is on file. This is
+ *                  the only evidence the physical card was ever in front of a
+ *                  camera. `false` means it was never scanned.
+ *   from_spread    the id of the multi-card photo it was extracted from, if it
+ *                  came out of one rather than a scan of its own.
+ */
+app.get('/api/portfolio/:id/provenance', requireAuth, async (req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT pc.id, pc.card_name, pc.card_set, pc.card_number, pc.added_at,
+                   pc.image_url, pc.verified_source, pc.source_photo_id, pc.confidence,
+                   pc.price_tier, pc.price_source,
+                   (pc.image_data IS NOT NULL AND pc.image_data <> '') AS card_photo,
+                   (SELECT COUNT(*)::int FROM card_copies cc
+                     WHERE cc.card_id = pc.id AND cc.image_data <> '') AS copy_photos,
+                   (SELECT MIN(cc.created_at) FROM card_copies cc WHERE cc.card_id = pc.id) AS first_copy_at
+            FROM portfolio_cards pc
+            WHERE pc.id = $1 AND pc.user_id = $2
+        `, [parseInt(req.params.id, 10), req.user.id]);
+
+        if (!rows.length) return res.status(404).json({ error: 'Card not found' });
+        const r = rows[0];
+        const hasScanPhoto = Boolean(r.card_photo) || r.copy_photos > 0;
+
+        // Which host the artwork came from, named rather than implied — the
+        // point of the answer is that it is somebody else's picture.
+        let artworkFrom = '';
+        if (r.image_url) {
+            if (/pokemontcg\.io/i.test(r.image_url)) artworkFrom = 'the Pokémon TCG database (images.pokemontcg.io)';
+            else if (/tcgdex/i.test(r.image_url)) artworkFrom = 'TCGdex (assets.tcgdex.net)';
+            else artworkFrom = new URL(r.image_url).host;
+        }
+
+        res.json({
+            success: true,
+            id: r.id,
+            card_name: r.card_name,
+            added_at: r.added_at,
+            first_seen_at: r.first_copy_at || r.added_at,
+            picture_shown: r.image_url ? 'database' : (hasScanPhoto ? 'your photo' : 'none'),
+            artwork_url: r.image_url || '',
+            artwork_from: artworkFrom,
+            scan_photo: hasScanPhoto,
+            scan_photo_count: (r.card_photo ? 1 : 0) + r.copy_photos,
+            from_spread: r.source_photo_id || null,
+            identified_by: r.verified_source || '',
+            read_confidence: Number(r.confidence) || 0,
+            price_tier: r.price_tier || '',
+            price_source: r.price_source || '',
+        });
+    } catch (err) {
+        console.error('Provenance error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/:id/image', requireAuth, async (req, res) => {
     try {
         const result = await pool.query(

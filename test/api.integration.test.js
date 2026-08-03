@@ -750,6 +750,68 @@ if (!DB) {
     });
 
     /**
+     * "Where did that card come from? Did I upload that image?"
+     *
+     * The app could not answer, because the picture on a card is not evidence
+     * of anything: when a card matches a database the app downloads that
+     * database's official artwork and shows it in preference to any photo
+     * taken during the scan. So a card physically photographed and a card the
+     * app merely inferred look exactly alike.
+     *
+     * The scan photo is the evidence, and provenance has to report it exactly —
+     * claiming a photo that is not there would make the one honest signal
+     * useless.
+     */
+    test('provenance never claims a photograph that is not stored', async () => {
+        const bare = await seedLegacyCard({ card_name: 'Never Photographed', card_number: '218/203' });
+        const shot = await seedLegacyCard({ card_name: 'Actually Scanned', card_number: '4/102' });
+        await pool.query('UPDATE portfolio_cards SET image_data = $2 WHERE id = $1',
+            [shot, 'data:image/jpeg;base64,/9j/4AAQSkZJRg==']);
+
+        const a = (await api(`/api/portfolio/${bare}/provenance`)).body;
+        assert.equal(a.scan_photo, false, 'a card with no stored image has no photo behind it');
+        assert.equal(a.scan_photo_count, 0);
+
+        const b = (await api(`/api/portfolio/${shot}/provenance`)).body;
+        assert.equal(b.scan_photo, true);
+        assert.equal(b.scan_photo_count, 1);
+    });
+
+    /**
+     * A photo attached to a copy counts as evidence too — that is where the
+     * scanner puts it when a card is added as a second copy of one already held.
+     */
+    test('a photo stored against a copy still counts as evidence', async () => {
+        const id = await seedLegacyCard({ card_name: 'Copy Photographed', card_number: '9/102' });
+        await pool.query('INSERT INTO card_copies (card_id, condition, image_data) VALUES ($1, $2, $3)',
+            [id, 'Near Mint', 'data:image/jpeg;base64,/9j/4AAQSkZJRg==']);
+
+        const p = (await api(`/api/portfolio/${id}/provenance`)).body;
+        assert.equal(p.scan_photo, true, 'the card row has no image, but a copy does');
+        assert.equal(p.scan_photo_count, 1);
+    });
+
+    /**
+     * The artwork is somebody else's picture, and the answer has to say so
+     * rather than let it pass as the user's own.
+     */
+    test('database artwork is reported as database artwork, by host', async () => {
+        const id = await seedLegacyCard({ card_name: 'Stock Art', card_number: '218/203' });
+        await pool.query('UPDATE portfolio_cards SET image_url = $2 WHERE id = $1',
+            [id, 'https://images.pokemontcg.io/swsh7/218_hires.png']);
+
+        const p = (await api(`/api/portfolio/${id}/provenance`)).body;
+        assert.equal(p.picture_shown, 'database');
+        assert.match(p.artwork_from, /pokemontcg/i, 'the host is named, not implied');
+        assert.equal(p.scan_photo, false, 'and artwork is never mistaken for evidence');
+    });
+
+    test('provenance is scoped to the owner and 404s otherwise', async () => {
+        const missing = await api('/api/portfolio/99999999/provenance');
+        assert.equal(missing.status, 404);
+    });
+
+    /**
      * The books and the collection totals are two views of one set of facts,
      * and they drifted: the accounting called seven cards "estimated" that the
      * stats counted as none, because a price carrying no tier at all was being

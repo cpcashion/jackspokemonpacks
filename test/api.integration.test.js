@@ -715,6 +715,108 @@ if (!DB) {
     });
 
     /**
+     * "It's now saying a total value of $20k plus and I know that's not true...
+     * There's no solid accounting."
+     *
+     * Every card lands in exactly one bucket and the buckets sum to the total,
+     * so the headline figure can always be taken apart and checked. Without
+     * this, speculation and evidence look identical once they are both a row in
+     * a list.
+     */
+    test('every card is accounted for in exactly one bucket', async () => {
+        const { status, body } = await api('/api/portfolio/accounting');
+        assert.equal(status, 200);
+
+        const counted = body.confirmed.cards + body.estimated.cards
+            + body.unverified.cards + body.unpriced.cards;
+        const listed = (await api('/api/portfolio')).body.cards.length;
+        assert.equal(counted, listed, 'no card is missing from the books, and none is counted twice');
+
+        const summed = body.confirmed.value + body.estimated.value
+            + body.unverified.value + body.unpriced.value;
+        assert.ok(Math.abs(summed - body.total) < 0.05,
+            `the buckets must add up to the total (${summed} vs ${body.total})`);
+
+        // An unpriced card contributes nothing, by definition.
+        assert.equal(body.unpriced.value, 0);
+        for (const item of body.unpriced.items) assert.equal(item.unit_price, 0);
+
+        // A confirmed entry is confirmed: the tier is not merely asserted by
+        // the bucket it was sorted into.
+        for (const item of body.confirmed.items) {
+            assert.equal(item.tier, 'confirmed', `${item.card_name} is in the confirmed bucket`);
+            assert.ok(item.unit_price > 0);
+        }
+    });
+
+    /**
+     * The books and the collection totals are two views of one set of facts,
+     * and they drifted: the accounting called seven cards "estimated" that the
+     * stats counted as none, because a price carrying no tier at all was being
+     * sorted one way in one place and another way in the other. Two parts of
+     * the app disagreeing about what a card is worth IS the missing accounting.
+     */
+    test('the books and the collection totals agree card for card', async () => {
+        const books = (await api('/api/portfolio/accounting')).body;
+        const stats = (await api('/api/portfolio')).body.stats;
+
+        assert.equal(books.confirmed.cards, stats.confirmedCards);
+        assert.ok(Math.abs(books.confirmed.value - stats.confirmedValue) < 0.05,
+            `confirmed: books ${books.confirmed.value} vs stats ${stats.confirmedValue}`);
+
+        assert.equal(books.estimated.cards, stats.estimatedCards);
+        assert.ok(Math.abs(books.estimated.value - stats.estimatedValue) < 0.05,
+            `estimated: books ${books.estimated.value} vs stats ${stats.estimatedValue}`);
+
+        assert.equal(books.unverified.cards, stats.unverifiedCards);
+        assert.ok(Math.abs(books.unverified.value - stats.unverifiedValue) < 0.05,
+            `unverified: books ${books.unverified.value} vs stats ${stats.unverifiedValue}`);
+
+        // And the priced buckets account for the whole total between them.
+        const priced = books.confirmed.value + books.estimated.value + books.unverified.value;
+        assert.ok(Math.abs(priced - stats.totalValue) < 0.05,
+            `the priced buckets (${priced.toFixed(2)}) must be the collection total (${stats.totalValue})`);
+    });
+
+    /**
+     * "I don't even think I have the card from the screenshot. Where did that
+     * come from?" — a card with no photograph behind it was never scanned, and
+     * that is the first thing to check when an entry looks wrong.
+     */
+    test('the books say which cards have no photograph behind them', async () => {
+        const { body } = await api('/api/portfolio/accounting');
+        const stats = (await api('/api/portfolio')).body.stats;
+
+        assert.equal(body.withoutPhoto.length, stats.cardsWithoutPhoto,
+            'the count in the stats and the list in the books agree');
+        for (const item of body.withoutPhoto) {
+            assert.equal(item.has_photo, false);
+        }
+
+        assert.equal(stats.cardsWithPhoto + stats.cardsWithoutPhoto,
+            body.confirmed.cards + body.estimated.cards + body.unverified.cards + body.unpriced.cards,
+            'every card is either photographed or not; there is no third state');
+    });
+
+    /**
+     * The headline has to be defensible on its own. Estimates are reported
+     * beside it, never folded into it.
+     */
+    test('the confirmed total never includes an estimated price', async () => {
+        const { body } = await api('/api/portfolio');
+        const s = body.stats;
+
+        const confirmedFromCards = body.cards
+            .filter(c => c.price_tier === 'confirmed' && c.unit_price > 0)
+            .reduce((n, c) => n + c.total_value, 0);
+
+        assert.ok(Math.abs(s.confirmedValue - confirmedFromCards) < 0.05,
+            `confirmedValue (${s.confirmedValue}) must be exactly the confirmed cards (${confirmedFromCards.toFixed(2)})`);
+        assert.ok(s.confirmedValue <= s.totalValue + 0.01,
+            'and can never exceed the total it is a part of');
+    });
+
+    /**
      * The complaint, stated plainly: "there's no value being found for new
      * cards that get uploaded in the app... the user shouldn't ever have to
      * manually review cards or confirm pricing."

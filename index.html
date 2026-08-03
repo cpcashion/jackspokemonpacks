@@ -103,8 +103,9 @@
       <section class="hero glass" id="hero">
         <div class="hero-head">
           <div>
-            <div class="hero-label">Collection value</div>
+            <div class="hero-label" id="heroLabel">Collection value</div>
             <div class="hero-value" id="heroValue">$0.00</div>
+            <div class="hero-basis" id="heroBasis"></div>
             <div class="hero-change" id="heroChange"></div>
           </div>
           <div class="hero-ranges" id="heroRanges">
@@ -242,6 +243,12 @@
           </div>
           <button class="btn btn-glass btn-sm" id="auditHistoryBtn">Check</button>
         </div>
+      </div>
+
+      <div class="panel glass" id="accountingPanel">
+        <div class="section-title" style="margin-bottom: 6px;">Where the value comes from</div>
+        <div class="setting-desc" style="margin-bottom: 12px;">Every card sits in exactly one row below and the rows add up to the total, so any figure can be taken apart and checked. A card with no photograph behind it was never scanned — that is the first thing to look at when an entry seems wrong.</div>
+        <div id="accountingBody" class="chart-empty" style="height:auto; padding: 8px 0;">Checking…</div>
       </div>
 
       <div class="panel glass" id="healthPanel">

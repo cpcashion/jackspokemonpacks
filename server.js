@@ -238,6 +238,7 @@ async function initDB() {
     await clearPricesOnUnconfirmedCards();
     await queueUnpricedCardsForEstimates();
     await flagSpreadPhotos();
+    await withdrawUnreachablePrices();
 }
 
 async function hasRun(key) {
@@ -379,6 +380,59 @@ async function queueUnpricedCardsForEstimates() {
  * Nothing is deleted. The row becomes a source photo, keeps its image, and the
  * cards inside it are extracted into rows of their own.
  */
+/**
+ * Strip the prices that were invented on the back of lookups that never ran.
+ *
+ * An earlier rule priced any card whose printing could not be confirmed and
+ * labelled the result an estimate. It did not distinguish "the databases
+ * answered and the answer did not fit this card" from "the databases could not
+ * be reached", so a rate limit during a refresh produced a confident-looking
+ * figure for a card nothing had been learned about. One Rayquaza VMAX showed
+ * $1,253.94 with the explanation "the card database could not answer — Rate
+ * limited" printed directly beneath it, and enough of those together carried
+ * the collection past $20,000.
+ *
+ * Those figures cannot be corrected, only withdrawn: there was never any
+ * evidence behind them. The cards go back to having no price and to the front
+ * of the refresh queue, where they will be priced properly against a database
+ * that is actually answering.
+ */
+async function withdrawUnreachablePrices() {
+    const KEY = 'withdraw_unreachable_estimates_v1';
+    if (await hasRun(KEY)) return;
+
+    const affected = await pool.query(`
+        SELECT id FROM portfolio_cards
+        WHERE price_tier = 'estimated'
+          AND COALESCE(current_price, 0) > 0
+          AND (
+            price_explanation ILIKE '%could not answer%'
+            OR price_explanation ILIKE '%rate limited%'
+            OR price_explanation ILIKE '%before asking again%'
+            OR price_explanation ILIKE '%could not be reached%'
+          )
+    `);
+    const ids = affected.rows.map(r => r.id);
+
+    if (ids.length) {
+        // The history goes too. It was recorded against the same non-evidence,
+        // and leaving it would draw a chart of a price that never existed.
+        await pool.query('DELETE FROM price_history WHERE card_id = ANY($1::int[])', [ids]);
+        await pool.query(`
+            UPDATE portfolio_cards
+            SET current_price = 0, price_source = '', price_source_url = '',
+                price_confidence = 0, price_marketplace = '', price_variant = '',
+                price_variant_matched = 0, price_low = 0, price_high = 0,
+                price_sources = '{}'::jsonb, highest_recent_sale = 0,
+                best_sold_price = 0, best_sold_source = '',
+                price_tier = '', price_explanation = '', last_price_check = NULL
+            WHERE id = ANY($1::int[])
+        `, [ids]);
+        console.log(`  [Migrate] Withdrew ${ids.length} price(s) that were estimated while the card databases were unreachable`);
+    }
+    await markRun(KEY, ids.length);
+}
+
 async function flagSpreadPhotos() {
     const KEY = 'flag_spread_photos_v1';
     if (await hasRun(KEY)) return;
@@ -820,6 +874,14 @@ async function getAllPortfolioCards(userId) {
             pc.price_source_url AS card_price_source_url,
             pc.price_sources, pc.last_price_check,
             CASE WHEN pc.image_data IS NOT NULL AND pc.image_data != '' AND (pc.image_url IS NULL OR pc.image_url = '') THEN true ELSE false END AS has_local_image,
+            -- Is there a photograph of this card at all: either the scan that
+            -- created it, or one attached to a copy. This is the difference
+            -- between a card in the binder and a card the app merely believes
+            -- in, and it is the first question to ask of a suspect entry.
+            (
+                (pc.image_data IS NOT NULL AND pc.image_data <> '')
+                OR EXISTS (SELECT 1 FROM card_copies cc2 WHERE cc2.card_id = pc.id AND cc2.image_data <> '')
+            ) AS has_photo,
             latest.price AS current_price,
             day_ref.price AS previous_price,
             day_ref.price AS prev_day_price,
@@ -993,9 +1055,35 @@ function computePortfolioStats(cards) {
     let unverified = 0;
     let estimatedCards = 0;
     let estimatedValue = 0;
+    let confirmedCards = 0;
+    let confirmedValue = 0;
+    let unverifiedCards = 0;
+    let unverifiedValue = 0;
+    let withPhoto = 0;
+    let withoutPhoto = 0;
 
     for (const card of cards) {
         totalValue += card.total_value;
+
+        // Solid accounting starts with what is actually evidenced. A card whose
+        // printing was confirmed against a database and priced against that
+        // printing is a number worth adding up; an estimate is a reasonable
+        // guess and belongs in its own column, not folded silently into the
+        // headline.
+        if (card.unit_price > 0) {
+            if (card.price_tier === 'confirmed') {
+                confirmedCards++;
+                confirmedValue += card.total_value;
+            } else if (card.price_tier !== 'estimated') {
+                // Priced with no tier at all: the old engine's work, kept
+                // visible rather than quietly counted as something it is not.
+                unverifiedCards++;
+                unverifiedValue += card.total_value;
+            }
+        }
+        // Whether a photograph of the card exists at all — the difference
+        // between a card in a binder and a card the app believes in.
+        if (card.has_photo) withPhoto++; else withoutPhoto++;
         totalCopies += card.quantity;
         if (!(card.unit_price > 0)) unpriced += card.quantity;
         // Outstanding means "no price", not "unconfirmed printing" — an
@@ -1032,6 +1120,15 @@ function computePortfolioStats(cards) {
         // more certain than it is.
         estimatedCards,
         estimatedValue: Number(estimatedValue.toFixed(2)),
+        // The figure that can be stood behind: every card confirmed to a
+        // printing and priced against it. Shown as the headline, with the
+        // estimates beside it rather than inside it.
+        confirmedCards,
+        confirmedValue: Number(confirmedValue.toFixed(2)),
+        unverifiedCards,
+        unverifiedValue: Number(unverifiedValue.toFixed(2)),
+        cardsWithPhoto: withPhoto,
+        cardsWithoutPhoto: withoutPhoto,
         totalValue: Number(totalValue.toFixed(2)),
         prevValue: Number(prevValue.toFixed(2)),
         acquiredCost: Number(acquiredCost.toFixed(2)),
@@ -1472,7 +1569,14 @@ async function fetchPokemonTcgCandidates(card) {
         const health = sourceHealth.get('pokemontcg');
         lastCandidateErrors.set(cacheKey, {
             ...health,
-            message: `${health.message} — waiting ${Math.ceil(cooling / 1000)}s before asking again`,
+            // Built from `baseMessage`, never from `message`. This record is
+            // handed back to noteSource further up the call chain, so deriving
+            // it from the message would make each pass append to the last: one
+            // card's explanation ended up reading "Rate limited — waiting 59s
+            // before asking again — waiting 57s before asking again —" thirty
+            // times over, having accumulated once per card in the refresh.
+            baseMessage: health.baseMessage || health.message,
+            message: `${health.baseMessage || health.message} — waiting ${Math.ceil(cooling / 1000)}s before asking again`,
         });
         return [];
     }
@@ -1604,11 +1708,33 @@ async function verifyAndCanonicalizeCard(card, report = () => {}) {
  */
 async function verifyWithReason(card, report = () => {}) {
     let why = '';
+    let reason = '';
     const verified = await verifyAndCanonicalizeCard(card, (stage, payload = {}) => {
-        if (stage === 'verify_failed' && payload.message) why = payload.message;
+        if (stage === 'verify_failed' && payload.message) {
+            why = payload.message;
+            reason = payload.reason || '';
+        }
         report(stage, payload);
     });
-    return { verified, why: verified ? '' : asReasonClause(why) };
+    return {
+        verified,
+        why: verified ? '' : asReasonClause(why),
+        reason: verified ? '' : reason,
+        // Did we actually learn anything about this card?
+        //
+        // "The closest match is numbered 051, not 120/105" is a finding: the
+        // databases were asked and answered, and the answer did not fit. A rate
+        // limit or an outage is the opposite — nothing was learned, because
+        // nothing was asked. Estimating a price off the second kind is how a
+        // Rayquaza VMAX came to be valued at $1,253.94 on the strength of a
+        // lookup that never happened.
+        answered: verified ? true : !isTransientFailure(reason),
+    };
+}
+
+/** Failures that say nothing about the card, only about the moment. */
+function isTransientFailure(reason) {
+    return String(reason || '').startsWith('database_');
 }
 
 /** Confirm a non-English printing against TCGdex in its own language. */
@@ -2605,7 +2731,7 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
  * Now every identifiable card gets a number, carrying the tier and the sentence
  * that explains it. Nobody is asked to confirm anything.
  */
-async function priceCard(card, { verified, why = '', onSource, fresh = false } = {}) {
+async function priceCard(card, { verified, why = '', answered = true, onSource, fresh = false } = {}) {
     const market = await lookupMarketPrice(card, { onSource, fresh });
     const price = Number(market?.price) || 0;
 
@@ -2615,16 +2741,23 @@ async function priceCard(card, { verified, why = '', onSource, fresh = false } =
     const tier = tierFor({
         verified,
         price,
+        answered,
         why: price > 0 ? why : (market?.sourcesUnavailable ? 'no price source could be reached' : why),
     });
 
-    if (!(price > 0)) {
+    // An unconfirmed card whose databases could not be reached is reported as
+    // having no price, whatever a marketplace happened to say. The figure is
+    // dropped rather than shown, because a number nothing corroborates is worse
+    // than an admission — this is what put four-figure cards in the collection
+    // total on the back of lookups that never completed.
+    if (!(price > 0) || tier.unreached) {
         return {
             ...(market || {}),
             price: 0,
             tier: tier.tier,
             tierLabel: tier.label,
             explanation: tier.explanation,
+            unreached: Boolean(tier.unreached),
         };
     }
 
@@ -2857,9 +2990,10 @@ async function refreshAllPrices() {
                 // deciding to do nothing.
                 let subject = card;
                 let unverifiedReason = '';
+                let databasesAnswered = true;
                 if (card.needs_review) {
                     forgetCandidates(card);
-                    const { verified, why } = await verifyWithReason({
+                    const { verified, why, answered } = await verifyWithReason({
                         ...card,
                         confidence: Math.max(Number(card.confidence) || 0, 0.9),
                     });
@@ -2870,6 +3004,7 @@ async function refreshAllPrices() {
                         broadcastActivity('info', `Identified ${verified.card_name} (${verified.card_set}) — priced against that exact printing.`);
                     } else {
                         unverifiedReason = why || 'the exact printing could not be confirmed';
+                        databasesAnswered = answered;
                     }
                 }
 
@@ -2886,6 +3021,7 @@ async function refreshAllPrices() {
                 const result = await priceCard(subject, {
                     verified: !subject.needs_review,
                     why: unverifiedReason,
+                    answered: databasesAnswered,
                     fresh: true,
                 });
                 if (result && result.price > 0) {
@@ -3396,7 +3532,7 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
         // though — someone who has just typed in the right set and number
         // should not be told their correction produced nothing.
         forgetCandidates(merged);
-        const { verified, why } = await verifyWithReason({ ...merged, confidence: 0.95 });
+        const { verified, why, answered } = await verifyWithReason({ ...merged, confidence: 0.95 });
         let priceNote = '';
 
         const subject = verified ? { ...merged, ...verified } : merged;
@@ -3412,6 +3548,7 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
         const market = await priceCard(subject, {
             verified: Boolean(verified),
             why: why || 'the exact printing could not be confirmed',
+            answered,
             fresh: true,
         });
 
@@ -3602,9 +3739,10 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
         let subject = card;
         let clearedReview = false;
         let unverifiedReason = card.price_explanation || '';
+        let databasesAnswered = true;
         if (card.needs_review) {
             forgetCandidates(card);
-            const { verified, why } = await verifyWithReason({
+            const { verified, why, answered } = await verifyWithReason({
                 ...card,
                 // The stored confidence is the AI's read of the photo. Re-verifying
                 // works from the fields as they now stand, which the person may
@@ -3617,6 +3755,7 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
                 clearedReview = true;
             } else {
                 unverifiedReason = why || 'the exact printing could not be confirmed';
+                databasesAnswered = answered;
             }
         }
 
@@ -3625,6 +3764,7 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
         const market = await priceCard(subject, {
             verified: !subject.needs_review,
             why: unverifiedReason,
+            answered: databasesAnswered,
             fresh: true,
         });
         const price = Number(market?.price) || 0;
@@ -3745,7 +3885,7 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
                 const card = rows[i];
                 try {
                     forgetCandidates(card);
-                    const { verified, why } = await verifyWithReason({
+                    const { verified, why, answered } = await verifyWithReason({
                         ...card,
                         confidence: Math.max(Number(card.confidence) || 0, 0.9),
                     });
@@ -3762,6 +3902,7 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
                     const market = await priceCard(verified ? { ...card, ...verified } : card, {
                         verified: Boolean(verified),
                         why: why || 'the exact printing could not be confirmed',
+                        answered,
                         fresh: true,
                     });
 
@@ -3820,6 +3961,89 @@ app.post('/api/portfolio/recheck-review', requireAuth, async (req, res) => {
  * /api/portfolio, so the app can show them as what they are: material still
  * waiting to be read, not twenty-card "cards" that no marketplace can price.
  */
+/**
+ * The books: every card, what it is worth, and what that figure rests on.
+ *
+ * This exists because the collection reached $20,000 and could not account for
+ * it. The question "where did this card come from and why does it say that
+ * number" had no answer in the app, so speculation and evidence looked
+ * identical once they were both a row in a list.
+ *
+ * Each card is placed in exactly one bucket, and the buckets sum to the total.
+ * A card is in the first bucket it qualifies for, so nothing is counted twice:
+ *
+ *   confirmed  the printing was matched to a database and priced against it
+ *   estimated  priced, but the exact printing was never confirmed
+ *   unpriced   no marketplace quotes it yet
+ *
+ * Separately, and independently of price: does a photograph of this card exist?
+ * A card with no photo was never scanned — it came out of a spread photo, or an
+ * import — and that is the first thing to check when an entry looks wrong.
+ */
+app.get('/api/portfolio/accounting', requireAuth, async (req, res) => {
+    try {
+        const cards = await getAllPortfolioCards(req.user.id);
+
+        /**
+         * Four states, not three. A card carrying a price but no tier was
+         * priced by an earlier engine that recorded no provenance — no source,
+         * no confidence, no printing. That is not a confirmed price and it is
+         * not an estimate either; calling it either one is how the books came
+         * to disagree with the collection totals, which is precisely the
+         * "no solid accounting" being complained about. It gets its own line
+         * and gets re-priced on the next refresh.
+         */
+        const bucket = (card) => {
+            if (!(card.unit_price > 0)) return 'unpriced';
+            if (card.price_tier === 'confirmed') return 'confirmed';
+            if (card.price_tier === 'estimated') return 'estimated';
+            return 'unverified';
+        };
+
+        const buckets = { confirmed: [], estimated: [], unverified: [], unpriced: [] };
+        for (const card of cards) buckets[bucket(card)].push(card);
+
+        const summarise = (list) => ({
+            cards: list.length,
+            copies: list.reduce((n, c) => n + c.quantity, 0),
+            value: Number(list.reduce((n, c) => n + c.total_value, 0).toFixed(2)),
+            withoutPhoto: list.filter(c => !c.has_photo).length,
+        });
+
+        const describe = (card) => ({
+            id: card.id,
+            card_name: card.card_name,
+            card_set: card.card_set,
+            card_number: card.card_number,
+            language: card.language_label,
+            quantity: card.quantity,
+            unit_price: card.unit_price,
+            total_value: card.total_value,
+            tier: card.price_tier || '',
+            source: card.price_source || '',
+            confidence: card.price_confidence || 0,
+            explanation: card.price_explanation || '',
+            has_photo: Boolean(card.has_photo),
+            from_source_photo: card.source_photo_id || null,
+        });
+
+        res.json({
+            success: true,
+            // Ordered most valuable first: a wrong number matters in proportion
+            // to its size, so the entries worth auditing are at the top.
+            confirmed: { ...summarise(buckets.confirmed), items: buckets.confirmed.map(describe) },
+            estimated: { ...summarise(buckets.estimated), items: buckets.estimated.map(describe) },
+            unverified: { ...summarise(buckets.unverified), items: buckets.unverified.map(describe) },
+            unpriced: { ...summarise(buckets.unpriced), items: buckets.unpriced.map(describe) },
+            withoutPhoto: cards.filter(c => !c.has_photo).map(describe),
+            total: Number(cards.reduce((n, c) => n + c.total_value, 0).toFixed(2)),
+        });
+    } catch (err) {
+        console.error('Accounting error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
     try {
         const { rows } = await pool.query(`
@@ -3937,7 +4161,7 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                     for (const rawCard of cards) {
                         if (!hasMeaningfulCardName(rawCard.card_name)) continue;
 
-                        const { verified, why } = await verifyWithReason(rawCard);
+                        const { verified, why, answered } = await verifyWithReason(rawCard);
                         const card = verified || { ...rawCard, needs_review: true };
 
                         const existing = await findCardByVariant(buildVariantKey(card), req.user.id);
@@ -3949,6 +4173,7 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                             thumbDataUrl: crop || '',
                             needsReview: !verified,
                             unverifiedReason: why,
+                            databasesAnswered: answered,
                             forceSeparate: true,
                         });
                         if (saved?.id) {
@@ -4420,7 +4645,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
             });
             report('verifying', { ...photo, message: 'Confirming the printing against the card database' });
 
-            const { verified, why: unverifiedReason } = await verifyWithReason(rawCard, report);
+            const { verified, why: unverifiedReason, answered: databasesAnswered } = await verifyWithReason(rawCard, report);
             const card = verified || { ...rawCard, needs_review: true };
 
             if (verified) {
@@ -4468,6 +4693,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
                 thumbDataUrl: cardThumb,
                 needsReview: !verified,
                 unverifiedReason,
+                databasesAnswered,
                 forceSeparate: options.forceSeparate === true,
                 report: (stage, payload) => report(stage, { ...photo, ...payload }),
             });
@@ -4491,7 +4717,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
  * Persist one identified card: either as a new printing or as another copy of a
  * printing already held.
  */
-async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unverifiedReason = '', forceSeparate, report = () => {} }) {
+async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unverifiedReason = '', databasesAnswered = true, forceSeparate, report = () => {} }) {
     const variantKey = buildVariantKey(card);
     const existing = forceSeparate ? null : await findCardByVariant(variantKey, userId);
 
@@ -4584,6 +4810,7 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unveri
         market = await priceCard(card, {
             verified: !needsReview,
             why: unverifiedReason || 'the exact printing could not be confirmed',
+            answered: databasesAnswered,
             onSource: (entry) => report('price_source', entry),
         });
     } catch (err) {

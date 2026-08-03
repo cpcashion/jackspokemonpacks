@@ -237,7 +237,7 @@ function showView(name) {
 
   window.scrollTo({ top: 0 });
   render();
-  if (name === 'settings') { loadHealth(); loadVersion(); }
+  if (name === 'settings') { loadHealth(); loadAccounting(); loadVersion(); }
 }
 
 document.querySelectorAll('[data-view]').forEach((b) => {
@@ -436,7 +436,39 @@ function portfolioSeries(days) {
 
 function renderHero() {
   const s = state.stats;
-  $('heroValue').textContent = money(s.totalValue || 0);
+
+  /**
+   * The headline is what can be stood behind.
+   *
+   * It used to be every price the app held, estimates included, which is how a
+   * collection came to announce $20,000 with a good part of that resting on
+   * cards whose printing had never been confirmed. Confirmed value leads;
+   * estimates are stated underneath, in their own words, so the two are never
+   * added together silently.
+   */
+  const confirmed = Number(s.confirmedValue) || 0;
+  const estimated = Number(s.estimatedValue) || 0;
+  const unverified = Number(s.unverifiedValue) || 0;
+  // Anything not confirmed is stated separately rather than folded in.
+  const soft = estimated + unverified;
+
+  $('heroValue').textContent = money(soft > 0 ? confirmed : (s.totalValue || 0));
+  $('heroLabel').textContent = soft > 0 ? 'Confirmed value' : 'Collection value';
+
+  const basis = $('heroBasis');
+  basis.innerHTML = '';
+  if (estimated > 0) {
+    basis.append(el('span', null,
+      `+ ${money(estimated)} estimated across ${s.estimatedCards} card${s.estimatedCards === 1 ? '' : 's'}`));
+  }
+  if (unverified > 0) {
+    basis.append(el('span', null,
+      `+ ${money(unverified)} not verified yet (${s.unverifiedCards})`));
+  }
+  if (s.unpricedCopies) {
+    basis.append(el('span', 'muted',
+      `${s.unpricedCopies} card${s.unpricedCopies === 1 ? '' : 's'} not priced yet`));
+  }
 
   const series = portfolioSeries(state.heroRange);
   const first = series.length ? series[0].v : null;
@@ -1905,6 +1937,66 @@ const whenFrom = (ts) => {
   const label = hours < 48 ? `${hours}h` : `${Math.round(hours / 24)} days`;
   return diff > 0 ? `in ${label}` : `${label} ago`;
 };
+
+/**
+ * The books, in the app.
+ *
+ * The collection announced $20,000 and there was no way to ask it why. Each
+ * row here is a claim of a different strength, they add up to the total, and
+ * the cards with no photograph behind them are named — because "where did this
+ * card come from" is the question a wrong number always raises first.
+ */
+async function loadAccounting() {
+  const host = $('accountingBody');
+  if (!host) return;
+  try {
+    const a = await api('/api/portfolio/accounting');
+    host.innerHTML = '';
+    host.className = '';
+
+    const rows = [
+      ['Confirmed', a.confirmed, 'good', 'matched to a printing and priced against it'],
+      ['Estimated', a.estimated, 'warn', 'priced, but the exact printing was never confirmed'],
+      ['Not verified yet', a.unverified, 'warn', 'priced by an earlier version that recorded no source'],
+      ['No price yet', a.unpriced, 'muted', 'no marketplace quotes these'],
+    ];
+
+    for (const [label, bucket, tone, why] of rows) {
+      if (!bucket || !bucket.cards) continue;
+      const row = el('div', 'acct-row');
+      const labelCell = el('div', 'acct-label');
+      labelCell.append(
+        el('div', 'acct-name', `${label} — ${bucket.cards} card${bucket.cards === 1 ? '' : 's'}`),
+        el('div', 'acct-why', why),
+      );
+      row.append(el('div', `acct-dot acct-${tone}`), labelCell, el('div', 'acct-value', money(bucket.value)));
+      host.appendChild(row);
+    }
+
+    const total = el('div', 'acct-row acct-total');
+    total.append(el('div', 'acct-dot'), el('div', 'acct-label', 'Total'), el('div', 'acct-value', money(a.total)));
+    host.appendChild(total);
+
+    if (a.withoutPhoto.length) {
+      const note = el('div', 'acct-note');
+      note.append(el('b', null, `${a.withoutPhoto.length} card${a.withoutPhoto.length === 1 ? '' : 's'} with no photograph`));
+      note.append(el('div', 'acct-why',
+        'These were never scanned — they came from a spread photo or an import. If one looks wrong, it is the place to start.'));
+      const list = el('div', 'acct-list');
+      for (const card of a.withoutPhoto.slice(0, 12)) {
+        list.append(el('div', 'acct-item',
+          `${card.card_name}${card.card_number ? ` · ${card.card_number}` : ''} — ${card.unit_price > 0 ? money(card.total_value) : 'no price'}`));
+      }
+      if (a.withoutPhoto.length > 12) {
+        list.append(el('div', 'acct-item muted', `…and ${a.withoutPhoto.length - 12} more`));
+      }
+      note.appendChild(list);
+      host.appendChild(note);
+    }
+  } catch (err) {
+    host.textContent = `Could not load the books: ${err.message}`;
+  }
+}
 
 async function loadHealth() {
   const host = $('healthBody');

@@ -37,6 +37,49 @@ test('an identified card with an unconfirmed printing still gets a number', () =
     assert.match(t.explanation, /051/, 'and it says exactly what did not line up');
 });
 
+/**
+ * The bug that carried the collection past $20,000.
+ *
+ * A Rayquaza VMAX was shown at $1,253.94 under the words "Estimated — the card
+ * database could not answer — Rate limited". The app was stating in the same
+ * breath that it had a price and that it had learned nothing about the card.
+ *
+ * An estimate is defensible when the databases answered and the answer did not
+ * quite fit: the name, number and language are still known, so a figure based
+ * on them means something. When they could not be reached, none of that holds
+ * and there is no estimate to be made — only an admission.
+ */
+test('a price is never estimated on the back of a lookup that never happened', () => {
+    const unreachable = tierFor({
+        verified: false,
+        price: 1253.94,
+        answered: false,
+        why: 'the card database could not answer — Rate limited',
+    });
+    assert.equal(unreachable.tier, 'unpriced', 'no evidence means no price, whatever a marketplace said');
+    assert.equal(unreachable.unreached, true);
+    assert.match(unreachable.explanation, /could not be reached/i);
+    assert.doesNotMatch(unreachable.explanation, /1253|1,253/, 'and the figure is not repeated back');
+
+    // The same card, once the databases are answering again: the reply did not
+    // fit, which IS a finding, and an estimate is then reasonable.
+    const answered = tierFor({
+        verified: false,
+        price: 1253.94,
+        answered: true,
+        why: 'the closest match is numbered 217, not 218/203',
+    });
+    assert.equal(answered.tier, 'estimated');
+    assert.match(answered.explanation, /217/);
+});
+
+test('a confirmed price is unaffected by whether other lookups answered', () => {
+    for (const answered of [true, false]) {
+        const t = tierFor({ verified: true, price: 412.5, answered });
+        assert.equal(t.tier, 'confirmed', 'confirmation is itself an answer');
+    }
+});
+
 test('no price from any source is reported as such, not as zero', () => {
     const t = tierFor({ verified: true, price: 0 });
     assert.equal(t.tier, 'unpriced');

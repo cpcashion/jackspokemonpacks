@@ -53,6 +53,11 @@ import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/p
 import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook } from './lib/card-crop.js';
 import { spreadPhotoIds } from './lib/source-photo.js';
 import {
+    createBudget,
+    cardsAffordable,
+    EBAY_DAILY_LIMIT as EBAY_DEFAULT_DAILY_LIMIT,
+} from './lib/api-budget.js';
+import {
     perceptualHash,
     decodeDataUrl,
     groupLikelySamePhoto,
@@ -87,6 +92,10 @@ const JUSTTCG_API_KEY = process.env.JUSTTCG_API_KEY || '';
 const EBAY_APP_ID = process.env.EBAY_APP_ID || process.env.EBAY_CLIENT_ID || '';
 const EBAY_CERT_ID = process.env.EBAY_CERT_ID || process.env.EBAY_CLIENT_SECRET || '';
 const EBAY_MARKETPLACE = process.env.EBAY_MARKETPLACE || 'EBAY_US';
+// eBay allows an application 5,000 Browse calls a day. Pricing one card can
+// cost up to eight, so a collection of a few hundred can spend the lot in a
+// single refresh — see lib/api-budget.js.
+const EBAY_DAILY_LIMIT = Number(process.env.EBAY_DAILY_CALL_LIMIT) || EBAY_DEFAULT_DAILY_LIMIT;
 
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE
@@ -2442,6 +2451,31 @@ let ebayToken = { value: '', expiresAt: 0 };
  * over a large collection would otherwise spend a meaningful fraction of its
  * time re-authenticating.
  */
+/**
+ * eBay's daily allowance, counted across restarts.
+ *
+ * Persisted to app_meta rather than held in memory: the free tier restarts
+ * whenever the service wakes from a spin-down, and a counter that forgot would
+ * let each boot spend the whole allowance again.
+ */
+const ebayBudget = createBudget({
+    limit: EBAY_DAILY_LIMIT,
+    load: async (day) => {
+        try {
+            const r = await pool.query('SELECT value FROM app_meta WHERE key = $1', [`ebay_calls_${day}`]);
+            return Number(r.rows[0]?.value) || 0;
+        } catch { return 0; }
+    },
+    save: async (day, used) => {
+        try {
+            await pool.query(
+                `INSERT INTO app_meta (key, value) VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, applied_at = NOW()`,
+                [`ebay_calls_${day}`, String(used)]);
+        } catch { /* a lost count is better than a failed price lookup */ }
+    },
+});
+
 async function ebayAccessToken() {
     if (!EBAY_APP_ID || !EBAY_CERT_ID) return null;
     if (ebayToken.value && Date.now() < ebayToken.expiresAt) return ebayToken.value;
@@ -2476,10 +2510,22 @@ async function ebayAccessToken() {
  * explicitly, and auctions are the half we care about most — so both are
  * fetched and merged.
  */
-async function fetchEbayListings(card, q) {
+async function fetchEbayListings(card, q, { interactive = false } = {}) {
     const token = await ebayAccessToken();
     if (!token) return null;
     if (!q) return null;
+
+    // Each search costs two calls: fixed-price listings and auctions are
+    // separate requests. Checked before spending rather than after, so the
+    // allowance cannot go negative mid-refresh.
+    if (!(await ebayBudget.canSpend(2, { interactive }))) {
+        throw new SourceUnavailable({
+            ok: false,
+            kind: 'quota',
+            message: `eBay's daily allowance of ${EBAY_DAILY_LIMIT} calls is spent — it resets at midnight UTC`,
+        });
+    }
+    await ebayBudget.spend(2);
 
     const headers = {
         Authorization: `Bearer ${token}`,
@@ -2522,7 +2568,7 @@ async function fetchEbayListings(card, q) {
  * the printing, and lib/identity.js discounts each copy for its own condition
  * afterwards — applying both would discount twice.
  */
-async function collectEbayQuotes(card) {
+async function collectEbayQuotes(card, { interactive = false } = {}) {
     const subject = {
         name: card.card_name_en || card.card_name,
         number: normalizeCardNumber(card.card_number),
@@ -2562,9 +2608,13 @@ async function collectEbayQuotes(card) {
     for (const { q, requireNumber, strict } of queries) {
         let listings;
         try {
-            listings = await fetchEbayListings(card, q);
+            listings = await fetchEbayListings(card, q, { interactive });
         } catch (err) {
             lastError = err;
+            // A spent allowance is not a per-search failure: every remaining
+            // rung would fail identically, so the ladder stops rather than
+            // logging the same refusal four times over.
+            if (err instanceof SourceUnavailable && err.failure?.kind === 'quota') break;
             attempts.push({ q, error: describeAxiosError(err, { usesKey: true }).message });
             continue;
         }
@@ -2721,7 +2771,7 @@ const PRICE_SOURCE_LABELS = {
  * a spinner. The returned object carries the same information as `sources`, so
  * a caller that only wants the outcome does not have to listen.
  */
-async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
+async function lookupMarketPrice(card, { onSource, fresh = false, interactive = false } = {}) {
     if (!card?.card_name) return null;
 
     const key = priceCacheKey(card);
@@ -2757,7 +2807,7 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
             name: 'ebay',
             configured: Boolean(EBAY_APP_ID && EBAY_CERT_ID),
             reason: 'no eBay credentials — set EBAY_APP_ID and EBAY_CERT_ID',
-            run: () => collectEbayQuotes(card),
+            run: () => collectEbayQuotes(card, { interactive }),
         },
         {
             name: 'scrydex',
@@ -2862,8 +2912,8 @@ async function lookupMarketPrice(card, { onSource, fresh = false } = {}) {
  * Now every identifiable card gets a number, carrying the tier and the sentence
  * that explains it. Nobody is asked to confirm anything.
  */
-async function priceCard(card, { verified, why = '', answered = true, onSource, fresh = false } = {}) {
-    const market = await lookupMarketPrice(card, { onSource, fresh });
+async function priceCard(card, { verified, why = '', answered = true, onSource, fresh = false, interactive = false } = {}) {
+    const market = await lookupMarketPrice(card, { onSource, fresh, interactive });
     const price = Number(market?.price) || 0;
 
     // When there is no price the reason worth showing is why the lookup came
@@ -3239,6 +3289,21 @@ async function refreshAllPrices() {
                 if (unavailable >= 5) {
                     console.error('  [PriceRefresh] Stopping early — no price source is answering.');
                     broadcastActivity('error', 'Stopped refreshing: no price source is answering right now.');
+                    break;
+                }
+
+                // The day's eBay allowance is spent. Carrying on would price
+                // the remaining cards from catalogues alone and record that
+                // thinner answer as though it were the best available, so the
+                // run stops here and resumes tomorrow — the queue is ordered by
+                // last checked, so it picks up exactly where it left off.
+                const spend = await ebayBudget.state();
+                if (spend.exhausted && EBAY_APP_ID && EBAY_CERT_ID) {
+                    const left = cards.length - (i + 1);
+                    console.log(`  [PriceRefresh] eBay allowance spent (${spend.used}/${spend.limit}); pausing with ${left} card(s) to go.`);
+                    broadcastActivity('info',
+                        `Priced ${updated} card${updated === 1 ? '' : 's'}. eBay's daily allowance is now spent, `
+                        + `so the remaining ${left} will be picked up tomorrow — the queue resumes where it stopped.`);
                     break;
                 }
 
@@ -3801,6 +3866,7 @@ app.post('/api/portfolio/:id/edit', requireAuth, express.json(), async (req, res
             why: why || 'the exact printing could not be confirmed',
             answered,
             fresh: true,
+            interactive: true,
         });
 
         if (market?.price > 0) {
@@ -4017,6 +4083,7 @@ app.post('/api/portfolio/:id/reprice', requireAuth, async (req, res) => {
             why: unverifiedReason,
             answered: databasesAnswered,
             fresh: true,
+            interactive: true,
         });
         const price = Number(market?.price) || 0;
 
@@ -4715,6 +4782,7 @@ app.get('/api/health', requireAuth, async (req, res) => {
         const cards = await getAllPortfolioCards(req.user.id);
         const stats = computePortfolioStats(cards);
         const schedule = await refreshSchedule();
+        const ebaySpend = await ebayBudget.state();
 
         const checked = cards.map(c => c.last_price_check).filter(Boolean).map(d => new Date(d).getTime());
 
@@ -4727,9 +4795,14 @@ app.get('/api/health', requireAuth, async (req, res) => {
                 {
                     name: 'eBay live market', live: Boolean(EBAY_APP_ID && EBAY_CERT_ID),
                     detail: EBAY_APP_ID && EBAY_CERT_ID
-                        ? 'live listings and auction bids'
+                        // The allowance is stated because running out looks
+                        // exactly like the card having no market, and only one
+                        // of those is worth doing anything about.
+                        ? `live listings and auction bids · ${ebaySpend.used} of ${ebaySpend.limit} calls used today`
+                          + `${ebaySpend.exhausted ? ' — allowance spent, resets at midnight UTC' : ''}`
                         : 'needs EBAY_APP_ID + EBAY_CERT_ID — the only source that sees what buyers are doing',
                     key: 'EBAY_APP_ID',
+                    quota: ebaySpend,
                 },
             ],
             schedule,
@@ -5130,6 +5203,9 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unveri
             verified: !needsReview,
             why: unverifiedReason || 'the exact printing could not be confirmed',
             answered: databasesAnswered,
+            // Somebody is standing there with the card in their hand. This may
+            // spend the reserve a bulk refresh is not allowed to touch.
+            interactive: true,
             onSource: (entry) => report('price_source', entry),
         });
     } catch (err) {

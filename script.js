@@ -662,14 +662,48 @@ function cardArt(card, cls) {
 }
 
 /** Scan photos live in the database as base64; fetch them only once on screen. */
+/**
+ * Scan photos live in the database as base64, so each one costs a request and
+ * tens of kilobytes. Fetching them all on render was fine for a shelf and
+ * ruinous for a collection: 657 cards meant 657 requests and something like
+ * 30MB, fired at once, at a free-tier server, from a phone.
+ *
+ * They load as they come into view instead. Everything below the fold costs
+ * nothing until it is actually looked at.
+ */
+const localImageObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries, observer) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        observer.unobserve(entry.target);
+        fetchLocalImage(entry.target);
+      }
+    }, {
+      // A screen's worth of lead time, so a photo is usually there by the time
+      // it is scrolled to rather than popping in afterwards.
+      rootMargin: '600px 0px',
+    })
+  : null;
+
+function fetchLocalImage(img) {
+  if (img.dataset.hydrated) return;
+  img.dataset.hydrated = '1';
+  fetch(`/api/portfolio/${img.dataset.localFor}/image`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(cardPlaceholder()); })
+    .catch(() => img.replaceWith(cardPlaceholder()));
+}
+
 function hydrateLocalImages(root) {
   root.querySelectorAll('img[data-local-for]').forEach((img) => {
-    if (img.dataset.hydrated) return;
-    img.dataset.hydrated = '1';
-    fetch(`/api/portfolio/${img.dataset.localFor}/image`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(cardPlaceholder()); })
-      .catch(() => img.replaceWith(cardPlaceholder()));
+    if (img.dataset.hydrated || img.dataset.observed) return;
+    if (localImageObserver) {
+      img.dataset.observed = '1';
+      localImageObserver.observe(img);
+    } else {
+      // No IntersectionObserver: fetch eagerly rather than show nothing.
+      fetchLocalImage(img);
+    }
   });
 }
 

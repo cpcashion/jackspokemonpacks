@@ -757,6 +757,30 @@ if (!DB) {
     });
 
     /**
+     * eBay allows 5,000 Browse calls a day and pricing one card can cost eight,
+     * so a collection of a few hundred can spend the lot in a single refresh —
+     * after which every card comes back unpriced for 24 hours, looking exactly
+     * like the app being broken. The allowance has to be visible.
+     */
+    test('the eBay allowance is reported, not left to be discovered', async () => {
+        const { body } = await api('/api/health');
+        const ebay = body.sources.find(s => /eBay/i.test(s.name));
+        assert.ok(ebay, 'eBay is listed as a source');
+
+        // The suite runs without credentials, so it reports what is missing
+        // rather than a spend figure it cannot have.
+        if (!ebay.live) {
+            assert.match(ebay.detail, /EBAY_APP_ID/, 'and says exactly what it needs');
+            return;
+        }
+        assert.ok(ebay.quota, 'a live eBay source reports its allowance');
+        assert.equal(typeof ebay.quota.used, 'number');
+        assert.ok(ebay.quota.limit > 0);
+        assert.ok(ebay.quota.remainingForBulk <= ebay.quota.remaining,
+            'bulk work always stops short of the interactive reserve');
+    });
+
+    /**
      * "Why is the app showing a different amount of cards than the Neon
      * database?" — there was no way to tell which was right, or whether the two
      * were even looking at the same place. Every figure here is a plain

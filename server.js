@@ -52,6 +52,7 @@ import { buildSearchQueries, compsFromListings } from './lib/ebay-comps.js';
 import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
 import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook } from './lib/card-crop.js';
 import { spreadPhotoIds } from './lib/source-photo.js';
+import { buildZip, safeEntryName } from './lib/zip.js';
 import {
     createBudget,
     cardsAffordable,
@@ -1008,11 +1009,33 @@ async function getAllPortfolioCards(userId) {
             month_ref.price AS prev_30d_price,
             latest.source AS price_source,
             latest.source_url AS price_source_url,
+            -- The first observation ever, plus the last 120 daily closes.
+            --
+            -- This used to be the raw last 30 rows, which quietly broke every
+            -- window longer than the recording cadence: a card priced daily
+            -- for 100 days had no point older than a month in the payload, so
+            -- the client's 90-day and all-time movement treated the whole
+            -- mature collection as "newly priced". One close per day is what
+            -- the charts draw anyway; the first-ever point is what all-time
+            -- movement measures from. Payload stays bounded at ~121 points.
             (
                 SELECT json_agg(h ORDER BY h.recorded_at ASC) FROM (
-                    SELECT price, recorded_at FROM price_history
-                    WHERE card_id = pc.id
-                    ORDER BY recorded_at DESC LIMIT 30
+                    (
+                        SELECT price, recorded_at FROM price_history
+                        WHERE card_id = pc.id
+                        ORDER BY recorded_at ASC LIMIT 1
+                    )
+                    UNION ALL
+                    (
+                        SELECT price, recorded_at FROM (
+                            SELECT DISTINCT ON (date_trunc('day', recorded_at))
+                                   price, recorded_at
+                            FROM price_history
+                            WHERE card_id = pc.id
+                            ORDER BY date_trunc('day', recorded_at) DESC, recorded_at DESC
+                            LIMIT 120
+                        ) daily
+                    )
                 ) h
             ) as price_history,
             (
@@ -2103,7 +2126,7 @@ function dataUrlToBuffer(dataUrl) {
  * whole grid is a cosmetic problem, and failing the scan over it would be a
  * real one. The caller falls back to the full-frame thumbnail.
  */
-async function cropCardThumbnail(buffer, box, { width = 400, height = 560 } = {}) {
+async function cropCardThumbnail(buffer, box, { width = 900, height = 1260 } = {}) {
     try {
         const meta = await sharp(buffer).metadata();
         const region = boxToRegion(box, meta.width, meta.height);
@@ -4420,6 +4443,61 @@ app.get('/api/portfolio/accounting', requireAuth, async (req, res) => {
     }
 });
 
+/**
+ * Every photo Jack ever uploaded, back out as one archive.
+ *
+ * The photos live inside Postgres as base64 data URLs; there is no folder on
+ * Render or Neon to point a download at, and asking someone to copy base64 out
+ * of a SQL console is not an answer. One click, one ZIP.
+ *
+ * Worth stating on the way out: these are the images AS STORED. Early scans
+ * kept only a 400px thumbnail and discarded the original, so for those this is
+ * everything that still exists — which is exactly why re-uploading fresh,
+ * full-resolution photos is the right move, and why they are stored larger now.
+ */
+app.get('/api/portfolio/photos.zip', requireAuth, async (req, res) => {
+    try {
+        const cards = await pool.query(`
+            SELECT id, card_name, image_data, COALESCE(is_source_photo, 0) AS is_source, added_at
+            FROM portfolio_cards
+            WHERE user_id = $1 AND image_data IS NOT NULL AND image_data <> ''
+            ORDER BY id ASC
+        `, [req.user.id]);
+        const copies = await pool.query(`
+            SELECT cc.id, cc.card_id, cc.image_data, cc.created_at, pc.card_name
+            FROM card_copies cc
+            JOIN portfolio_cards pc ON pc.id = cc.card_id
+            WHERE pc.user_id = $1 AND cc.image_data IS NOT NULL AND cc.image_data <> ''
+            ORDER BY cc.id ASC
+        `, [req.user.id]);
+
+        const files = [];
+        const push = (name, dataUrl, mtime) => {
+            const buffer = dataUrlToBuffer(dataUrl);
+            if (buffer) files.push({ name, data: buffer, mtime: mtime ? new Date(mtime) : undefined });
+        };
+        for (const row of cards.rows) {
+            const slug = safeEntryName(row.card_name, `card-${row.id}`);
+            push(row.is_source
+                ? `source-photos/photo-${row.id}.jpg`
+                : `cards/${row.id}-${slug}.jpg`, row.image_data, row.added_at);
+        }
+        for (const row of copies.rows) {
+            const slug = safeEntryName(row.card_name, `card-${row.card_id}`);
+            push(`copies/${row.card_id}-${slug}-copy-${row.id}.jpg`, row.image_data, row.created_at);
+        }
+
+        const zip = buildZip(files);
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', 'attachment; filename="jackspokemon-photos.zip"');
+        res.setHeader('Content-Length', zip.length);
+        res.end(zip);
+    } catch (err) {
+        console.error('Photo export error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
     try {
         const { rows } = await pool.query(`
@@ -4925,9 +5003,14 @@ async function processPortfolioUpload(files, userId, options = {}) {
             // The thumbnail and the recognition call are independent, so they run
             // together: the client gets a picture of the card to look at while
             // the model is still thinking, rather than after.
+            // Stored at a size a vision model can still read on a second
+            // pass. 400px was fine as a picture and useless as evidence — the
+            // card number was gone — and those thumbnails are all that remain
+            // of the early uploads. Storage cost is real but bounded: ~150KB a
+            // card at this size, tens of MB across the whole collection.
             const thumbnail = sharp(prepared.buffer)
-                .resize(400, 560, { fit: 'inside', withoutEnlargement: true })
-                .jpeg({ quality: 80 })
+                .resize(900, 1260, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 82 })
                 .toBuffer()
                 .then((thumbBuffer) => {
                     thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;

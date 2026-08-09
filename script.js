@@ -347,11 +347,6 @@ function renderCounts() {
   badge.hidden = reviewCount === 0;
   badge.textContent = reviewCount;
 
-  $('railTotal').textContent = money(state.stats.totalValue || 0);
-  const change = pct(state.stats.totalValue, state.stats.prevValue);
-  const railChange = $('railChange');
-  railChange.className = `rail-total-change ${trendClass(change)}`;
-  railChange.textContent = change === null ? 'No history yet' : `${trendText(change)} today`;
 
   const fx = state.pricing?.fx;
   if (fx) {
@@ -434,6 +429,73 @@ function portfolioSeries(days) {
   return series.filter(p => p.v > 0);
 }
 
+/**
+ * Market movement, as the other tracking apps mean it.
+ *
+ * The old change figure compared the portfolio series at the window's two
+ * ends. But that series jumps every time a card gets its FIRST price, so after
+ * a week in which the app priced five hundred cards, "past 30 days ↑ 15.6%"
+ * described the app's own progress, not the market. No marketplace charts its
+ * own discovery as gains.
+ *
+ * Movement is measured on the cards that can testify to it: priced at the
+ * start of the window AND priced now. A card first priced mid-window is real
+ * value but not movement, so it is reported separately as newly tracked.
+ */
+function marketMovement(days) {
+  const cutoff = days > 0 ? Date.now() - days * 86400000 : 0;
+  let base = 0;
+  let current = 0;
+  let newlyTracked = 0;
+  let witnesses = 0;
+
+  for (const card of state.cards) {
+    if (!(card.unit_price > 0)) continue;
+    const hist = (card.price_history || [])
+      .map((p) => ({ t: new Date(p.recorded_at).getTime(), v: Number(p.price) }))
+      .filter((p) => p.v > 0 && Number.isFinite(p.t))
+      .sort((x, y) => x.t - y.t);
+    if (!hist.length) continue;
+
+    // Only copies priced off the market move with it. A graded copy whose
+    // value was set by hand did not budge because TCGplayer did — this is the
+    // same split portfolioSeries makes, for the same reason.
+    const scale = (card.copies || [])
+      .filter((c) => !(Number(c.manual_value) > 0))
+      .reduce((sum, c) => sum + Number(c.value || 0), 0) / card.unit_price;
+    if (!(scale > 0)) continue;
+
+    if (cutoff) {
+      const before = hist.filter((p) => p.t <= cutoff);
+      if (before.length) {
+        base += before[before.length - 1].v * scale;
+        current += hist[hist.length - 1].v * scale;
+        witnesses++;
+      } else {
+        newlyTracked += card.total_value;
+      }
+    } else {
+      // All-time: a card needs two observations to testify. One price point is
+      // a card newly under tracking, not evidence that nothing moved — five
+      // hundred of those must not average into a confident "0.0% all time".
+      if (hist.length >= 2 && hist[hist.length - 1].t > hist[0].t) {
+        base += hist[0].v * scale;
+        current += hist[hist.length - 1].v * scale;
+        witnesses++;
+      } else {
+        newlyTracked += card.total_value;
+      }
+    }
+  }
+
+  return {
+    base, current,
+    delta: current - base,
+    pct: base > 0 ? ((current - base) / base) * 100 : null,
+    newlyTracked, witnesses,
+  };
+}
+
 function renderHero() {
   const s = state.stats;
 
@@ -474,7 +536,6 @@ function renderHero() {
   const first = series.length ? series[0].v : null;
   const last = series.length ? series[series.length - 1].v : null;
   const windowChange = first && last ? ((last - first) / first) * 100 : null;
-  const windowDelta = first && last ? last - first : null;
 
   // How much history actually exists, as opposed to how much was asked for.
   // A "90 days" label over four days of data is not a small inaccuracy — it
@@ -488,19 +549,51 @@ function renderHero() {
 
   const changeEl = $('heroChange');
   changeEl.innerHTML = '';
-  if (windowChange === null) {
-    changeEl.append(el('span', 'muted', 'Tracking starts as prices are recorded'));
-  } else {
-    // Say the window the numbers are actually from, not the button that was
-    // pressed to ask for them.
-    const label = shortOfRange
-      ? `past ${Math.max(1, Math.round(coverage))} day${Math.round(coverage) === 1 ? '' : 's'} — all the history there is`
-      : asked === 0 ? 'all time' : `past ${asked} days`;
+  // Measure over the window the data can actually cover. Asking for 30 days on
+  // top of 4 days of history must degrade to "over the 4 days there are" — the
+  // label already says so — rather than finding no card old enough to testify
+  // and declaring there is no movement to show.
+  const mv = marketMovement(shortOfRange ? 0 : asked);
+  // Say the window the numbers are actually from, not the button that was
+  // pressed to ask for them.
+  const label = shortOfRange
+    ? `past ${Math.max(1, Math.round(coverage))} day${Math.round(coverage) === 1 ? '' : 's'} — all the history there is`
+    : asked === 0 ? 'all time' : `past ${asked} days`;
+
+  if (mv.pct !== null && mv.witnesses > 0) {
     changeEl.append(
-      el('span', trendClass(windowChange), `${windowDelta >= 0 ? '+' : '−'}${money(Math.abs(windowDelta)).slice(1)}`),
-      el('span', trendClass(windowChange), trendText(windowChange)),
-      el('span', 'muted', label),
+      el('span', trendClass(mv.pct), `${mv.delta >= 0 ? '+' : '−'}${money(Math.abs(mv.delta)).slice(1)}`),
+      el('span', trendClass(mv.pct), trendText(mv.pct)),
+      el('span', 'muted',
+        `market movement, ${label} · ${mv.witnesses} card${mv.witnesses === 1 ? '' : 's'} tracked that long`),
     );
+  } else {
+    changeEl.append(el('span', 'muted', 'Market movement appears once cards have been priced on more than one day'));
+  }
+  // Value that arrived because pricing caught up, kept apart from movement —
+  // charting our own discovery as gains is how "+15.6%" happened.
+  if (mv.newlyTracked > 0) {
+    changeEl.append(el('span', 'muted',
+      `+ ${money(mv.newlyTracked)} newly priced in this window (not market movement)`));
+  }
+  // windowChange still colours the chart below: the chart draws the tracked
+  // series (which includes discovery), so its colour follows what is drawn,
+  // while the figures above follow market movement only.
+
+  // The rail repeats the hero rather than computing its own answer. It used
+  // to show the grand total while the hero led with confirmed value — the same
+  // money, two presentations, nothing saying so, and it read as a $13,000
+  // discrepancy.
+  const railLabel = document.querySelector('.rail-total-label');
+  if (railLabel) railLabel.textContent = $('heroLabel').textContent;
+  $('railTotal').textContent = $('heroValue').textContent;
+  const railChange = $('railChange');
+  if (railChange) {
+    const showTrend = soft <= 0 && mv.pct !== null && mv.witnesses > 0;
+    railChange.className = `rail-total-change ${showTrend ? trendClass(mv.pct) : 'flat'}`;
+    railChange.textContent = soft > 0
+      ? `${money((s.totalValue || 0))} incl. estimates`
+      : (showTrend ? `${trendText(mv.pct)} ${label}` : '—');
   }
 
   const chartHost = $('heroChart');

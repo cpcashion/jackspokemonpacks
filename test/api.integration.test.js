@@ -757,6 +757,56 @@ if (!DB) {
     });
 
     /**
+     * The database must never be a trap.
+     *
+     * Every free Postgres meters something — one caps egress, another pauses on
+     * idle, another expires the instance — and the right answer to any of them
+     * is to be able to leave in five minutes. That is only true if an export
+     * genuinely restores: same cards, same copies, same history, on a database
+     * that has never seen this collection before.
+     */
+    test('an export restores completely into a different database', async () => {
+        const id = await seedLegacyCard({
+            card_name: 'Portable Zard', card_number: '4/102', current_price: 250,
+        });
+        await pool.query(
+            'INSERT INTO card_copies (card_id, condition, grade, manual_value) VALUES ($1,$2,$3,$4)',
+            [id, 'Near Mint', 'PSA 9', 999]);
+        await pool.query(
+            "INSERT INTO price_history (card_id, price, source) VALUES ($1,$2,'test')", [id, 250]);
+
+        const dump = await (await fetch(`${BASE}/api/portfolio/export.json`)).json();
+        assert.equal(dump.format, 'jackspokemon/v1');
+        assert.ok(dump.counts.cards > 0 && dump.counts.copies > 0 && dump.counts.history > 0);
+
+        // Importing over a live collection must refuse rather than duplicate it.
+        const refused = await api('/api/portfolio/import', {
+            method: 'POST', body: JSON.stringify(dump),
+        });
+        assert.equal(refused.status, 409, 'a restore is not an append');
+        assert.match(refused.body.error, /replace=1/);
+
+        // Now the real test: wipe and restore, and check nothing was lost.
+        const before = await api('/api/portfolio');
+        const restored = await api('/api/portfolio/import?replace=1', {
+            method: 'POST', body: JSON.stringify(dump),
+        });
+        assert.equal(restored.status, 200);
+        assert.equal(restored.body.restored.cards, dump.counts.cards);
+
+        const after = await api('/api/portfolio');
+        assert.equal(after.body.cards.length, before.body.cards.length,
+            'every card came back');
+        assert.ok(Math.abs(after.body.stats.totalValue - before.body.stats.totalValue) < 0.05,
+            'and so did every value');
+
+        const zard = after.body.cards.find(c => c.card_name === 'Portable Zard');
+        assert.ok(zard, 'the card survived');
+        assert.equal(zard.total_value, 999, 'including a hand-set graded value on its copy');
+        assert.ok((zard.price_history || []).length > 0, 'and its price history');
+    });
+
+    /**
      * Neon meters what leaves the database — 5GB a month on the free plan — and
      * exceeding it suspends the project and takes the whole app down. These pin
      * the two behaviours that keep the meter sane: the collection payload is

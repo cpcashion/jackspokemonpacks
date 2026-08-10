@@ -731,74 +731,56 @@ async function checkForSplitRows() {
  * different one. Your own photograph is always a picture of your actual card,
  * so it wins whenever the identity is not settled.
  */
-function cardArt(card, cls) {
+/**
+ * The picture to show for a card.
+ *
+ * Database artwork is preferred, but ONLY when the printing was confirmed: it
+ * is a picture of a card, and on an unconfirmed match it may be a picture of a
+ * different one. Your own photograph is always a picture of your actual card,
+ * so it wins whenever the identity is not settled.
+ *
+ * Scan photos come from /thumb.jpg as ordinary image bytes rather than being
+ * fetched as base64 JSON. The browser then caches them itself, natively and
+ * for a year, and the grid moves about 8KB a card instead of 285KB — which is
+ * the difference between a collection that browses freely on a metered
+ * database and one that suspends it.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.full] ask for the full stored photo instead of the
+ *   grid thumbnail. Only the card sheet should: it is 25x the bytes.
+ */
+function cardArt(card, cls, { full = false } = {}) {
   const wrap = el('div', cls);
   const artworkTrustworthy = card.image_url && card.printing_confirmed !== false;
+  const img = el('img');
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.alt = card.card_name || 'Card';
+  img.addEventListener('error', () => { img.replaceWith(cardPlaceholder()); }, { once: true });
+
   if (artworkTrustworthy) {
-    const img = el('img');
-    img.loading = 'lazy';
-    img.decoding = 'async';
-    img.alt = card.card_name || 'Card';
     img.src = card.image_url;
-    img.addEventListener('error', () => { img.replaceWith(cardPlaceholder()); }, { once: true });
-    wrap.appendChild(img);
   } else if (card.has_local_image) {
-    const img = el('img');
-    img.loading = 'lazy';
-    img.alt = card.card_name || 'Card';
-    img.dataset.localFor = card.id;
-    wrap.appendChild(img);
+    img.src = `/api/portfolio/${card.id}/${full ? 'photo' : 'thumb'}.jpg`;
   } else {
     wrap.appendChild(cardPlaceholder());
+    return wrap;
   }
+  wrap.appendChild(img);
   return wrap;
 }
 
 /** Scan photos live in the database as base64; fetch them only once on screen. */
 /**
- * Scan photos live in the database as base64, so each one costs a request and
- * tens of kilobytes. Fetching them all on render was fine for a shelf and
- * ruinous for a collection: 657 cards meant 657 requests and something like
- * 30MB, fired at once, at a free-tier server, from a phone.
+ * Nothing to hydrate any more.
  *
- * They load as they come into view instead. Everything below the fold costs
- * nothing until it is actually looked at.
+ * Scan photos used to be fetched as base64 JSON and injected, with an
+ * IntersectionObserver to stop 657 of those firing at once. They are ordinary
+ * <img src> now, so the browser does the lazy loading, the caching and the
+ * revalidation itself — better than this code did, and with no JavaScript at
+ * all. Kept as a no-op because several render paths call it.
  */
-const localImageObserver = 'IntersectionObserver' in window
-  ? new IntersectionObserver((entries, observer) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        observer.unobserve(entry.target);
-        fetchLocalImage(entry.target);
-      }
-    }, {
-      // A screen's worth of lead time, so a photo is usually there by the time
-      // it is scrolled to rather than popping in afterwards.
-      rootMargin: '600px 0px',
-    })
-  : null;
-
-function fetchLocalImage(img) {
-  if (img.dataset.hydrated) return;
-  img.dataset.hydrated = '1';
-  fetch(`/api/portfolio/${img.dataset.localFor}/image`)
-    .then((r) => (r.ok ? r.json() : null))
-    .then((d) => { if (d?.image_data) img.src = d.image_data; else img.replaceWith(cardPlaceholder()); })
-    .catch(() => img.replaceWith(cardPlaceholder()));
-}
-
-function hydrateLocalImages(root) {
-  root.querySelectorAll('img[data-local-for]').forEach((img) => {
-    if (img.dataset.hydrated || img.dataset.observed) return;
-    if (localImageObserver) {
-      img.dataset.observed = '1';
-      localImageObserver.observe(img);
-    } else {
-      // No IntersectionObserver: fetch eagerly rather than show nothing.
-      fetchLocalImage(img);
-    }
-  });
-}
+function hydrateLocalImages() {}
 
 function sparkline(history) {
   const prices = (history || []).map((p) => Number(p.price)).filter((p) => p > 0).slice(-24);
@@ -1400,10 +1382,9 @@ async function loadProvenance(cardId, panel) {
       const shot = el('img', 'prov-photo');
       shot.alt = 'The photo taken when this card was scanned';
       shot.loading = 'lazy';
-      fetch(`/api/portfolio/${cardId}/image`)
-        .then(r => (r.ok ? r.json() : null))
-        .then(d => { if (d?.image_data) { shot.src = d.image_data; host.appendChild(shot); } })
-        .catch(() => {});
+      shot.src = `/api/portfolio/${cardId}/photo.jpg`;
+      shot.addEventListener('error', () => shot.remove(), { once: true });
+      host.appendChild(shot);
     }
   } catch (err) {
     host.textContent = `Could not check: ${err.message}`;
@@ -1418,7 +1399,7 @@ function renderSheetBody() {
 
   // Hero: value, what it is made of, and how much to trust it.
   const hero = el('div', 'sheet-hero');
-  hero.appendChild(cardArt(card, 'sheet-art'));
+  hero.appendChild(cardArt(card, 'sheet-art', { full: true }));
 
   const estimated = card.price_tier === 'estimated';
   const figures = el('div', 'sheet-figures');

@@ -199,6 +199,17 @@ async function initDB() {
         -- can be shown and a re-extraction cannot duplicate it.
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS source_photo_id INTEGER;
 
+        -- A small copy of the scan photo, for the collection grid.
+        --
+        -- The grid shows every card at about 150px wide, and was being served
+        -- the full stored photo to do it. At 900px that is ~285KB of base64 per
+        -- card, so browsing 657 cards moved 183MB — and a database's free plan
+        -- meters roughly 5GB a MONTH. A dozen page loads was the whole
+        -- allowance. The thumbnail is ~8KB, which is 25x less for a picture
+        -- nobody can tell apart at that size; the full photo is still there for
+        -- the card sheet and for re-reading a card with a vision model.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS thumb_data TEXT DEFAULT '';
+
         -- A non-English card is stored under the name printed on it. The English
         -- name of the same Pokémon is kept alongside so it stays searchable and
         -- so an English-language card database can be queried at all.
@@ -280,6 +291,7 @@ async function initDB() {
     await withdrawUnreachablePrices();
     await rebuildIdentityAndMerge();
     await dropUnconfirmedArtwork();
+    await backfillGridThumbnails();
 }
 
 async function hasRun(key) {
@@ -552,6 +564,42 @@ async function dropUnconfirmedArtwork() {
     }
 }
 
+/**
+ * Give every existing card its grid thumbnail.
+ *
+ * Reads the full photo once per card and writes back a small one. That read is
+ * the last time the collection will ever move its full photos in bulk: from
+ * here on the grid asks for the thumbnail and the originals stay put.
+ */
+async function backfillGridThumbnails() {
+    const KEY = 'backfill_grid_thumbs_v1';
+    if (await hasRun(KEY)) return;
+
+    // Ids first, then one row at a time — SELECTing every photo at once would
+    // pull the entire library into memory and across the wire in one go.
+    const { rows } = await pool.query(`
+        SELECT id FROM portfolio_cards
+        WHERE COALESCE(thumb_data, '') = '' AND image_data IS NOT NULL AND image_data <> ''
+        ORDER BY id ASC
+    `);
+    if (!rows.length) { await markRun(KEY, 0); return; }
+
+    let made = 0;
+    for (const { id } of rows) {
+        try {
+            const r = await pool.query('SELECT image_data FROM portfolio_cards WHERE id = $1', [id]);
+            const thumb = await makeGridThumb(r.rows[0]?.image_data);
+            if (!thumb) continue;
+            await pool.query('UPDATE portfolio_cards SET thumb_data = $2 WHERE id = $1', [id, thumb]);
+            made++;
+        } catch (err) {
+            console.error(`  [Migrate] thumbnail for card ${id}:`, err.message);
+        }
+    }
+    await markRun(KEY, made);
+    if (made) console.log(`  [Migrate] Built ${made} grid thumbnail(s) — the collection grid no longer moves full photos`);
+}
+
 async function rebuildIdentityAndMerge() {
     const KEY = 'variant_key_without_set_name_v1';
     if (await hasRun(KEY)) return;
@@ -651,15 +699,17 @@ initDB().then(() => ensureDefaultUser()).catch(err => console.error("DB Init Err
 
 // ── Portfolio DB helpers ──
 async function insertPortfolioCard(card, userId) {
+    // Made here, once, so the grid never pays to move the full photo.
+    const thumb = card.image_data ? await makeGridThumb(card.image_data) : '';
     const res = await pool.query(`
-        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source, types)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, thumb_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source, types)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         RETURNING id
     `, [
         userId, card.card_name, card.card_name_en || '', card.card_set || '', card.set_code || '',
         card.card_number || '', card.rarity || 'Unknown',
         canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
-        card.confidence || 0, card.image_data || '', card.image_url || '', card.notes || '',
+        card.confidence || 0, card.image_data || '', thumb, card.image_url || '', card.notes || '',
         card.year || 0, normalizeLanguage(card.language), card.holo_type || 'Unknown',
         buildVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || '', card.types || ''
     ]);
@@ -2133,6 +2183,32 @@ async function prepareImageForAi(buffer) {
     } catch (err) {
         console.error('  [AI prep] Could not resize, sending as-is:', err.message);
         return { buffer, mime: null, resized: false };
+    }
+}
+
+/**
+ * The small copy the collection grid is served.
+ *
+ * Generated once, on write, so browsing never pays to shrink anything and
+ * never pays to move the full photo. Returns '' if it cannot be made — the
+ * endpoint falls back to the full photo, which is correct but expensive, so
+ * failing here is visible in the egress rather than as a blank card.
+ */
+const GRID_THUMB_EDGE = 220;
+
+async function makeGridThumb(dataUrlOrBuffer) {
+    try {
+        const buffer = Buffer.isBuffer(dataUrlOrBuffer)
+            ? dataUrlOrBuffer
+            : dataUrlToBuffer(dataUrlOrBuffer);
+        if (!buffer) return '';
+        const out = await sharp(buffer)
+            .resize(GRID_THUMB_EDGE, Math.round(GRID_THUMB_EDGE * 1.4), { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 72, mozjpeg: true })
+            .toBuffer();
+        return `data:image/jpeg;base64,${out.toString('base64')}`;
+    } catch {
+        return '';
     }
 }
 
@@ -3862,6 +3938,35 @@ app.get('/api/portfolio/:id/provenance', requireAuth, async (req, res) => {
  *    does not even ask again — and when it revalidates, the 304 carries no
  *    image bytes from anywhere.
  */
+/**
+ * Photos as image bytes, not base64 in JSON.
+ *
+ * Both endpoints below serve real `image/jpeg` with an immutable ETag, which
+ * matters three ways at a metered database:
+ *
+ *  - base64 costs a third more bytes than the JPEG it encodes, and every one
+ *    of those bytes was being paid for on the way out of Postgres;
+ *  - an <img src> is cached by the browser as an image, for free, with no
+ *    JavaScript and no fetch;
+ *  - the grid asks for the thumbnail, so browsing a collection costs about 8KB
+ *    a card instead of 285KB.
+ */
+function serveStoredImage(res, req, dataUrl, cacheKey) {
+    const buffer = dataUrlToBuffer(dataUrl);
+    if (!buffer) return res.status(404).json({ error: 'No image' });
+
+    const etag = `"${createHash('sha1').update(buffer).digest('hex').slice(0, 20)}"`;
+    res.setHeader('ETag', etag);
+    // The bytes for a given card id never change in place — a re-crop writes a
+    // different id or clears the cache — so a year is safe and a revalidation
+    // costs nothing.
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.setHeader('Content-Type', 'image/jpeg');
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    res.setHeader('Content-Length', buffer.length);
+    return res.end(buffer);
+}
+
 const imageCache = new Map();
 const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 let imageCacheBytes = 0;
@@ -3881,13 +3986,52 @@ function cacheImage(id, imageData) {
 }
 
 /** Call wherever image_data is rewritten, or a stale photo outlives its card. */
+const thumbCache = new Map();
+
 function forgetCachedImage(id) {
+    thumbCache.delete(id);
     const hit = imageCache.get(id);
     if (hit) {
         imageCacheBytes -= hit.imageData.length;
         imageCache.delete(id);
     }
 }
+
+/**
+ * The grid thumbnail. Small, cached hard, and the only image a full browse of
+ * the collection ever asks for.
+ */
+app.get('/api/portfolio/:id/thumb.jpg', requireAuth, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        let hit = thumbCache.get(id);
+        if (!hit) {
+            const r = await pool.query(
+                'SELECT thumb_data, image_data FROM portfolio_cards WHERE id = $1', [id]);
+            if (!r.rows.length) return res.status(404).json({ error: 'No image' });
+            // Fall back to the full photo for a row the backfill has not
+            // reached yet, so nothing is ever blank while it catches up.
+            hit = r.rows[0].thumb_data || r.rows[0].image_data;
+            if (!hit) return res.status(404).json({ error: 'No image' });
+            thumbCache.set(id, hit);
+        }
+        return serveStoredImage(res, req, hit, id);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/** The full stored photo, for the card sheet and the photo audit. */
+app.get('/api/portfolio/:id/photo.jpg', requireAuth, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id, 10);
+        const r = await pool.query('SELECT image_data FROM portfolio_cards WHERE id = $1', [id]);
+        if (!r.rows.length || !r.rows[0].image_data) return res.status(404).json({ error: 'No image' });
+        return serveStoredImage(res, req, r.rows[0].image_data, id);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 app.get('/api/portfolio/:id/image', requireAuth, async (req, res) => {
     try {
@@ -4577,6 +4721,141 @@ app.get('/api/portfolio/accounting', requireAuth, async (req, res) => {
  * everything that still exists — which is exactly why re-uploading fresh,
  * full-resolution photos is the right move, and why they are stored larger now.
  */
+/**
+ * The whole collection as one JSON file, and back again.
+ *
+ * This exists so the database is never a trap. Every free Postgres meters
+ * something — Neon meters egress, Supabase pauses on idle, Render's free
+ * instance expires — and the right answer to any of them is to be able to
+ * leave in five minutes rather than to argue with a quota. The app itself is
+ * provider-agnostic: it speaks plain Postgres over DATABASE_URL and nothing
+ * else, so moving is an export, a paste, and an import.
+ *
+ * It doubles as the backup that never existed. A collection that lives in one
+ * free-tier database and nowhere else is one suspension away from gone.
+ *
+ * Photos are excluded by default because they are 95% of the bytes and already
+ * have their own download; `?photos=1` includes them for a true full backup.
+ */
+app.get('/api/portfolio/export.json', requireAuth, async (req, res) => {
+    try {
+        const withPhotos = req.query.photos === '1';
+        const photoCols = withPhotos ? 'image_data, thumb_data,' : '';
+        const cards = await pool.query(`
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity,
+                   condition, is_holo, is_first_edition, confidence, ${photoCols} image_url,
+                   notes, year, language, holo_type, variant_key, needs_review, verified_source,
+                   types, current_price, price_source, price_source_url, price_confidence,
+                   price_marketplace, price_variant, price_variant_matched, price_low, price_high,
+                   price_tier, price_explanation, is_source_photo, source_photo_id,
+                   source_cards_found, added_at, last_price_check
+            FROM portfolio_cards WHERE user_id = $1 ORDER BY id ASC
+        `, [req.user.id]);
+        const copies = await pool.query(`
+            SELECT cc.id, cc.card_id, cc.condition, cc.grade, cc.grader, cc.manual_value,
+                   cc.acquired_price, cc.acquired_at, cc.notes, cc.created_at
+                   ${withPhotos ? ', cc.image_data' : ''}
+            FROM card_copies cc JOIN portfolio_cards pc ON pc.id = cc.card_id
+            WHERE pc.user_id = $1 ORDER BY cc.id ASC
+        `, [req.user.id]);
+        const history = await pool.query(`
+            SELECT ph.card_id, ph.price, ph.source, ph.source_url, ph.recorded_at
+            FROM price_history ph JOIN portfolio_cards pc ON pc.id = ph.card_id
+            WHERE pc.user_id = $1 ORDER BY ph.id ASC
+        `, [req.user.id]);
+
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition',
+            `attachment; filename="jackspokemon-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+        res.end(JSON.stringify({
+            format: 'jackspokemon/v1',
+            exportedAt: new Date().toISOString(),
+            includesPhotos: withPhotos,
+            counts: { cards: cards.rowCount, copies: copies.rowCount, history: history.rowCount },
+            cards: cards.rows,
+            copies: copies.rows,
+            price_history: history.rows,
+        }));
+    } catch (err) {
+        console.error('Export error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * Restore an export into this database.
+ *
+ * Refuses to run over an existing collection unless explicitly told to replace
+ * it: importing into a live database is how a restore becomes a duplication
+ * event. Ids are remapped rather than forced, so copies and history follow
+ * their cards without colliding with whatever sequence the new database is on.
+ */
+app.post('/api/portfolio/import', requireAuth, express.json({ limit: '512mb' }), async (req, res) => {
+    const backup = req.body;
+    if (backup?.format !== 'jackspokemon/v1') {
+        return res.status(400).json({ error: 'Not a jackspokemon backup file.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        const existing = await client.query(
+            'SELECT COUNT(*)::int n FROM portfolio_cards WHERE user_id = $1', [req.user.id]);
+        if (existing.rows[0].n > 0 && req.query.replace !== '1') {
+            return res.status(409).json({
+                error: `This database already holds ${existing.rows[0].n} card(s). `
+                    + 'Add ?replace=1 to wipe them and restore the backup in their place.',
+            });
+        }
+
+        await client.query('BEGIN');
+        if (req.query.replace === '1') {
+            await client.query('DELETE FROM portfolio_cards WHERE user_id = $1', [req.user.id]);
+        }
+
+        // Old id -> new id, so copies and history land on the right cards.
+        const idMap = new Map();
+        for (const card of backup.cards || []) {
+            const cols = Object.keys(card).filter(k => k !== 'id');
+            const placeholders = cols.map((_, i) => `$${i + 2}`).join(', ');
+            const r = await client.query(
+                `INSERT INTO portfolio_cards (user_id, ${cols.join(', ')})
+                 VALUES ($1, ${placeholders}) RETURNING id`,
+                [req.user.id, ...cols.map(c => card[c])]);
+            idMap.set(card.id, r.rows[0].id);
+        }
+        for (const copy of backup.copies || []) {
+            const target = idMap.get(copy.card_id);
+            if (!target) continue;
+            const cols = Object.keys(copy).filter(k => k !== 'id' && k !== 'card_id');
+            const placeholders = cols.map((_, i) => `$${i + 2}`).join(', ');
+            await client.query(
+                `INSERT INTO card_copies (card_id, ${cols.join(', ')}) VALUES ($1, ${placeholders})`,
+                [target, ...cols.map(c => copy[c])]);
+        }
+        for (const point of backup.price_history || []) {
+            const target = idMap.get(point.card_id);
+            if (!target) continue;
+            await client.query(
+                'INSERT INTO price_history (card_id, price, source, source_url, recorded_at) VALUES ($1,$2,$3,$4,$5)',
+                [target, point.price, point.source, point.source_url || '', point.recorded_at]);
+        }
+        await client.query('COMMIT');
+        invalidatePortfolioCache();
+
+        res.json({
+            success: true,
+            restored: { cards: idMap.size, copies: (backup.copies || []).length, history: (backup.price_history || []).length },
+            message: `Restored ${idMap.size} card(s).`,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Import error:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 app.get('/api/portfolio/photos.zip', requireAuth, async (req, res) => {
     try {
         const cards = await pool.query(`

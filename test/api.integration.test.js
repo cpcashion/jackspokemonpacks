@@ -757,6 +757,60 @@ if (!DB) {
     });
 
     /**
+     * Neon meters what leaves the database — 5GB a month on the free plan — and
+     * exceeding it suspends the project and takes the whole app down. These pin
+     * the two behaviours that keep the meter sane: the collection payload is
+     * served from cache between writes, and any write invalidates it so nobody
+     * ever sees a stale collection.
+     */
+    test('the collection payload is cached between writes and fresh after one', async () => {
+        // Prime, then hit.
+        await api('/api/portfolio');
+        const second = await fetch(`${BASE}/api/portfolio`);
+        assert.equal(second.headers.get('x-cache'), 'HIT', 'an unchanged collection costs no queries');
+
+        // A write must invalidate — stale totals would be worse than slow ones.
+        const id = await seedLegacyCard({ card_name: 'Cache Buster', card_number: '99/102' });
+        const copy = await api(`/api/portfolio/${id}/copies`, {
+            method: 'POST', body: JSON.stringify({ condition: 'Near Mint' }),
+        });
+        assert.equal(copy.status, 200);
+
+        const after = await fetch(`${BASE}/api/portfolio`);
+        assert.equal(after.headers.get('x-cache'), 'MISS', 'a write always shows through');
+        const body = await after.json();
+        assert.ok(body.cards.some(c => c.id === id), 'and the new card is in the fresh payload');
+    });
+
+    /**
+     * The other meter-killer: pulling a photo out of Neon on every single view.
+     * A repeat view must be served from process memory, and a browser that
+     * already holds the photo must get a bodyless 304.
+     */
+    test('a scan photo leaves the database once, not once per look', async () => {
+        const id = await seedLegacyCard({ card_name: 'Photo Cache', card_number: '77/102' });
+        await pool.query('UPDATE portfolio_cards SET image_data = $2 WHERE id = $1',
+            [id, 'data:image/jpeg;base64,/9j/4AAQSkZJRg==']);
+
+        const first = await fetch(`${BASE}/api/portfolio/${id}/image`);
+        assert.equal(first.status, 200);
+        const etag = first.headers.get('etag');
+        assert.ok(etag, 'the photo carries an ETag');
+        assert.match(first.headers.get('cache-control') || '', /max-age/,
+            'and tells the browser it may keep it');
+
+        const revalidated = await fetch(`${BASE}/api/portfolio/${id}/image`, {
+            headers: { 'If-None-Match': etag },
+        });
+        assert.equal(revalidated.status, 304, 'a browser that has the photo gets no bytes at all');
+
+        // Deleting the card must not leave its photo answering from cache.
+        await api(`/api/portfolio/${id}`, { method: 'DELETE' });
+        const gone = await fetch(`${BASE}/api/portfolio/${id}/image`);
+        assert.equal(gone.status, 404, 'a deleted card has no photo, cached or otherwise');
+    });
+
+    /**
      * eBay allows 5,000 Browse calls a day and pricing one card can cost eight,
      * so a collection of a few hundred can spend the lot in a single refresh —
      * after which every card comes back unpriced for 24 hours, looking exactly

@@ -3289,11 +3289,15 @@ function connectEvents() {
     };
     source.onerror = () => {
       source.close();
-      // Serverless hosts cannot hold the connection open; poll instead.
-      setInterval(loadCollection, 60000);
+      // Serverless hosts cannot hold the connection open; poll instead — but
+      // gently. This used to re-download the whole collection every minute,
+      // which at 1.1MB a call was over 1.5GB a day from one open tab, and
+      // Neon's free plan meters 5GB a MONTH. Polling is a fallback, not a
+      // replacement for the live connection.
+      setInterval(loadCollection, 5 * 60 * 1000);
     };
   } catch {
-    setInterval(loadCollection, 60000);
+    setInterval(loadCollection, 5 * 60 * 1000);
   }
 }
 

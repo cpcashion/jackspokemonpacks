@@ -242,6 +242,35 @@ async function initDB() {
         );
     `);
 
+    // A revision counter the database maintains about itself.
+    //
+    // The collection payload is cached to keep Neon's metered egress sane, and
+    // a cache needs an invalidation rule that cannot be forgotten. App writes
+    // announce themselves, but writes from OUTSIDE the app — a SQL console
+    // edit, a migration, a test seeding rows directly — announce nothing, and
+    // a cache keyed on announcements would serve a stale collection after any
+    // of them. Statement-level triggers bump one counter on any change to the
+    // three tables the payload is built from; reading it costs a few bytes,
+    // which is the whole point.
+    await pool.query(`
+        CREATE OR REPLACE FUNCTION bump_collection_rev() RETURNS trigger AS $$
+        BEGIN
+            INSERT INTO app_meta (key, value) VALUES ('collection_rev', '1')
+            ON CONFLICT (key) DO UPDATE
+                SET value = (COALESCE(NULLIF(app_meta.value, ''), '0')::bigint + 1)::text,
+                    applied_at = NOW();
+            RETURN NULL;
+        END $$ LANGUAGE plpgsql;
+    `);
+    for (const table of ['portfolio_cards', 'card_copies', 'price_history']) {
+        await pool.query(`
+            DROP TRIGGER IF EXISTS trg_${table}_rev ON ${table};
+            CREATE TRIGGER trg_${table}_rev
+                AFTER INSERT OR UPDATE OR DELETE ON ${table}
+                FOR EACH STATEMENT EXECUTE FUNCTION bump_collection_rev();
+        `);
+    }
+
     await backfillVariantKeys();
     await backfillCardCopies();
     await queueLegacyPricesForRecheck();
@@ -3041,7 +3070,26 @@ async function storePriceIfBetter(cardId, priced, existingTier) {
 
 const sseClients = new Set();
 
+/**
+ * The collection payload, cached between writes.
+ *
+ * Building /api/portfolio costs a fan of Neon queries and about 1.1MB of
+ * egress at the collection's real size — and Neon meters egress at 5GB a
+ * month on the free plan. The payload only actually changes when something is
+ * written, and every write path already announces itself over SSE, so the
+ * broadcast below doubles as the cache invalidation: one choke point, no
+ * write path to forget.
+ */
+const portfolioCache = new Map();
+const PORTFOLIO_CACHE_MS = 5 * 60 * 1000;
+const PORTFOLIO_MUTATIONS = new Set(['portfolio_updated', 'card_added']);
+
+function invalidatePortfolioCache() {
+    portfolioCache.clear();
+}
+
 function broadcast(event) {
+    if (PORTFOLIO_MUTATIONS.has(event?.type)) invalidatePortfolioCache();
     const data = JSON.stringify(event);
     for (const client of sseClients) {
         try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
@@ -3690,9 +3738,24 @@ app.get('/api/auth/me', (req, res) => {
 // Get all portfolio cards with latest + previous prices
 app.get('/api/portfolio', requireAuth, async (req, res) => {
     try {
+        // One tiny query decides whether the expensive fan of queries runs.
+        // The stamp moves on ANY write to the underlying tables — the app's
+        // own, a migration's, or a SQL console's — so the cache can be
+        // aggressive without ever being able to lie.
+        const rev = await pool.query("SELECT value FROM app_meta WHERE key = 'collection_rev'");
+        const stamp = rev.rows[0]?.value || '0';
+
+        const cached = portfolioCache.get(req.user.id);
+        if (cached && cached.stamp === stamp && Date.now() - cached.at < PORTFOLIO_CACHE_MS) {
+            res.setHeader('X-Cache', 'HIT');
+            return res.json(cached.payload);
+        }
         const cards = await getAllPortfolioCards(req.user.id);
         const stats = computePortfolioStats(cards);
-        res.json({ cards, stats, pricing: { fx: fxStatus(), conditions: CONDITIONS } });
+        const payload = { cards, stats, pricing: { fx: fxStatus(), conditions: CONDITIONS } };
+        portfolioCache.set(req.user.id, { at: Date.now(), stamp, payload });
+        res.setHeader('X-Cache', 'MISS');
+        res.json(payload);
     } catch (err) {
         console.error('Portfolio fetch error:', err);
         res.status(500).json({ error: err.message });
@@ -3781,16 +3844,74 @@ app.get('/api/portfolio/:id/provenance', requireAuth, async (req, res) => {
     }
 });
 
+/**
+ * Scan photos, without paying Neon for every look at them.
+ *
+ * The photos live inside Postgres, and Neon's free plan meters what leaves the
+ * database — 5GB a month. This endpoint used to SELECT the image out of Neon on
+ * every single view, so browsing the collection billed the full weight of every
+ * photo against that meter again and again until the project was suspended and
+ * the whole app went down with "Your project has exceeded the data transfer
+ * quota".
+ *
+ * Two layers now stand between a view and the meter:
+ *
+ *  - an in-process cache, so each photo leaves Neon roughly once per boot
+ *    rather than once per look;
+ *  - an ETag with a week of browser caching, so a phone that has seen a photo
+ *    does not even ask again — and when it revalidates, the 304 carries no
+ *    image bytes from anywhere.
+ */
+const imageCache = new Map();
+const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+let imageCacheBytes = 0;
+
+function cacheImage(id, imageData) {
+    const size = imageData.length;
+    if (size > IMAGE_CACHE_MAX_BYTES / 4) return;   // one huge photo must not evict everything
+    while (imageCacheBytes + size > IMAGE_CACHE_MAX_BYTES && imageCache.size) {
+        const oldest = imageCache.keys().next().value;
+        imageCacheBytes -= imageCache.get(oldest).imageData.length;
+        imageCache.delete(oldest);
+    }
+    const etag = `"${createHash('sha1').update(imageData).digest('hex').slice(0, 20)}"`;
+    imageCache.set(id, { imageData, etag });
+    imageCacheBytes += size;
+    return imageCache.get(id);
+}
+
+/** Call wherever image_data is rewritten, or a stale photo outlives its card. */
+function forgetCachedImage(id) {
+    const hit = imageCache.get(id);
+    if (hit) {
+        imageCacheBytes -= hit.imageData.length;
+        imageCache.delete(id);
+    }
+}
+
 app.get('/api/portfolio/:id/image', requireAuth, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT image_data FROM portfolio_cards WHERE id = $1',
-            [parseInt(req.params.id)]
-        );
-        if (!result.rows.length || !result.rows[0].image_data) {
-            return res.status(404).json({ error: 'No image' });
+        const id = parseInt(req.params.id, 10);
+        let hit = imageCache.get(id);
+        if (!hit) {
+            const result = await pool.query(
+                'SELECT image_data FROM portfolio_cards WHERE id = $1', [id]);
+            if (!result.rows.length || !result.rows[0].image_data) {
+                return res.status(404).json({ error: 'No image' });
+            }
+            hit = cacheImage(id, result.rows[0].image_data)
+                || { imageData: result.rows[0].image_data, etag: '' };
+        } else {
+            // Refresh recency for the byte-bounded eviction above.
+            imageCache.delete(id); imageCache.set(id, hit);
         }
-        res.json({ image_data: result.rows[0].image_data });
+
+        if (hit.etag) {
+            res.setHeader('ETag', hit.etag);
+            res.setHeader('Cache-Control', 'private, max-age=604800');
+            if (req.headers['if-none-match'] === hit.etag) return res.status(304).end();
+        }
+        res.json({ image_data: hit.imageData });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -3800,6 +3921,7 @@ app.get('/api/portfolio/:id/image', requireAuth, async (req, res) => {
 app.delete('/api/portfolio/:id', requireAuth, async (req, res) => {
     try {
         await deletePortfolioCard(parseInt(req.params.id), req.user.id);
+        forgetCachedImage(parseInt(req.params.id, 10));
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });

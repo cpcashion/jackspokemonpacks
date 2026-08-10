@@ -1049,6 +1049,11 @@ a { color: inherit; text-decoration: none; }
   animation: toast-in 240ms var(--ease-out);
 }
 .toast span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* An error's tail is usually its diagnosis. "Your project has exceeded th…"
+   hid the words "the data transfer quota" — the exact name of the problem —
+   behind an ellipsis, and the outage got blamed on the wrong service. Errors
+   wrap; only routine toasts truncate. */
+.toast[data-kind="error"] span:last-child { white-space: normal; overflow: visible; text-overflow: unset; line-height: 1.4; }
 .toast.out { animation: toast-out 180ms var(--ease) forwards; }
 @keyframes toast-in { from { transform: translateY(12px); opacity: 0; } }
 @keyframes toast-out { to { transform: translateY(6px); opacity: 0; } }

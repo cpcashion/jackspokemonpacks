@@ -2210,6 +2210,56 @@ async function loadAccounting() {
   }
 }
 
+/**
+ * Restore a backup into whatever database the app is pointed at.
+ *
+ * The whole of migrating between hosts: swap DATABASE_URL, drop the file. Done
+ * in the browser rather than as a curl incantation because the person who
+ * needs it is standing in front of a broken app, not a terminal.
+ */
+$('restoreFile')?.addEventListener('change', async (e) => {
+  const file = e.currentTarget.files?.[0];
+  e.currentTarget.value = '';           // let the same file be picked again after a refusal
+  if (!file) return;
+
+  let backup;
+  try {
+    backup = JSON.parse(await file.text());
+  } catch {
+    return toast('That file is not readable JSON.', 'error', 6000);
+  }
+  if (backup?.format !== 'jackspokemon/v1') {
+    return toast('That is not a jackspokemon backup file.', 'error', 6000);
+  }
+
+  const summary = `${backup.counts?.cards ?? 0} cards, ${backup.counts?.copies ?? 0} copies, `
+    + `${backup.counts?.history ?? 0} price points`;
+  toast(`Restoring ${summary}…`, 'info', 5000);
+
+  const send = (replace) => api(`/api/portfolio/import${replace ? '?replace=1' : ''}`, {
+    method: 'POST', body: JSON.stringify(backup),
+  });
+
+  try {
+    let result;
+    try {
+      result = await send(false);
+    } catch (err) {
+      // The server refuses to restore over a live collection, because a
+      // restore that appends is a duplication event. Ask, then obey.
+      if (!/already holds/i.test(err.message)) throw err;
+      if (!confirm(`${err.message}\n\nReplace everything in this database with the backup?`)) {
+        return toast('Restore cancelled — nothing was changed.', 'info');
+      }
+      result = await send(true);
+    }
+    toast(result.message || `Restored ${summary}.`, 'success', 8000);
+    loadCollection();
+  } catch (err) {
+    toast(`Restore failed: ${err.message}`, 'error', 9000);
+  }
+});
+
 async function loadHealth() {
   const host = $('healthBody');
   if (!host) return;

@@ -585,12 +585,27 @@ async function backfillGridThumbnails() {
     if (!rows.length) { await markRun(KEY, 0); return; }
 
     let made = 0;
+    let shrunk = 0;
+    let reclaimed = 0;
     for (const { id } of rows) {
         try {
             const r = await pool.query('SELECT image_data FROM portfolio_cards WHERE id = $1', [id]);
-            const thumb = await makeGridThumb(r.rows[0]?.image_data);
+            const original = r.rows[0]?.image_data;
+            const thumb = await makeGridThumb(original);
             if (!thumb) continue;
-            await pool.query('UPDATE portfolio_cards SET thumb_data = $2 WHERE id = $1', [id, thumb]);
+
+            // The same pass re-encodes anything stored above 700px. Across a
+            // collection those extra pixels are the difference between fitting
+            // inside a free database and being evicted from one.
+            const smaller = await shrinkStoredPhoto(original);
+            if (smaller && smaller.length < original.length * 0.9) {
+                await pool.query('UPDATE portfolio_cards SET image_data = $2, thumb_data = $3 WHERE id = $1',
+                    [id, smaller, thumb]);
+                reclaimed += original.length - smaller.length;
+                shrunk++;
+            } else {
+                await pool.query('UPDATE portfolio_cards SET thumb_data = $2 WHERE id = $1', [id, thumb]);
+            }
             made++;
         } catch (err) {
             console.error(`  [Migrate] thumbnail for card ${id}:`, err.message);
@@ -598,6 +613,7 @@ async function backfillGridThumbnails() {
     }
     await markRun(KEY, made);
     if (made) console.log(`  [Migrate] Built ${made} grid thumbnail(s) — the collection grid no longer moves full photos`);
+    if (shrunk) console.log(`  [Migrate] Re-encoded ${shrunk} oversized photo(s), freeing ${(reclaimed / 1048576).toFixed(0)}MB`);
 }
 
 async function rebuildIdentityAndMerge() {
@@ -2212,6 +2228,30 @@ async function makeGridThumb(dataUrlOrBuffer) {
     }
 }
 
+/**
+ * Re-encode a stored photo down to the size the app keeps now.
+ *
+ * Returns '' when it is already at or below that size, so the caller leaves it
+ * alone — re-compressing an already-small JPEG loses quality and gains nothing.
+ */
+const STORED_PHOTO_EDGE = 700;
+
+async function shrinkStoredPhoto(dataUrl) {
+    try {
+        const buffer = dataUrlToBuffer(dataUrl);
+        if (!buffer) return '';
+        const meta = await sharp(buffer).metadata();
+        if (Math.max(meta.width || 0, meta.height || 0) <= STORED_PHOTO_EDGE) return '';
+        const out = await sharp(buffer)
+            .resize(STORED_PHOTO_EDGE, Math.round(STORED_PHOTO_EDGE * 1.4), { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 80, mozjpeg: true })
+            .toBuffer();
+        return `data:image/jpeg;base64,${out.toString('base64')}`;
+    } catch {
+        return '';
+    }
+}
+
 /** Decode a stored `data:` thumbnail back to bytes. */
 function dataUrlToBuffer(dataUrl) {
     const m = /^data:([^;]+);base64,(.+)$/s.exec(String(dataUrl || ''));
@@ -2231,7 +2271,7 @@ function dataUrlToBuffer(dataUrl) {
  * whole grid is a cosmetic problem, and failing the scan over it would be a
  * real one. The caller falls back to the full-frame thumbnail.
  */
-async function cropCardThumbnail(buffer, box, { width = 900, height = 1260 } = {}) {
+async function cropCardThumbnail(buffer, box, { width = 700, height = 980 } = {}) {
     try {
         const meta = await sharp(buffer).metadata();
         const region = boxToRegion(box, meta.width, meta.height);
@@ -3615,7 +3655,14 @@ function sendServiceWorker(res) {
 }
 
 const app = express();
-app.use(express.json());
+// A restore carries the whole collection — photos included, which is tens of
+// megabytes — so the global parser must not reject it before the route with
+// its own larger limit is ever reached. Everything else stays modest: a big
+// default limit on every endpoint is an easy way to be knocked over.
+app.use((req, res, next) => {
+    if (req.path === '/api/portfolio/import') return next();
+    return express.json()(req, res, next);
+});
 app.use(cookieParser());
 
 /** Cheap, unauthenticated: lets you confirm a deploy landed without logging in. */
@@ -4813,16 +4860,33 @@ app.post('/api/portfolio/import', requireAuth, express.json({ limit: '512mb' }),
         }
 
         // Old id -> new id, so copies and history land on the right cards.
+        //
+        // Photos are normalised on the way in, not left for a boot migration to
+        // find. The migrations run once at startup and mark themselves done, so
+        // a restore that happened afterwards would land oversized photos with
+        // no grid thumbnails and quietly reintroduce the egress problem the
+        // move was meant to escape — on the brand new host, on day one.
         const idMap = new Map();
+        let shrunk = 0;
         for (const card of backup.cards || []) {
-            const cols = Object.keys(card).filter(k => k !== 'id');
+            const row = { ...card };
+            if (row.image_data) {
+                const smaller = await shrinkStoredPhoto(row.image_data);
+                if (smaller && smaller.length < row.image_data.length * 0.9) {
+                    row.image_data = smaller;
+                    shrunk++;
+                }
+                if (!row.thumb_data) row.thumb_data = await makeGridThumb(row.image_data);
+            }
+            const cols = Object.keys(row).filter(k => k !== 'id');
             const placeholders = cols.map((_, i) => `$${i + 2}`).join(', ');
             const r = await client.query(
                 `INSERT INTO portfolio_cards (user_id, ${cols.join(', ')})
                  VALUES ($1, ${placeholders}) RETURNING id`,
-                [req.user.id, ...cols.map(c => card[c])]);
+                [req.user.id, ...cols.map(c => row[c])]);
             idMap.set(card.id, r.rows[0].id);
         }
+        if (shrunk) console.log(`  [Import] Re-encoded ${shrunk} oversized photo(s) on the way in`);
         for (const copy of backup.copies || []) {
             const target = idMap.get(copy.card_id);
             if (!target) continue;
@@ -5410,8 +5474,14 @@ async function processPortfolioUpload(files, userId, options = {}) {
             // of the early uploads. Storage cost is real but bounded: ~150KB a
             // card at this size, tens of MB across the whole collection.
             const thumbnail = sharp(prepared.buffer)
-                .resize(900, 1260, { fit: 'inside', withoutEnlargement: true })
-                .jpeg({ quality: 82 })
+                // 700px, where two requirements meet. A Pokemon card is 63mm
+                // wide and its set number about 1.5mm tall, so 700px leaves
+                // that number ~17px — comfortably re-readable by a vision
+                // model on a second pass. It is also half the bytes of 900px,
+                // which puts the whole collection's photos near 105MB: small
+                // enough to live inside any free Postgres indefinitely.
+                .resize(700, 980, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 80, mozjpeg: true })
                 .toBuffer()
                 .then((thumbBuffer) => {
                     thumbDataUrl = `data:image/jpeg;base64,${thumbBuffer.toString('base64')}`;

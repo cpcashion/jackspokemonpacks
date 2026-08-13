@@ -807,6 +807,78 @@ if (!DB) {
     });
 
     /**
+     * Two ways a restore silently defeats the move it was meant to enable, both
+     * found by actually moving a collection between two databases rather than
+     * reasoning about it.
+     *
+     * The photo work runs in a boot migration that marks itself done. A restore
+     * happens long after boot, so without this the brand new host receives
+     * oversized photos with no grid thumbnails — and reintroduces, on day one,
+     * the exact egress problem the move was escaping.
+     */
+    test('a restore normalises photos on the way in, not at some later boot', async () => {
+        // A photo stored the old way: larger than the app keeps now.
+        const sharp = (await import('sharp')).default;
+        const raw = Buffer.alloc(1000 * 1400 * 3, 0x7a);
+        const big = await sharp(raw, { raw: { width: 1000, height: 1400, channels: 3 } })
+            .jpeg({ quality: 90 }).toBuffer();
+        const oversized = `data:image/jpeg;base64,${big.toString('base64')}`;
+
+        const backup = {
+            format: 'jackspokemon/v1',
+            counts: { cards: 1, copies: 0, history: 0 },
+            cards: [{
+                id: 1, card_name: 'Oversized Zard', card_set: 'Base Set', card_number: '4/102',
+                condition: 'Near Mint', language: 'english', is_holo: 1,
+                image_data: oversized, thumb_data: '', current_price: 100,
+            }],
+            copies: [], price_history: [],
+        };
+
+        const restored = await api('/api/portfolio/import?replace=1', {
+            method: 'POST', body: JSON.stringify(backup),
+        });
+        assert.equal(restored.status, 200);
+
+        const row = await pool.query(
+            "SELECT image_data, thumb_data FROM portfolio_cards WHERE card_name = 'Oversized Zard'");
+        const stored = row.rows[0];
+        assert.ok(stored.thumb_data, 'the grid thumbnail exists immediately, not after the next deploy');
+        assert.ok(stored.thumb_data.length < stored.image_data.length / 3,
+            'and it is genuinely small');
+        assert.ok(stored.image_data.length < oversized.length * 0.9,
+            'the oversized original was re-encoded down on the way in');
+    });
+
+    /**
+     * A backup carries the whole collection including photos, which is tens of
+     * megabytes. The route sets its own generous body limit, but a global JSON
+     * parser registered earlier would reject the request before that route is
+     * ever reached — so the restore failed with a 413 on any real collection.
+     */
+    test('a restore large enough to matter is not rejected by the body parser', async () => {
+        // Comfortably past Express's 100KB default.
+        const filler = 'x'.repeat(400 * 1024);
+        const backup = {
+            format: 'jackspokemon/v1',
+            counts: { cards: 1, copies: 0, history: 0 },
+            cards: [{
+                id: 1, card_name: 'Big Payload', card_set: 'Base Set', card_number: '9/102',
+                condition: 'Near Mint', language: 'english', is_holo: 1, notes: filler,
+            }],
+            copies: [], price_history: [],
+        };
+        const body = JSON.stringify(backup);
+        assert.ok(body.length > 400 * 1024, 'the fixture really is oversized');
+
+        const res = await fetch(`${BASE}/api/portfolio/import?replace=1`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+        });
+        assert.notEqual(res.status, 413, 'a real backup must not be refused as too large');
+        assert.equal(res.status, 200);
+    });
+
+    /**
      * Neon meters what leaves the database — 5GB a month on the free plan — and
      * exceeding it suspends the project and takes the whole app down. These pin
      * the two behaviours that keep the meter sane: the collection payload is

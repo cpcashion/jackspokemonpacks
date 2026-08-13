@@ -238,6 +238,14 @@
         </div>
         <div class="setting">
           <div class="setting-body">
+            <div class="setting-title">Restore from a backup</div>
+            <div class="setting-desc">Point the app at a fresh empty database, then drop the backup file here. This is the whole of moving between hosts: change one setting, restore one file. It refuses to run over a collection that already has cards unless you confirm replacing them.</div>
+          </div>
+          <label class="btn btn-glass btn-sm" for="restoreFile">Restore…</label>
+          <input type="file" id="restoreFile" accept="application/json,.json" hidden />
+        </div>
+        <div class="setting">
+          <div class="setting-body">
             <div class="setting-title">Download every photo you uploaded</div>
             <div class="setting-desc">One ZIP of every scan photo the app holds — cards, copies and the original multi-card pages. These are the images as stored: early scans kept only a small thumbnail, so re-uploading fresh photos (which are now stored at higher resolution) is the best way to sharpen the collection.</div>
           </div>

@@ -1197,4 +1197,115 @@ if (!DB) {
         assert.equal(stats.estimatedCards, estimated.length);
         assert.ok(Number(stats.estimatedValue) <= Number(stats.totalValue) + 0.01);
     });
+
+    /**
+     * Which photos get read.
+     *
+     * The bug these pin: the queue used to be "rows the shape test condemned",
+     * and the shape test only ever condemns landscape photos. A binder page
+     * held upright — the ordinary way anybody photographs one — is portrait,
+     * so it was never condemned, never queued, and sat in the collection
+     * displayed as whichever card the old scanner named first. The page was
+     * visible on the site and no pass would ever look at it again.
+     *
+     * `?preview=1` reports the queue without calling vision, which is what
+     * makes this testable with no model configured.
+     */
+    const seedPhotoRow = async (over = {}) => {
+        const id = await seedLegacyCard({ card_name: over.card_name || 'Page Row', card_number: '1/999' });
+        await pool.query(
+            `UPDATE portfolio_cards SET image_data = $2, is_source_photo = $3,
+                    source_photo_id = $4, source_extracted_at = $5, source_cards_found = $6 WHERE id = $1`,
+            [id, over.image_data ?? 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
+             over.is_source_photo ?? 0, over.source_photo_id ?? null,
+             over.source_extracted_at ?? null, over.source_cards_found ?? null]);
+        return id;
+    };
+
+    /** The queue as the endpoint itself reports it. */
+    const queue = async () => {
+        const { body } = await api('/api/portfolio/extract-source-photos?preview=1', { method: 'POST' });
+        return body;
+    };
+
+    /** How much seeding one row moves the real queue. */
+    const queueDeltaFor = async (over) => {
+        const before = await queue();
+        const id = await seedPhotoRow(over);
+        const after = await queue();
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [id]);
+        return { id, queued: after.queued - before.queued, unchecked: after.unchecked - before.unchecked };
+    };
+
+    test('a page photographed upright is offered for reading, not left on the shelf', async () => {
+        const delta = await queueDeltaFor({ card_name: 'Upright Binder Page' });
+        assert.equal(delta.queued, 1,
+            'a portrait photo no shape test can condemn still has to be read by vision');
+        assert.equal(delta.unchecked, 1, 'and it is counted as unchecked, not as a known page');
+    });
+
+    test('the panel offers the work even when nothing was condemned by its shape', async () => {
+        const id = await seedPhotoRow({ card_name: 'Quiet Page' });
+        const { body } = await api('/api/portfolio/source-photos');
+        assert.ok((body.unchecked || 0) >= 1,
+            'the panel must report the work, or the button to start it never appears');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [id]);
+    });
+
+    test('a card already read out of a page is never read again', async () => {
+        const page = await seedPhotoRow({ card_name: 'Read Page', is_source_photo: 1, source_extracted_at: new Date() });
+        const delta = await queueDeltaFor({ card_name: 'Card From Page', source_photo_id: page });
+        assert.equal(delta.queued, 0, 'a crop of one card is not a page and must not be re-read');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [page]);
+    });
+
+    /**
+     * Resumability. A run stopped by a quota has to continue where it left off,
+     * so a judged row is stamped and never re-read — that stamp is the only
+     * thing standing between one vision call per photo and one per photo per
+     * run, which on a collection this size is the difference between a job that
+     * finishes and a bill that does not stop.
+     */
+    test('a photo that has already been judged is not read a second time', async () => {
+        const delta = await queueDeltaFor({ card_name: 'Judged Page', source_extracted_at: new Date() });
+        assert.equal(delta.queued, 0, 'a judged photo stays out of the queue');
+    });
+
+    test('a row with no photo is never queued, because there is nothing to read', async () => {
+        const delta = await queueDeltaFor({ card_name: 'No Photo', image_data: '' });
+        assert.equal(delta.queued, 0);
+    });
+
+    /**
+     * A known page and an unchecked row are both work, but they are not the
+     * same claim, and the panel says so separately. Collapsing them would tell
+     * somebody with 600 ordinary cards that they have 600 unread pages.
+     */
+    /**
+     * The whole point of the exercise, stated as the user states it: no sheets
+     * on the site. A row found to hold several cards is marked a source photo
+     * at that moment, and that mark is what takes it out of the grid. The
+     * extraction used to stamp the count and the timestamp but not the mark,
+     * so a page stayed on display beside the twelve cards just read out of it.
+     */
+    test('a photo found to hold several cards leaves the collection grid', async () => {
+        const page = await seedPhotoRow({ card_name: 'Extracted Page', is_source_photo: 1, source_cards_found: 12 });
+        const { body } = await api('/api/portfolio');
+        assert.ok(!body.cards.some(c => c.id === page),
+            'a page of cards is not a card and must not be listed as one');
+
+        const stats = body.stats || {};
+        assert.ok(!Number.isNaN(Number(stats.totalValue)),
+            'and it is not counted in the value either');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [page]);
+    });
+
+    test('known pages and unchecked photos are counted apart', async () => {
+        const page = await seedPhotoRow({ card_name: 'Certain Page', is_source_photo: 1 });
+        const q = await queue();
+        assert.ok(q.certainSpreads >= 1, 'a shape-condemned row is reported as a known page');
+        assert.equal(q.queued, q.certainSpreads + q.unchecked,
+            'the two counts partition the queue exactly');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [page]);
+    });
 }

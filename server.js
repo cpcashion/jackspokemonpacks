@@ -4966,7 +4966,7 @@ app.get('/api/portfolio/photos.zip', requireAuth, async (req, res) => {
 app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
     try {
         const { rows } = await pool.query(`
-            SELECT pc.id, pc.image_data, pc.source_cards_found, pc.source_extracted_at, pc.added_at,
+            SELECT pc.id, pc.source_cards_found, pc.source_extracted_at, pc.added_at,
                    (SELECT COUNT(*)::int FROM portfolio_cards c WHERE c.source_photo_id = pc.id) AS extracted
             FROM portfolio_cards pc
             -- A row with no stored image has nothing to show and nothing to
@@ -4976,16 +4976,28 @@ app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
             ORDER BY pc.id ASC
         `, [req.user.id]);
 
+        // Rows that are not known pages but have never been looked at either.
+        // A page photographed upright is indistinguishable from a card until
+        // vision reads it, so this is where the ones the shape test cannot
+        // condemn are counted — without them the panel reports "nothing to do"
+        // to somebody staring at a grid full of pages.
+        const { rows: [unread] } = await pool.query(`
+            SELECT COUNT(*)::int AS n FROM portfolio_cards
+            WHERE user_id = $1 AND COALESCE(is_source_photo, 0) = 0
+              AND source_extracted_at IS NULL AND source_photo_id IS NULL
+              AND image_data IS NOT NULL AND image_data <> ''
+        `, [req.user.id]);
+
         res.json({
             success: true,
             photos: rows.map(r => ({
                 id: r.id,
-                image_data: r.image_data,
                 cards_found: r.source_cards_found,
                 extracted: r.extracted,
                 done: Boolean(r.source_extracted_at),
             })),
             pending: rows.filter(r => !r.source_extracted_at).length,
+            unchecked: unread?.n || 0,
             recognitionReady: Boolean(geminiModel),
         });
     } catch (err) {
@@ -5000,36 +5012,84 @@ app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
  * This is the job the original uploads were for: a picture of a shelf goes in,
  * and every card in it comes out identified, cropped to itself and priced.
  *
- * Three properties it has to hold to be safe to run on a live collection:
+ * Which rows are offered to it is the part that was wrong for a long time, and
+ * is worth stating plainly. The shape test rules a row out as a single card
+ * when it is landscape, and says nothing at all when it is portrait — because a
+ * binder page held upright, three across and four down, is portrait too. So
+ * "the queue is the landscape rows" quietly excluded the most ordinary way
+ * anybody photographs a page of cards. Those pages stayed in the collection,
+ * each displayed as whichever single card the old scanner happened to name
+ * first, and no pass ever looked at them again.
+ *
+ * The queue is therefore every row holding a photograph that vision has not yet
+ * judged, shape-condemned ones first. Shape is a priority hint, not a gate;
+ * only vision can tell a page of twelve from a card, so only vision decides.
+ *
+ * Four properties it has to hold to be safe to run on a live collection:
  *
  *  - It only ever adds. A photo it cannot read leaves the collection exactly as
  *    it found it; losing a card Jack owns is far worse than failing to find one.
  *  - Cards are matched by the same variant key the scanner uses, so re-running
  *    it cannot double anything. One photograph is evidence of one shelf, not of
  *    a second copy of everything on it.
- *  - A row that turns out to hold exactly one card was never a spread at all —
- *    the shape test guessed wrong — so it goes back into the collection as the
- *    card it always was.
+ *  - A row that turns out to hold exactly one card is a card, and stays one.
+ *    Widening the queue means most rows reaching here are ordinary cards, so
+ *    this is the common path now, not the exception it used to be.
+ *  - A row that turns out to hold several becomes a source photo at that
+ *    moment, which is what takes the page out of the grid. Marking it only
+ *    where the shape test had already guessed left extracted pages on display
+ *    beside the cards read out of them.
+ *
+ * It is resumable by construction: a judged row is stamped and skipped, and a
+ * row that failed is not, so a run cut short by a quota continues where it
+ * stopped. `?limit=` bounds one run, and `?preview=1` reports the queue without
+ * spending a single vision call on it.
  */
 app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) => {
+    // Rows vision has not judged, certain spreads first. A card extracted from
+    // a page is itself a crop of one card and is never re-read.
+    const QUEUE_SQL = `
+        SELECT id, image_data, COALESCE(is_source_photo, 0) AS was_flagged FROM portfolio_cards
+        WHERE user_id = $1 AND source_extracted_at IS NULL AND source_photo_id IS NULL
+          AND image_data IS NOT NULL AND image_data <> ''
+        ORDER BY COALESCE(is_source_photo, 0) DESC, id ASC
+    `;
+
+    // Reporting the size of the job is not the job, so it needs neither the
+    // running lock nor a configured model.
+    if (req.query.preview) {
+        try {
+            const { rows } = await pool.query(QUEUE_SQL, [req.user.id]);
+            return res.json({
+                success: true,
+                queued: rows.length,
+                certainSpreads: rows.filter(r => r.was_flagged).length,
+                unchecked: rows.filter(r => !r.was_flagged).length,
+                recognitionReady: Boolean(geminiModel),
+            });
+        } catch (err) {
+            console.error('Extraction preview error:', err);
+            return res.status(500).json({ error: err.message });
+        }
+    }
+
     if (gridRescanRunning) return res.status(409).json({ error: 'An extraction is already running.' });
     if (!geminiModel) return res.status(503).json({ error: 'Card recognition is not configured on this server.' });
 
     gridRescanRunning = true;
     try {
-        const { rows } = await pool.query(`
-            SELECT id, image_data FROM portfolio_cards
-            WHERE user_id = $1 AND COALESCE(is_source_photo, 0) = 1 AND source_extracted_at IS NULL
-              AND image_data IS NOT NULL AND image_data <> ''
-            ORDER BY id ASC
-        `, [req.user.id]);
+        const limit = Math.max(0, Math.floor(Number(req.query.limit) || 0));
+        const all = await pool.query(QUEUE_SQL, [req.user.id]);
+        const rows = limit ? all.rows.slice(0, limit) : all.rows;
+        const remaining = all.rows.length - rows.length;
 
         res.json({
             success: true,
             started: rows.length,
+            remaining,
             message: rows.length
                 ? `Reading ${rows.length} photo${rows.length === 1 ? '' : 's'} — every card in them will be added and priced…`
-                : 'No source photos are waiting to be read.',
+                : 'Every photo has already been read.',
         });
 
         (async () => {
@@ -5037,6 +5097,8 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
             let alreadyHeld = 0;
             let cardsSeen = 0;
             let restored = 0;
+            let confirmedSingle = 0;
+            let pagesFound = 0;
             let unreadable = 0;
 
             for (let i = 0; i < rows.length; i++) {
@@ -5057,14 +5119,16 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                     let cards = (vision.analysis?.cards || []).filter(c => hasMeaningfulCardName(c.card_name));
                     if (!cards.length) { unreadable++; continue; }
 
-                    // The shape test only rules a single card out, never in, so
-                    // a row it flagged that holds exactly one card was a card
-                    // all along. Put it back rather than stranding it.
+                    // One card means this row is a card. If the shape test had
+                    // condemned it, that was a wrong guess and it comes back
+                    // into the collection; if it had never been flagged, this
+                    // is simply an ordinary card confirming what it already
+                    // was. Either way it is stamped, so it is never re-read.
                     if (cards.length === 1) {
                         await pool.query(
                             'UPDATE portfolio_cards SET is_source_photo = 0, source_cards_found = 1, source_extracted_at = NOW() WHERE id = $1',
                             [row.id]);
-                        restored++;
+                        if (row.was_flagged) restored++; else confirmedSingle++;
                         continue;
                     }
 
@@ -5103,9 +5167,14 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                         broadcastActivity('card_added_detail', `➕ ${card.card_name}`, saved);
                     }
 
+                    // Several cards means this row is a page, whatever its shape
+                    // suggested. Marking it here is what takes it off the grid;
+                    // without this the page stayed on display next to every
+                    // card just read out of it.
                     await pool.query(
-                        'UPDATE portfolio_cards SET source_cards_found = $2, source_extracted_at = NOW() WHERE id = $1',
+                        'UPDATE portfolio_cards SET is_source_photo = 1, source_cards_found = $2, source_extracted_at = NOW() WHERE id = $1',
                         [row.id, cards.length]);
+                    pagesFound++;
                 } catch (err) {
                     console.error(`  [Extract] photo ${row.id}:`, err.message);
                     unreadable++;
@@ -5115,9 +5184,11 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
             }
 
             const parts = [];
+            if (pagesFound) parts.push(`${pagesFound} were pages of several cards`);
             if (added) parts.push(`${added} card${added === 1 ? '' : 's'} added`);
             if (alreadyHeld) parts.push(`${alreadyHeld} already in the collection`);
             if (restored) parts.push(`${restored} turned out to be single cards and went back`);
+            if (confirmedSingle) parts.push(`${confirmedSingle} confirmed as single cards`);
             if (unreadable) parts.push(`${unreadable} could not be read`);
             broadcastActivity('extract_complete',
                 parts.length

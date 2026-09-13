@@ -2041,24 +2041,36 @@ async function loadSourcePhotos() {
   try {
     const r = await api('/api/portfolio/source-photos');
     const pending = (r.photos || []).filter(p => !p.done);
-    panel.hidden = pending.length === 0;
-    if (!pending.length) return;
+    const unchecked = r.unchecked || 0;
+    panel.hidden = pending.length === 0 && unchecked === 0;
+    if (panel.hidden) return;
 
     // No card count is claimed until a photo has actually been read: a 2x1
     // spread and a 6x3 are the same shape, so the number cannot be known from
     // the outside, and inventing one would be the sort of confident wrong
     // figure this app keeps having to remove.
+    //
+    // The two numbers are kept apart on purpose. Pages are known pages. The
+    // unchecked ones are almost all ordinary cards — saying so is the
+    // difference between an honest queue and a claim that the whole collection
+    // is broken.
+    const known = pending.length
+      ? `${pending.length} photo${pending.length === 1 ? '' : 's'} of your collection ${pending.length === 1 ? 'is' : 'are'} still whole, each holding a page of cards. `
+      : '';
+    const rest = unchecked
+      ? `${known ? 'A further ' : ''}${unchecked} photo${unchecked === 1 ? '' : 's'} ${unchecked === 1 ? 'has' : 'have'} never been checked — a page held upright looks just like a card until it is read, so these are read to find out. Ones that hold a single card stay exactly as they are.`
+      : '';
     $('sourcePhotoText').textContent = r.recognitionReady
-      ? `${pending.length} photo${pending.length === 1 ? '' : 's'} of your collection ${pending.length === 1 ? 'is' : 'are'} still whole. `
-        + 'Each holds a page of cards. Reading them adds every card inside as its own entry, priced and filed by set and type.'
-      : `${pending.length} photo${pending.length === 1 ? '' : 's'} of your collection ${pending.length === 1 ? 'is' : 'are'} still whole, `
-        + 'but card recognition is not configured on the server, so they cannot be read yet.';
+      ? `${known}${rest} Reading them adds every card inside as its own entry, priced and filed by set and type.`.trim()
+      : `${known}${rest} Card recognition is not configured on the server, so they cannot be read yet.`.trim();
 
     const strip = $('sourcePhotoStrip');
     strip.innerHTML = '';
     for (const photo of pending.slice(0, 12)) {
       const img = el('img', 'source-thumb');
-      img.src = photo.image_data;
+      // Served as bytes, not base64 in the listing: a page photo is the
+      // largest thing in the database and this panel is on the main view.
+      img.src = `/api/portfolio/${photo.id}/photo.jpg`;
       img.alt = 'A page of cards waiting to be read';
       img.loading = 'lazy';
       strip.appendChild(img);

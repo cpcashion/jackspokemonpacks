@@ -2229,6 +2229,40 @@ async function loadAccounting() {
  * in the browser rather than as a curl incantation because the person who
  * needs it is standing in front of a broken app, not a terminal.
  */
+/**
+ * Add a list of cards that have already been identified.
+ *
+ * Deliberately not the restore door: restoring over a live collection means
+ * replacing it, and this is an addition. The server does the identifying and
+ * the pricing, so all this has to do is refuse anything that is not a card
+ * list and then get out of the way.
+ */
+$('addListFile')?.addEventListener('change', async (e) => {
+  const file = e.currentTarget.files?.[0];
+  e.currentTarget.value = '';           // let the same file be picked again after a refusal
+  if (!file) return;
+
+  let list;
+  try {
+    list = JSON.parse(await file.text());
+  } catch {
+    return toast('That file is not readable JSON.', 'error', 6000);
+  }
+  if (list?.format !== 'jackspokemon/cards-v1') {
+    return toast('That is not a jackspokemon card list.', 'error', 6000);
+  }
+
+  const count = (list.cards || []).length;
+  if (!count) return toast('That list has no cards in it.', 'error', 6000);
+
+  try {
+    const r = await api('/api/portfolio/add-identified', { method: 'POST', body: JSON.stringify(list) });
+    toast(r.message || `Adding ${count} cards…`, 'info', 7000);
+  } catch (err) {
+    toast(err.message, 'error', 7000);
+  }
+});
+
 $('restoreFile')?.addEventListener('change', async (e) => {
   const file = e.currentTarget.files?.[0];
   e.currentTarget.value = '';           // let the same file be picked again after a refusal
@@ -3325,6 +3359,7 @@ function connectEvents() {
       if (payload.type === 'refresh_progress') showRefreshProgress(payload);
       if (payload.type === 'recheck_progress') showRecheckProgress(payload);
       if (payload.type === 'extract_progress') showExtractProgress(payload);
+      if (payload.type === 'add_identified_progress') showExtractProgress(payload);
       if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
       if (payload.activityType === 'recheck_complete') { toast(payload.message, 'success', 8000); showRecheckProgress(null); }
       if (payload.activityType === 'extract_complete') { toast(payload.message, 'success', 10000); showExtractProgress(null); loadSourcePhotos(); }

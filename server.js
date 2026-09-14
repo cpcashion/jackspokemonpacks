@@ -31,6 +31,8 @@ import {
     normalizeText,
     normalizeCardNumber,
     buildVariantKey,
+    storedVariantKey,
+    resolvePrinting,
     canonicalCondition,
     conditionMultiplier,
     copyValue,
@@ -727,7 +729,7 @@ async function insertPortfolioCard(card, userId) {
         canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
         card.confidence || 0, card.image_data || '', thumb, card.image_url || '', card.notes || '',
         card.year || 0, normalizeLanguage(card.language), card.holo_type || 'Unknown',
-        buildVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || '', card.types || ''
+        storedVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || '', card.types || ''
     ]);
     return res.rows[0].id;
 }
@@ -928,7 +930,7 @@ async function applyVerifiedIdentity(cardId, verified) {
         normalizeLanguage(verified.language),
         verified.image_url || '',
         Number(verified.confidence) || 0,
-        buildVariantKey(verified),
+        storedVariantKey(verified),
         verified.verified_source || '',
         verified.types || '',
     ]);
@@ -4920,6 +4922,138 @@ app.post('/api/portfolio/import', requireAuth, express.json({ limit: '512mb' }),
     }
 });
 
+/**
+ * Add cards that have already been identified.
+ *
+ * A restore is not the right shape for "here are sixteen cards I read off a
+ * photo": it refuses to run over a live collection, and the only way past that
+ * refusal deletes everything first. Adding a handful of known cards is an
+ * addition, and it needed its own door.
+ *
+ * What arrives is an identification — a name and a printed number — not a
+ * valuation and not a printing. Each entry goes through exactly the path the
+ * scanner and the extraction use: the card databases are asked what that
+ * number in that set actually is, and their answer supplies the rarity, the
+ * artwork and the foil. That last one matters more than it looks. Whether a
+ * card is holo is the single hardest thing to read off a photograph, because it
+ * depends on the angle the light happened to hit it, and it is the difference
+ * between two prices — so nothing here reads it off a photograph. The database
+ * says what the card is; the photo is only how we knew to ask.
+ *
+ * It only ever adds. A card already in the collection is reported and left
+ * alone: one photograph of a shelf is evidence that the shelf exists, not that
+ * a second identical shelf appeared, and re-submitting the same list must not
+ * quietly double anything. Duplicates *within* one list are real — two Steelix
+ * side by side in the same picture are two pieces of cardboard — so those
+ * become copies, which is what `quantity` is for.
+ */
+let addIdentifiedRunning = false;
+
+app.post('/api/portfolio/add-identified', requireAuth, express.json({ limit: '8mb' }), async (req, res) => {
+    const body = req.body;
+    if (body?.format !== 'jackspokemon/cards-v1') {
+        return res.status(400).json({ error: 'Not a jackspokemon card list.' });
+    }
+    const entries = (body.cards || []).filter(c => hasMeaningfulCardName(c?.card_name));
+    if (!entries.length) return res.status(400).json({ error: 'That list has no named cards in it.' });
+    if (addIdentifiedRunning) return res.status(409).json({ error: 'A list is already being added.' });
+
+    addIdentifiedRunning = true;
+    res.json({
+        success: true,
+        started: entries.length,
+        message: `Adding ${entries.length} card${entries.length === 1 ? '' : 's'} — each one is being identified and priced…`,
+    });
+
+    (async () => {
+        let added = 0;
+        let copiesAdded = 0;
+        let alreadyHeld = 0;
+        let failed = 0;
+
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            const quantity = Math.max(1, Math.floor(Number(entry.quantity) || 1));
+            broadcast({
+                type: 'add_identified_progress',
+                done: i, total: entries.length, added,
+                message: `Identifying ${entry.card_name} (${i + 1} of ${entries.length})`,
+            });
+
+            try {
+                // The list carries evidence, not conclusions: name, number,
+                // language, condition. Rarity and foil are left blank on
+                // purpose so the databases decide them.
+                const rawCard = {
+                    card_name: entry.card_name,
+                    card_name_en: entry.card_name_en || '',
+                    card_set: entry.card_set || '',
+                    set_code: entry.set_code || '',
+                    card_number: entry.card_number || '',
+                    language: entry.language || 'English',
+                    condition: entry.condition || 'Near Mint',
+                    is_first_edition: entry.is_first_edition ? 1 : 0,
+                    notes: entry.notes || '',
+                };
+
+                const { verified, why, answered } = await verifyWithReason(rawCard);
+                const card = verified || { ...rawCard, needs_review: true };
+
+                // The list said nothing about foil, on purpose. Once the
+                // database has answered with a rarity, that rarity settles it —
+                // "Rare Holo" means holo, which is a fact about the printing
+                // rather than a reading of the glare in a photograph. Without
+                // this the card is filed as "normal" on no evidence at all, and
+                // the same card scanned by camera later would be read as holo
+                // and land as a second row for the same piece of cardboard.
+                const printing = resolvePrinting(card);
+                if (!card.holo_type && printing.printing !== 'unknown') {
+                    card.holo_type = printing.printing === 'holo' ? 'Holofoil'
+                        : printing.printing === 'reverse' ? 'Reverse Holo' : 'Non-Holo';
+                    card.is_holo = printing.printing !== 'normal';
+                }
+
+                const existing = await findCardByVariant(storedVariantKey(card), req.user.id);
+                if (existing) {
+                    alreadyHeld++;
+                    broadcastActivity('info', `${card.card_name} is already in the collection — left as it is.`);
+                    continue;
+                }
+
+                const saved = await saveScannedCard(card, {
+                    userId: req.user.id,
+                    thumbDataUrl: '',
+                    needsReview: !verified,
+                    unverifiedReason: why,
+                    databasesAnswered: answered,
+                });
+                added++;
+                broadcastActivity('card_added_detail', `➕ ${card.card_name}`, saved);
+
+                // Two of the same card in one picture are two cards.
+                for (let extra = 1; extra < quantity && saved?.id; extra++) {
+                    await addCardCopy(saved.id, { condition: card.condition || 'Near Mint', image_data: '', notes: '' });
+                    copiesAdded++;
+                }
+            } catch (err) {
+                console.error(`  [AddList] ${entry.card_name}:`, err.message);
+                failed++;
+            }
+            broadcast({ type: 'portfolio_updated' });
+        }
+
+        const parts = [];
+        if (added) parts.push(`${added} added`);
+        if (copiesAdded) parts.push(`${copiesAdded} extra cop${copiesAdded === 1 ? 'y' : 'ies'}`);
+        if (alreadyHeld) parts.push(`${alreadyHeld} already in the collection`);
+        if (failed) parts.push(`${failed} could not be identified`);
+        broadcastActivity('add_identified_complete',
+            parts.length ? `Card list: ${parts.join(', ')}.` : 'Nothing in that list was new.');
+        broadcast({ type: 'portfolio_updated' });
+    })().catch(err => console.error('Add-identified error:', err))
+        .finally(() => { addIdentifiedRunning = false; });
+});
+
 app.get('/api/portfolio/photos.zip', requireAuth, async (req, res) => {
     try {
         const cards = await pool.query(`
@@ -5147,7 +5281,7 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                         const { verified, why, answered } = await verifyWithReason(rawCard);
                         const card = verified || { ...rawCard, needs_review: true };
 
-                        const existing = await findCardByVariant(buildVariantKey(card), req.user.id);
+                        const existing = await findCardByVariant(storedVariantKey(card), req.user.id);
                         if (existing) { alreadyHeld++; continue; }
 
                         const crop = await cropCardThumbnail(buffer, rawCard.box_2d);
@@ -5725,7 +5859,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
  * printing already held.
  */
 async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unverifiedReason = '', databasesAnswered = true, forceSeparate, report = () => {} }) {
-    const variantKey = buildVariantKey(card);
+    const variantKey = storedVariantKey(card);
     const existing = forceSeparate ? null : await findCardByVariant(variantKey, userId);
 
     if (existing) {

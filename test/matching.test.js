@@ -15,7 +15,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCardNumber, printedSetTotal, normalizeCardNumber, buildVariantKey } from '../lib/identity.js';
+import { parseCardNumber, printedSetTotal, normalizeCardNumber, buildVariantKey, storedVariantKey } from '../lib/identity.js';
 import {
     compareCandidate,
     isLikelyVerifiedMatch,
@@ -313,4 +313,39 @@ test('placeholder names are refused in any language', () => {
     for (const real of ['Steelix', 'リザードン', '古空棘鱼', '리자몽']) {
         assert.equal(hasMeaningfulCardName(real), true, `"${real}" is a card name`);
     }
+});
+
+/**
+ * Looking a card up must find the row that card was written to.
+ *
+ * Storage defaults `holo_type` to the string "Unknown" and `is_holo` to false,
+ * and the key reads both — so a card with neither set keyed as "unknown" going
+ * in and "normal" coming out. Nothing ever matched, and since the foil is
+ * exactly the field nobody should read off a photograph, "neither set" is the
+ * normal case rather than an edge one. Re-running an extraction appended a
+ * second row for every card in the collection instead of recognising it.
+ */
+test('the key used to look a card up is the key it was stored under', () => {
+    const read = { card_name: 'Steelix', card_number: '093/132', language: 'English' };
+    // What storage does to a card on the way in.
+    const asStored = { ...read, holo_type: read.holo_type || 'Unknown', is_holo: false };
+
+    assert.notEqual(buildVariantKey(read), buildVariantKey(asStored),
+        'the two shapes really do disagree — which is the bug this guards');
+    assert.equal(storedVariantKey(read), storedVariantKey(asStored),
+        'asking the storage key of either shape gives one answer');
+    assert.equal(storedVariantKey(read), buildVariantKey(asStored),
+        'and that answer is the one actually written to the row');
+});
+
+test('an established foil still decides the printing', () => {
+    const base = { card_name: 'Kyogre', card_number: '034/132', language: 'English' };
+    const holo = storedVariantKey({ ...base, holo_type: 'Holofoil' });
+    const reverse = storedVariantKey({ ...base, holo_type: 'Reverse Holo' });
+    const unstated = storedVariantKey(base);
+
+    assert.notEqual(holo, reverse, 'holo and reverse holo are different printings');
+    assert.notEqual(holo, unstated, 'a known holo is not filed with the unestablished ones');
+    assert.match(holo, /\|holo\|/);
+    assert.match(reverse, /\|reverse\|/);
 });

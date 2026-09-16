@@ -14,8 +14,7 @@ import {
     isMultiCard,
     needsCloserLook,
     mergeCloserLook,
-    BOX_SCALE,
-} from '../lib/card-crop.js';
+    BOX_SCALE, uprightRotation } from '../lib/card-crop.js';
 
 test('a box on the model grid becomes the right pixel rectangle', () => {
     // The top-left quarter of a 1000x2000 image, with no margin.
@@ -139,4 +138,34 @@ test('a closer look that returns nothing changes nothing', () => {
     assert.deepEqual(mergeCloserLook(first, null), first);
     assert.equal(mergeCloserLook(first, { card_name: '   ', card_number: '' }).card_name, 'Pikachu',
         'whitespace is not a reading');
+});
+
+/**
+ * A card lying on its side is unreadable at grid size, which is the whole
+ * point of cutting it out. These pin how far it gets turned.
+ */
+test('the model\'s reading of how the card sits is trusted when it gave one', () => {
+    for (const d of [0, 90, 180, 270]) {
+        assert.deepEqual(uprightRotation(d, { width: 100, height: 140 }), { degrees: d, certain: true });
+    }
+    // A sideways card the model called upright stays upright: it can see where
+    // the name is and the box shape cannot.
+    assert.deepEqual(uprightRotation(0, { width: 140, height: 100 }), { degrees: 0, certain: true });
+});
+
+test('an off-axis answer is snapped to a square turn rather than letterboxed', () => {
+    assert.equal(uprightRotation(88).degrees, 90);
+    assert.equal(uprightRotation(271).degrees, 270);
+    assert.equal(uprightRotation(360).degrees, 0);
+    assert.equal(uprightRotation(-90).degrees, 270);
+});
+
+test('with no answer, a landscape crop is still known to be on its side', () => {
+    const guessed = uprightRotation(undefined, { width: 140, height: 100 });
+    assert.equal(guessed.degrees, 90, 'a quarter turn beats leaving it sideways');
+    assert.equal(guessed.certain, false, 'but which way up is genuinely unknown');
+
+    // Portrait already: leave it alone rather than spin it on a hunch.
+    assert.deepEqual(uprightRotation(undefined, { width: 100, height: 140 }), { degrees: 0, certain: true });
+    assert.deepEqual(uprightRotation(null, undefined), { degrees: 0, certain: true });
 });

@@ -27,6 +27,11 @@ import multer from 'multer';
 import sharp from 'sharp';
 import { execSync } from 'child_process';
 
+import { chooseArtwork, MATCH_PRINTED } from './lib/artwork.js';
+
+/** How many printings of one name we will pay a detail lookup to describe. */
+const ARTWORK_CANDIDATE_LIMIT = 8;
+
 import {
     normalizeText,
     normalizeCardNumber,
@@ -52,7 +57,7 @@ import { auditHistoryRows } from './lib/history.js';
 import { typesFromCard, serializeTypes } from './lib/types.js';
 import { buildSearchQueries, compsFromListings } from './lib/ebay-comps.js';
 import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
-import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook } from './lib/card-crop.js';
+import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook, uprightRotation } from './lib/card-crop.js';
 import { spreadPhotoIds } from './lib/source-photo.js';
 import { buildZip, safeEntryName } from './lib/zip.js';
 import {
@@ -193,6 +198,12 @@ async function initDB() {
         -- excluded from the collection, its totals and its counts, and exist
         -- only as the source the real cards are extracted from.
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS is_source_photo INTEGER DEFAULT 0;
+        -- How the stock artwork on this card was settled. Empty means it was
+        -- set before artwork carried any provenance, by a matcher that took the
+        -- first card sharing the printed number — and numbers repeat across
+        -- sets, so those URLs may be pictures of a different printing. Only
+        -- "printed" means the number AND its denominator both matched.
+        ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS artwork_match TEXT DEFAULT '';
         -- How many cards a look at the photo actually found, and whether the
         -- extraction has been done. Nulls mean "not examined yet".
         ALTER TABLE portfolio_cards ADD COLUMN IF NOT EXISTS source_cards_found INTEGER;
@@ -720,14 +731,14 @@ async function insertPortfolioCard(card, userId) {
     // Made here, once, so the grid never pays to move the full photo.
     const thumb = card.image_data ? await makeGridThumb(card.image_data) : '';
     const res = await pool.query(`
-        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, thumb_data, image_url, notes, year, language, holo_type, variant_key, needs_review, verified_source, types)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        INSERT INTO portfolio_cards (user_id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_data, thumb_data, image_url, artwork_match, notes, year, language, holo_type, variant_key, needs_review, verified_source, types)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         RETURNING id
     `, [
         userId, card.card_name, card.card_name_en || '', card.card_set || '', card.set_code || '',
         card.card_number || '', card.rarity || 'Unknown',
         canonicalCondition(card.condition_estimate || card.condition), (card.is_holographic || card.is_holo) ? 1 : 0, card.is_first_edition ? 1 : 0,
-        card.confidence || 0, card.image_data || '', thumb, card.image_url || '', card.notes || '',
+        card.confidence || 0, card.image_data || '', thumb, card.image_url || '', card.artwork_match || '', card.notes || '',
         card.year || 0, normalizeLanguage(card.language), card.holo_type || 'Unknown',
         storedVariantKey(card), card.needs_review ? 1 : 0, card.verified_source || '', card.types || ''
     ]);
@@ -771,8 +782,38 @@ async function getCardCopies(cardId) {
     return res.rows;
 }
 
-async function updateCardImageUrl(cardId, imageUrl) {
-    await pool.query(`UPDATE portfolio_cards SET image_url = $1 WHERE id = $2`, [imageUrl, cardId]);
+/**
+ * Find the stock picture of a card, in whatever language it was printed in.
+ *
+ * Every source behind this now refuses to answer unless the printed number and
+ * its denominator both match, so a URL coming back is evidence rather than a
+ * plausible-looking result — which is what makes it safe to show a stock image
+ * for a card the app could not otherwise price. Identification and valuation
+ * are different questions, and a card can be certainly a Steelix 093/132 while
+ * no marketplace will say what it is worth.
+ *
+ * @returns {{url: string, match: string}} empty url when nothing was settled
+ */
+async function resolveArtwork(card) {
+    const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
+    const attempts = [
+        () => fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)),
+        () => (english ? fetchCardImageFromTCGdex(english, card.card_set, card.card_number) : null),
+        () => (english ? fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) : null),
+    ];
+    for (const attempt of attempts) {
+        try {
+            const url = await attempt();
+            if (url) return { url, match: MATCH_PRINTED };
+        } catch { /* try the next source */ }
+    }
+    return { url: '', match: '' };
+}
+
+async function updateCardImageUrl(cardId, imageUrl, match = '') {
+    await pool.query(
+        `UPDATE portfolio_cards SET image_url = $1, artwork_match = $2 WHERE id = $3`,
+        [imageUrl, match, cardId]);
 }
 
 /**
@@ -1090,6 +1131,7 @@ async function getAllPortfolioCards(userId) {
             -- Simply "is there a scan photo". This used to be false whenever
             -- artwork existed, which left the client no way to fall back to
             -- the real photograph when the artwork could not be trusted.
+            pc.artwork_match,
             (pc.image_data IS NOT NULL AND pc.image_data <> '') AS has_local_image,
             -- Is there a photograph of this card at all: either the scan that
             -- created it, or one attached to a copy. This is the difference
@@ -1401,41 +1443,43 @@ async function fetchCardImageFromTCGdex(cardName, cardSet, cardNumber, lang = 'e
         const results = resp.data;
         if (!Array.isArray(results) || results.length === 0) return null;
 
-        // Try to match by card number first (most specific)
-        if (cardNumber) {
-            const numClean = cardNumber.replace(/^0+/, '').split('/')[0];
-            const byNumber = results.find(r => {
-                const localClean = (r.localId || '').replace(/^0+/, '');
-                return localClean === numClean && r.image;
-            });
-            if (byNumber) return byNumber.image + '/high.webp';
+        // A card number is only unique inside its set — there is a card
+        // numbered 93 in dozens of them — so the number alone cannot pick a
+        // printing, however specific it looks. What identifies one is the whole
+        // printed fraction: 093/132 means card 93 of a set that holds 132, and
+        // a set's official count is exactly that denominator.
+        //
+        // Establishing it costs one detail lookup per candidate, which is why
+        // the search is narrowed to plausible ones first and capped.
+        const printed = parseCardNumber(cardNumber || '');
+        const shortlist = results
+            .filter(r => r.image)
+            .filter(r => !printed.number
+                || String(r.localId ?? '').trim().replace(/^0+/, '') === printed.number)
+            .slice(0, ARTWORK_CANDIDATE_LIMIT);
+        if (!shortlist.length) return null;
+
+        const detailed = [];
+        for (const candidate of shortlist) {
+            try {
+                const detail = await axios.get(`https://api.tcgdex.net/v2/${lang}/cards/${candidate.id}`, {
+                    timeout: 8000,
+                    headers: { 'Accept': 'application/json' }
+                });
+                detailed.push({
+                    localId: detail.data.localId ?? candidate.localId,
+                    setName: detail.data.set?.name || '',
+                    setOfficialCount: Number(detail.data.set?.cardCount?.official) || 0,
+                    image: candidate.image,
+                });
+            } catch { /* a candidate we cannot describe cannot be matched */ }
         }
 
-        // Try to match by set name
-        if (cardSet) {
-            // Need to fetch full card details to check set name
-            const withImage = results.filter(r => r.image).slice(0, 5);
-            for (const candidate of withImage) {
-                try {
-                    const detail = await axios.get(`https://api.tcgdex.net/v2/${lang}/cards/${candidate.id}`, {
-                        timeout: 8000,
-                        headers: { 'Accept': 'application/json' }
-                    });
-                    if (detail.data.set && detail.data.set.name) {
-                        const setNameLower = detail.data.set.name.toLowerCase();
-                        const targetSetLower = cardSet.toLowerCase();
-                        if (setNameLower.includes(targetSetLower) || targetSetLower.includes(setNameLower)) {
-                            return candidate.image + '/high.webp';
-                        }
-                    }
-                } catch { /* skip */ }
-            }
-        }
-
-        // No fallback. If neither the printed number nor the set name picked a
-        // card out, we do not know which of these printings is in your hand,
-        // and guessing produces a picture of somebody else's card.
-        return null;
+        // No fallback. If the printed evidence did not pick exactly one card
+        // out, we do not know which of these printings is in your hand, and
+        // guessing produces a sharp, confident picture of somebody else's card.
+        const picked = chooseArtwork(detailed, printed, cardSet);
+        return picked ? picked.candidate.image + '/high.webp' : null;
     } catch (err) {
         console.error(`  [TCGdex] Error looking up "${cardName}":`, err.message);
         return null;
@@ -1598,6 +1642,8 @@ MANY OF THESE IMAGES CONTAIN SEVERAL CARDS AT ONCE — a binder page, a grid lai
 
 For each card also return box_2d: the card's bounding box in the image as [ymin, xmin, ymax, xmax], each value 0-1000 relative to the image size. This is what lets each card be cropped out and shown on its own, so give it for every card even when there is only one. Bound the card itself, not the sleeve or the binder pocket around it.
 
+Also return rotation: how far the card must be turned CLOCKWISE, in degrees, to stand upright with its name at the top — one of 0, 90, 180 or 270. Cards photographed on a table are often laid on their side or upside down, and a card cut out of the photo keeps whatever angle it was lying at. Read this from where the name and the text actually are, not from the shape of the box. Use 0 if the card is already upright.
+
 Pokemon cards are printed in English, Japanese, Korean, Simplified Chinese, Traditional Chinese, French, German, Spanish, Italian, Portuguese, Dutch, Polish, Russian, Thai and Indonesian. Read whichever language the card is actually in. Never refuse a card because it is not in English.
 
 Read these directly off the card. Do not infer them from the artwork or from what is typical:
@@ -1629,6 +1675,7 @@ Return ONLY valid JSON (no markdown fences):
 {
   "cards": [{
     "box_2d": [ymin, xmin, ymax, xmax],
+    "rotation": 0,
     "card_name": "name exactly as printed, in its own script",
     "card_name_en": "official English name of the same Pokemon",
     "card_set": "Set name or empty string",
@@ -2273,14 +2320,25 @@ function dataUrlToBuffer(dataUrl) {
  * whole grid is a cosmetic problem, and failing the scan over it would be a
  * real one. The caller falls back to the full-frame thumbnail.
  */
-async function cropCardThumbnail(buffer, box, { width = 700, height = 980 } = {}) {
+async function cropCardThumbnail(buffer, box, { width = 700, height = 980, rotation } = {}) {
     try {
         const meta = await sharp(buffer).metadata();
         const region = boxToRegion(box, meta.width, meta.height);
         if (!region) return null;
-        const out = await sharp(buffer)
-            .rotate()
-            .extract(region)
+        // Turned upright before it is scaled down, so the card fills the
+        // portrait frame it is about to be fitted into rather than being
+        // letterboxed on its side at a third of the size.
+        //
+        // Two pipelines, not one: sharp honours a single rotation per pipeline,
+        // so the EXIF `.rotate()` the source photo needs and the quarter turn
+        // this card needs cannot be chained — the second is silently dropped
+        // and the crop comes out sideways anyway, which is the bug this is here
+        // to fix. Cutting first and turning second keeps both.
+        const upright = uprightRotation(rotation, region);
+        const extracted = await sharp(buffer).rotate().extract(region).toBuffer();
+        let pipeline = sharp(extracted);
+        if (upright.degrees) pipeline = pipeline.rotate(upright.degrees);
+        const out = await pipeline
             .resize(width, height, { fit: 'inside', withoutEnlargement: true })
             .jpeg({ quality: 82, mozjpeg: true })
             .toBuffer();
@@ -3297,7 +3355,7 @@ async function refreshBatchPrices(batchSize = 5) {
         // this batch has no time budget for, and the full refresh does it — so
         // an unconfirmed card is priced as an estimate and re-verified there.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, artwork_match, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
             -- A source photo is not a card: never listed, never priced.
             WHERE COALESCE(is_source_photo, 0) = 0
@@ -3318,10 +3376,9 @@ async function refreshBatchPrices(batchSize = 5) {
                 // Artwork only for a confirmed printing: the picture is shown
                 // in preference to Jack's own photo, so on an unconfirmed card
                 // it would assert an identity nothing has established.
-                if (!card.needs_review && (!card.image_url || card.image_url.includes('undefined'))) {
-                    let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
-                    if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
-                    if (imageUrl) await updateCardImageUrl(card.id, imageUrl);
+                if (!card.image_url || card.image_url.includes('undefined') || card.artwork_match !== MATCH_PRINTED) {
+                    const art = await resolveArtwork(card);
+                    if (art.url) await updateCardImageUrl(card.id, art.url, art.match);
                 }
 
                 const result = await priceCard(card, {
@@ -3373,7 +3430,7 @@ async function refreshAllPrices() {
         // improves, so the right behaviour is to quietly try again on every
         // scheduled run until it resolves.
         const res = await pool.query(`
-            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
+            SELECT id, card_name, card_name_en, card_set, set_code, card_number, rarity, condition, is_holo, is_first_edition, confidence, image_url, artwork_match, year, language, holo_type, current_price, needs_review, price_tier, price_explanation, types
             FROM portfolio_cards
             -- A source photo is not a card: never listed, never priced.
             WHERE COALESCE(is_source_photo, 0) = 0
@@ -3388,14 +3445,18 @@ async function refreshAllPrices() {
         for (let i = 0; i < cards.length; i++) {
             const card = cards[i];
             try {
-                // Artwork only for a confirmed printing: the picture is shown
-                // in preference to Jack's own photo, so on an unconfirmed card
-                // it would assert an identity nothing has established.
-                if (!card.needs_review && (!card.image_url || card.image_url.includes('undefined'))) {
-                    let imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number);
-                    if (!imageUrl) imageUrl = await fetchCardImageFromPokemonTCG(card.card_name, card.card_set, card.card_number);
-                    if (imageUrl) {
-                        await updateCardImageUrl(card.id, imageUrl);
+                // Artwork no longer waits for the printing to be confirmed.
+                // Every source behind resolveArtwork refuses to answer unless
+                // the printed number and its denominator both match, so a URL
+                // coming back is itself the evidence — and a card can be
+                // certainly a Steelix 093/132 while no marketplace will say
+                // what it is worth. Withholding the picture in that case left
+                // the owner looking at a blurry crop of a card the app had in
+                // fact identified.
+                if (!card.image_url || card.image_url.includes('undefined') || card.artwork_match !== MATCH_PRINTED) {
+                    const art = await resolveArtwork(card);
+                    if (art.url) {
+                        await updateCardImageUrl(card.id, art.url, art.match);
                         console.log(`  [PriceRefresh] Found image for ${card.card_name}`);
                     }
                 }
@@ -5054,6 +5115,117 @@ app.post('/api/portfolio/add-identified', requireAuth, express.json({ limit: '8m
         .finally(() => { addIdentifiedRunning = false; });
 });
 
+/**
+ * Put a proper picture of every card on every card.
+ *
+ * The collection was built from photographs of binder pages, so a great many
+ * entries are illustrated by a crop of a crop: small, soft, sometimes lying on
+ * its side, occasionally clipped. That is not what a collection should look
+ * like, and it is not what the app has to show — the card databases publish a
+ * clean scan of every printing, and the app already prefers one when it has it.
+ *
+ * Two things stopped it having one. Artwork was only ever fetched for a card
+ * confirmed well enough to price, which is a different question from knowing
+ * which card it is; and the matcher that did the fetching took the first result
+ * sharing the printed number, which across sets is a lottery among printings.
+ * Both are fixed at the source. This walks the collection and applies them.
+ *
+ * Cards whose artwork has no recorded provenance are re-settled too, since
+ * those URLs came from the old matcher and may be pictures of somebody else's
+ * card. A card that cannot be settled keeps its photograph, which is at least
+ * always a picture of the thing actually in the binder.
+ */
+let artworkSweepRunning = false;
+
+app.post('/api/portfolio/refresh-artwork', requireAuth, async (req, res) => {
+    const QUEUE_SQL = `
+        SELECT id, card_name, card_name_en, card_set, set_code, card_number, language, image_url, artwork_match
+        FROM portfolio_cards
+        WHERE user_id = $1 AND COALESCE(is_source_photo, 0) = 0
+          AND (image_url IS NULL OR image_url = '' OR image_url LIKE '%undefined%'
+               OR COALESCE(artwork_match, '') <> $2)
+        ORDER BY (image_url IS NULL OR image_url = '') DESC, id ASC
+    `;
+
+    if (req.query.preview) {
+        try {
+            const { rows } = await pool.query(QUEUE_SQL, [req.user.id, MATCH_PRINTED]);
+            return res.json({
+                success: true,
+                queued: rows.length,
+                missing: rows.filter(r => !r.image_url).length,
+                unprovenanced: rows.filter(r => r.image_url).length,
+            });
+        } catch (err) {
+            console.error('Artwork preview error:', err);
+            return res.status(500).json({ error: err.message });
+        }
+    }
+
+    if (artworkSweepRunning) return res.status(409).json({ error: 'Artwork is already being refreshed.' });
+    artworkSweepRunning = true;
+    try {
+        const limit = Math.max(0, Math.floor(Number(req.query.limit) || 0));
+        const all = await pool.query(QUEUE_SQL, [req.user.id, MATCH_PRINTED]);
+        const rows = limit ? all.rows.slice(0, limit) : all.rows;
+
+        res.json({
+            success: true,
+            started: rows.length,
+            remaining: all.rows.length - rows.length,
+            message: rows.length
+                ? `Finding proper artwork for ${rows.length} card${rows.length === 1 ? '' : 's'}…`
+                : 'Every card already has artwork matched to its printed number.',
+        });
+
+        (async () => {
+            let settled = 0;
+            let replaced = 0;
+            let unresolved = 0;
+
+            for (let i = 0; i < rows.length; i++) {
+                const card = rows[i];
+                broadcast({
+                    type: 'artwork_progress',
+                    done: i, total: rows.length, added: settled,
+                    message: `Looking up ${card.card_name} (${i + 1} of ${rows.length})`,
+                });
+                try {
+                    const art = await resolveArtwork(card);
+                    if (art.url) {
+                        if (card.image_url && card.image_url !== art.url) replaced++;
+                        await updateCardImageUrl(card.id, art.url, art.match);
+                        settled++;
+                    } else {
+                        // Nothing matched. An unprovenanced URL is left in
+                        // place rather than removed: it may well be right, and
+                        // the client already treats it with the older, stricter
+                        // rule until something settles it.
+                        unresolved++;
+                    }
+                } catch (err) {
+                    console.error(`  [Artwork] ${card.card_name}:`, err.message);
+                    unresolved++;
+                }
+                if (i % 10 === 9) broadcast({ type: 'portfolio_updated' });
+            }
+
+            const parts = [];
+            if (settled) parts.push(`${settled} settled by printed number`);
+            if (replaced) parts.push(`${replaced} had been showing a different printing`);
+            if (unresolved) parts.push(`${unresolved} kept their own photo`);
+            broadcastActivity('artwork_complete',
+                parts.length ? `Artwork: ${parts.join(', ')}.` : 'No artwork changed.');
+            broadcast({ type: 'portfolio_updated' });
+        })().catch(err => console.error('Artwork sweep error:', err))
+            .finally(() => { artworkSweepRunning = false; });
+    } catch (err) {
+        artworkSweepRunning = false;
+        console.error('Artwork sweep error:', err);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/portfolio/photos.zip', requireAuth, async (req, res) => {
     try {
         const cards = await pool.query(`
@@ -5284,7 +5456,7 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                         const existing = await findCardByVariant(storedVariantKey(card), req.user.id);
                         if (existing) { alreadyHeld++; continue; }
 
-                        const crop = await cropCardThumbnail(buffer, rawCard.box_2d);
+                        const crop = await cropCardThumbnail(buffer, rawCard.box_2d, { rotation: rawCard.rotation });
                         const saved = await saveScannedCard(card, {
                             userId: req.user.id,
                             thumbDataUrl: crop || '',
@@ -5765,7 +5937,7 @@ async function processPortfolioUpload(files, userId, options = {}) {
             // is; a full-frame thumbnail stands in when it did not.
             let cardThumb = thumbDataUrl;
             if (multi) {
-                const cropped = await cropCardThumbnail(buffer, rawCard.box_2d);
+                const cropped = await cropCardThumbnail(buffer, rawCard.box_2d, { rotation: rawCard.rotation });
                 if (cropped) cardThumb = cropped;
             }
 
@@ -5902,22 +6074,24 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unveri
     // Artwork is only fetched for a card whose printing was actually confirmed.
     //
     // The picture is shown in preference to the photo you took, so it is a
-    // claim about what you own — and on an unconfirmed card that claim has
-    // nothing behind it. A Tyrunt numbered 070 that could not be placed was
-    // being illustrated with a different Tyrunt's artwork, which looked exactly
-    // as authoritative as a correct one. Your own photograph is always a
-    // picture of your actual card, so it stands until the printing is settled.
-    let imageUrl = needsReview ? '' : (card.image_url || '');
-    if (!needsReview) {
-        try {
-            // A Japanese card should show Japanese artwork, so TCGdex is asked in
-            // the card's own language first.
-            if (!imageUrl) imageUrl = await fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)) || '';
-            // The English fallbacks only make sense with an English name to search.
-            const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
-            if (!imageUrl && english) imageUrl = await fetchCardImageFromTCGdex(english, card.card_set, card.card_number) || '';
-            if (!imageUrl && english) imageUrl = await fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) || '';
-        } catch { /* the scan photo stands in until a refresh finds artwork */ }
+    // claim about what you own. A Tyrunt numbered 070 that could not be placed
+    // was once illustrated with a different Tyrunt's artwork, which looked
+    // exactly as authoritative as a correct one.
+    //
+    // The guard against that used to be "only illustrate a card we could
+    // price", which conflated two different questions and left every
+    // hard-to-price card showing a blurry crop. The guard is now on the
+    // artwork lookup itself: it answers only when the printed number and its
+    // denominator both match, so the URL is the evidence. A card nobody will
+    // quote a price for can still be certainly a Steelix 093/132.
+    let imageUrl = card.image_url || '';
+    let artworkMatch = imageUrl ? MATCH_PRINTED : '';
+    if (!imageUrl) {
+        // A Japanese card should show Japanese artwork, so TCGdex is asked in
+        // the card's own language first.
+        const art = await resolveArtwork(card);
+        imageUrl = art.url;
+        artworkMatch = art.match;
     }
 
     const cardId = await insertPortfolioCard({
@@ -5934,6 +6108,7 @@ async function saveScannedCard(card, { userId, thumbDataUrl, needsReview, unveri
         confidence: card.confidence || 0,
         image_data: thumbDataUrl,
         image_url: imageUrl,
+        artwork_match: artworkMatch,
         notes: card.notes || '',
         year: card.year || 0,
         language: card.language || 'English',

@@ -1308,4 +1308,61 @@ if (!DB) {
             'the two counts partition the queue exactly');
         await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [page]);
     });
+
+    /**
+     * Which cards are owed a proper picture.
+     *
+     * Stock artwork is shown in preference to the owner's own photo, so the
+     * queue has to cover two different kinds of wrong: cards with no artwork at
+     * all, which fall back to a blurry crop of a binder page; and cards whose
+     * artwork was chosen by the old matcher, which took the first result
+     * sharing the printed number and so may be illustrating a different
+     * printing. The second kind looks perfectly fine on screen, which is
+     * exactly why it has to be swept rather than left alone.
+     */
+    const artworkQueue = async () => {
+        const { body } = await api('/api/portfolio/refresh-artwork?preview=1', { method: 'POST' });
+        return body;
+    };
+
+    test('a card with no artwork is queued for a proper picture', async () => {
+        const before = await artworkQueue();
+        const id = await seedLegacyCard({ card_name: 'Artless Ninjask', card_number: '017/132' });
+        const after = await artworkQueue();
+
+        assert.equal(after.queued - before.queued, 1);
+        assert.equal(after.missing - before.missing, 1, 'counted as having no picture at all');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [id]);
+    });
+
+    test('artwork chosen by the old matcher is re-settled, not trusted', async () => {
+        const id = await seedLegacyCard({ card_name: 'Suspect Steelix', card_number: '093/132' });
+        // A URL with no recorded provenance: exactly what the number-only
+        // matcher used to leave behind.
+        await pool.query(
+            "UPDATE portfolio_cards SET image_url = 'https://example.test/some-steelix.png', artwork_match = '' WHERE id = $1",
+            [id]);
+
+        const q = await artworkQueue();
+        assert.ok(q.unprovenanced >= 1,
+            'a picture nobody can vouch for is queued even though the card looks illustrated');
+
+        // Once settled on printed evidence it stops being work.
+        await pool.query("UPDATE portfolio_cards SET artwork_match = 'printed' WHERE id = $1", [id]);
+        const after = await artworkQueue();
+        assert.equal(after.queued, q.queued - 1, 'settled artwork leaves the queue');
+
+        await pool.query('DELETE FROM portfolio_cards WHERE id = $1', [id]);
+    });
+
+    test('a source photo is never given card artwork, because it is not a card', async () => {
+        const page = await seedPhotoRow({ card_name: 'A Whole Page', is_source_photo: 1 });
+        const before = await artworkQueue();
+        const other = await seedPhotoRow({ card_name: 'An Actual Card' });
+        const after = await artworkQueue();
+
+        assert.equal(after.queued - before.queued, 1,
+            'the ordinary card joins the queue and the page does not');
+        await pool.query('DELETE FROM portfolio_cards WHERE id = ANY($1::int[])', [[page, other]]);
+    });
 }

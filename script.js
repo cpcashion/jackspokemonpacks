@@ -751,7 +751,17 @@ async function checkForSplitRows() {
  */
 function cardArt(card, cls, { full = false } = {}) {
   const wrap = el('div', cls);
-  const artworkTrustworthy = card.image_url && card.printing_confirmed !== false;
+  // Artwork matched on the printed number *and* its denominator identifies one
+  // printing and no other, so it stands on its own — a card can be certainly a
+  // Steelix 093/132 while no marketplace will quote a price for it, and showing
+  // a blurry crop of a card the app has in fact identified helps nobody.
+  //
+  // Artwork with no recorded provenance predates that matcher, which took the
+  // first card sharing the number and so may have illustrated a different
+  // printing. Those keep the older, stricter rule until a refresh re-settles
+  // them.
+  const artworkTrustworthy = card.image_url
+    && (card.artwork_match === 'printed' || card.printing_confirmed !== false);
   const img = el('img');
   img.loading = 'lazy';
   img.decoding = 'async';
@@ -2237,6 +2247,22 @@ async function loadAccounting() {
  * the pricing, so all this has to do is refuse anything that is not a card
  * list and then get out of the way.
  */
+$('refreshArtworkBtn')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Looking…';
+  try {
+    const r = await api('/api/portfolio/refresh-artwork', { method: 'POST' });
+    toast(r.message || 'Finding artwork…', 'info', 7000);
+  } catch (err) {
+    toast(err.message, 'error', 6000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
 $('addListFile')?.addEventListener('change', async (e) => {
   const file = e.currentTarget.files?.[0];
   e.currentTarget.value = '';           // let the same file be picked again after a refusal
@@ -3360,6 +3386,7 @@ function connectEvents() {
       if (payload.type === 'recheck_progress') showRecheckProgress(payload);
       if (payload.type === 'extract_progress') showExtractProgress(payload);
       if (payload.type === 'add_identified_progress') showExtractProgress(payload);
+      if (payload.type === 'artwork_progress') showExtractProgress(payload);
       if (payload.activityType === 'refresh_complete') { toast(payload.message, 'success'); showRefreshProgress(null); }
       if (payload.activityType === 'recheck_complete') { toast(payload.message, 'success', 8000); showRecheckProgress(null); }
       if (payload.activityType === 'extract_complete') { toast(payload.message, 'success', 10000); showExtractProgress(null); loadSourcePhotos(); }

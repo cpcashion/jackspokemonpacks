@@ -917,10 +917,27 @@ async function getCardCopies(cardId) {
  */
 async function resolveArtwork(card) {
     const english = card.card_name_en || (isNonEnglish(card.language) ? '' : card.card_name);
+
+    // A printed number belongs to the printing that carries it, and to no
+    // other. カイオーガ 025/070 is card 25 of a Japanese set of 70; the English
+    // Kyogre is a different card with a different number in a different set.
+    // Searching English sets with a Japanese card's number does not merely
+    // fail — the matcher is looking for card 25 in a set of 70, some English
+    // set has exactly that, and it would come back "matched on printed
+    // evidence" with a picture of something else entirely. Which is the precise
+    // failure the printed-number rule exists to stop, let back in through the
+    // side door of a fallback chain.
+    //
+    // So the number is only ever used against the card's own language. The
+    // English attempts keep the name and drop the number, which leaves the set
+    // name as the only evidence — and a set name the model guessed is not
+    // enough to settle a picture, so in practice a foreign card gets artwork
+    // from its own language's database or none at all.
+    const foreign = isNonEnglish(card.language);
     const attempts = [
         () => fetchCardImageFromTCGdex(card.card_name, card.card_set, card.card_number, languageCode(card.language)),
-        () => (english ? fetchCardImageFromTCGdex(english, card.card_set, card.card_number) : null),
-        () => (english ? fetchCardImageFromPokemonTCG(english, card.card_set, card.card_number) : null),
+        () => (english ? fetchCardImageFromTCGdex(english, card.card_set, foreign ? '' : card.card_number) : null),
+        () => (english ? fetchCardImageFromPokemonTCG(english, card.card_set, foreign ? '' : card.card_number) : null),
     ];
     for (const attempt of attempts) {
         try {

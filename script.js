@@ -129,9 +129,27 @@ function icon(name, size = 22) {
   return svg;
 }
 
-function cardPlaceholder() {
+/**
+ * What stands in when there is no picture worth showing.
+ *
+ * A blank card icon says "something is missing" and nothing else. Naming the
+ * card says which card is missing its picture, which is the thing you actually
+ * want to know when you are looking at a wall of them — and it means every tile
+ * in the collection is legible, even the ones no database could illustrate.
+ */
+function cardPlaceholder(card) {
   const wrap = el('div', 'ph');
   wrap.appendChild(icon('card', 22));
+  if (card?.card_name) {
+    const name = el('div', 'ph-name');
+    name.textContent = card.card_name;
+    wrap.appendChild(name);
+    if (card.card_number) {
+      const num = el('div', 'ph-num');
+      num.textContent = card.card_number;
+      wrap.appendChild(num);
+    }
+  }
   return wrap;
 }
 
@@ -766,14 +784,14 @@ function cardArt(card, cls, { full = false } = {}) {
   img.loading = 'lazy';
   img.decoding = 'async';
   img.alt = card.card_name || 'Card';
-  img.addEventListener('error', () => { img.replaceWith(cardPlaceholder()); }, { once: true });
+  img.addEventListener('error', () => { img.replaceWith(cardPlaceholder(card)); }, { once: true });
 
   if (artworkTrustworthy) {
     img.src = card.image_url;
   } else if (card.has_local_image) {
     img.src = `/api/portfolio/${card.id}/${full ? 'photo' : 'thumb'}.jpg`;
   } else {
-    wrap.appendChild(cardPlaceholder());
+    wrap.appendChild(cardPlaceholder(card));
     return wrap;
   }
   wrap.appendChild(img);

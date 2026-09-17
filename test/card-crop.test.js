@@ -14,7 +14,7 @@ import {
     isMultiCard,
     needsCloserLook,
     mergeCloserLook,
-    BOX_SCALE, uprightRotation } from '../lib/card-crop.js';
+    BOX_SCALE, uprightRotation, looksSideways } from '../lib/card-crop.js';
 
 test('a box on the model grid becomes the right pixel rectangle', () => {
     // The top-left quarter of a 1000x2000 image, with no margin.
@@ -168,4 +168,34 @@ test('with no answer, a landscape crop is still known to be on its side', () => 
     // Portrait already: leave it alone rather than spin it on a hunch.
     assert.deepEqual(uprightRotation(undefined, { width: 100, height: 140 }), { degrees: 0, certain: true });
     assert.deepEqual(uprightRotation(null, undefined), { degrees: 0, certain: true });
+});
+
+/**
+ * Straightening pictures already in the database is the only thing that helps
+ * the cards already in the collection — but a wrong call here turns an upright
+ * card onto its side, which is worse than doing nothing.
+ */
+test('a tight crop of a card lying down is recognised as sideways', () => {
+    assert.equal(looksSideways({ width: 880, height: 630 }), true, 'a card\'s own proportions, turned');
+    assert.equal(looksSideways({ width: 560, height: 400 }), true, 'loosely cut, still a card on its side');
+});
+
+test('an upright card is left alone, however it was cut', () => {
+    assert.equal(looksSideways({ width: 630, height: 880 }), false);
+    assert.equal(looksSideways({ width: 700, height: 980 }), false);
+    assert.equal(looksSideways({ width: 500, height: 500 }), false, 'square decides nothing');
+});
+
+test('a landscape photograph of an upright card is not straightened', () => {
+    // 16:9 and wider: the frame is landscape, the card inside it is not.
+    assert.equal(looksSideways({ width: 1920, height: 1080 }), false);
+    assert.equal(looksSideways({ width: 1600, height: 900 }), false);
+    // A panorama of a whole shelf, likewise.
+    assert.equal(looksSideways({ width: 3000, height: 1000 }), false);
+});
+
+test('a missing or nonsense size decides nothing', () => {
+    assert.equal(looksSideways(), false);
+    assert.equal(looksSideways({ width: 0, height: 0 }), false);
+    assert.equal(looksSideways({ width: -5, height: 10 }), false);
 });

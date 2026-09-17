@@ -66,7 +66,7 @@ if (!DB) {
         `);
 
         server = spawn(process.execPath, ['server.js'], {
-            env: { ...process.env, DATABASE_URL: DB, PORT: String(PORT), GEMINI_API_KEY: '' },
+            env: { ...process.env, DATABASE_URL: DB, PORT: String(PORT), GEMINI_API_KEY: '', SKIP_ARTWORK_SWEEP: '1' },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         server.stderr.on('data', d => { if (process.env.VERBOSE) process.stderr.write(d); });

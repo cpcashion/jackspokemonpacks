@@ -57,7 +57,7 @@ import { auditHistoryRows } from './lib/history.js';
 import { typesFromCard, serializeTypes } from './lib/types.js';
 import { buildSearchQueries, compsFromListings } from './lib/ebay-comps.js';
 import { tierFor, scaleConfidence, shouldReplace, asReasonClause } from './lib/price-tier.js';
-import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook, uprightRotation } from './lib/card-crop.js';
+import { boxToRegion, isMultiCard, needsCloserLook, mergeCloserLook, uprightRotation, looksSideways } from './lib/card-crop.js';
 import { spreadPhotoIds } from './lib/source-photo.js';
 import { buildZip, safeEntryName } from './lib/zip.js';
 import {
@@ -305,6 +305,7 @@ async function initDB() {
     await rebuildIdentityAndMerge();
     await dropUnconfirmedArtwork();
     await backfillGridThumbnails();
+    await straightenStoredPhotos();
 }
 
 async function hasRun(key) {
@@ -578,6 +579,64 @@ async function dropUnconfirmedArtwork() {
 }
 
 /**
+ * Turn the cards already in the collection the right way up.
+ *
+ * Cropping learned to stand a card upright, which does nothing at all for the
+ * pictures already saved — and those are the entire collection. Every card cut
+ * out of a binder-page photo before that kept whatever angle it was lying at,
+ * and a card on its side is illegible at grid size no matter how good the
+ * photograph was.
+ *
+ * This reads each stored picture, and where its proportions say "a card lying
+ * down" rather than "a landscape photograph of an upright card", turns it a
+ * quarter and rebuilds the thumbnail from the straightened copy. Which quarter
+ * is genuinely unknowable from the image alone, so a card may come out upside
+ * down — but upside down is readable and sideways is not, and where proper
+ * artwork exists the picture is not shown at all.
+ *
+ * Source photos are skipped: a page of cards is legitimately landscape, and is
+ * not a card.
+ */
+async function straightenStoredPhotos() {
+    const KEY = 'straighten_stored_photos_v1';
+    if (await hasRun(KEY)) return;
+
+    const { rows } = await pool.query(`
+        SELECT id FROM portfolio_cards
+        WHERE COALESCE(is_source_photo, 0) = 0
+          AND image_data IS NOT NULL AND image_data <> ''
+        ORDER BY id ASC
+    `);
+
+    let turned = 0;
+    for (const { id } of rows) {
+        try {
+            const one = await pool.query('SELECT image_data FROM portfolio_cards WHERE id = $1', [id]);
+            const buffer = dataUrlToBuffer(one.rows[0]?.image_data);
+            if (!buffer) continue;
+
+            const meta = await sharp(buffer).metadata();
+            if (!looksSideways({ width: meta.width, height: meta.height })) continue;
+
+            const upright = await sharp(buffer)
+                .rotate(90)
+                .jpeg({ quality: 82, mozjpeg: true })
+                .toBuffer();
+            const dataUrl = `data:image/jpeg;base64,${upright.toString('base64')}`;
+            await pool.query(
+                'UPDATE portfolio_cards SET image_data = $2, thumb_data = $3 WHERE id = $1',
+                [id, dataUrl, await makeGridThumb(dataUrl)]);
+            turned++;
+        } catch (err) {
+            console.error(`  [Straighten] card ${id}:`, err.message);
+        }
+    }
+
+    await markRun(KEY, turned);
+    if (turned) console.log(`  [Migrate] Stood ${turned} card photo(s) back up`);
+}
+
+/**
  * Give every existing card its grid thumbnail.
  *
  * Reads the full photo once per card and writes back a small one. That read is
@@ -724,7 +783,69 @@ async function ensureDefaultUser() {
         await pool.query("INSERT INTO users (id, username, password_hash) VALUES (1, 'jack', $1) ON CONFLICT DO NOTHING", [hash]);
     }
 }
-initDB().then(() => ensureDefaultUser()).catch(err => console.error("DB Init Error:", err));
+initDB()
+    .then(() => ensureDefaultUser())
+    .then(() => settleArtworkInBackground())
+    .catch(err => console.error("DB Init Error:", err));
+
+/**
+ * Find the missing artwork without being asked.
+ *
+ * This used to be a button in Settings, which is the same as not existing: the
+ * collection sat there illustrated by crops of binder pages while the fix for
+ * it waited to be clicked. Nothing about it needs a human decision — a card
+ * either has a picture matched to its printed number or it does not — so it
+ * runs on its own after the migrations, once per boot.
+ *
+ * Deliberately unhurried and deliberately quiet. It walks one card at a time
+ * with a pause between, because the card databases are somebody else's service
+ * and a redeploy should not arrive as a burst; it stops at a fixed budget so a
+ * crash-looping deploy cannot turn into thousands of lookups; and it never
+ * touches a card that already has artwork settled on printed evidence, so each
+ * boot picks up where the last one stopped rather than starting again.
+ */
+const ARTWORK_BOOT_BUDGET = 400;
+const ARTWORK_BOOT_PAUSE_MS = 250;
+
+async function settleArtworkInBackground() {
+    if (process.env.SKIP_ARTWORK_SWEEP === '1') return;
+    setTimeout(async () => {
+        try {
+            const { rows } = await pool.query(`
+                SELECT id, card_name, card_name_en, card_set, set_code, card_number, language, image_url
+                FROM portfolio_cards
+                WHERE COALESCE(is_source_photo, 0) = 0
+                  AND (image_url IS NULL OR image_url = '' OR image_url LIKE '%undefined%'
+                       OR COALESCE(artwork_match, '') <> $1)
+                ORDER BY (image_url IS NULL OR image_url = '') DESC, id ASC
+                LIMIT $2
+            `, [MATCH_PRINTED, ARTWORK_BOOT_BUDGET]);
+
+            if (!rows.length) return;
+            console.log(`🖼️  Looking up artwork for ${rows.length} card(s) in the background…`);
+
+            let settled = 0;
+            for (const card of rows) {
+                try {
+                    const art = await resolveArtwork(card);
+                    if (art.url) {
+                        await updateCardImageUrl(card.id, art.url, art.match);
+                        settled++;
+                    }
+                } catch { /* a card we cannot settle keeps its own photo */ }
+                await new Promise(r => setTimeout(r, ARTWORK_BOOT_PAUSE_MS));
+            }
+
+            if (settled) {
+                invalidatePortfolioCache();
+                broadcast({ type: 'portfolio_updated' });
+            }
+            console.log(`🖼️  Artwork: settled ${settled} of ${rows.length}.`);
+        } catch (err) {
+            console.error('Artwork sweep error:', err.message);
+        }
+    }, 5000).unref?.();
+}
 
 // ── Portfolio DB helpers ──
 async function insertPortfolioCard(card, userId) {

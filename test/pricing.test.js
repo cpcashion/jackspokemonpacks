@@ -328,3 +328,46 @@ test('canonicalCondition tidies free text', () => {
     assert.equal(canonicalCondition('LIGHTLY PLAYED'), 'Lightly Played');
     assert.equal(canonicalCondition('whatever'), 'Unknown');
 });
+
+/**
+ * A price has to be about the card in hand.
+ *
+ * A common Crobat was being carried at five thousand dollars. Nothing was
+ * wrong with the arithmetic: the search could not be pinned to the printing,
+ * matched a graded lot instead, and every quote in the pool agreed with every
+ * other — so trimming outliers caught nothing, because the pool was not
+ * scattered, it was uniformly about the wrong object.
+ *
+ * What gives it away is three weak signals at once: no quote matched the
+ * printing, the printing was never confirmed, and nothing in the pool actually
+ * sold. Any one alone is survivable — a scarce card really can have no
+ * completed sales — but together there is nothing tying any listing to the card.
+ */
+const listing = (priceUsd, over = {}) => ({
+    price: priceUsd, currency: 'USD', marketplace: 'ebay', source: 'ebay',
+    variantMatched: false, basis: 'listings', thin: true, ...over,
+});
+
+test('a price with nothing tying it to the card is withheld, not published', async () => {
+    const quotes = [listing(5000), listing(5100), listing(4900)];
+    const out = await aggregateQuotes(quotes, { context: { verified: false } });
+    assert.equal(out, null, 'an agreed-upon number about the wrong object is still about the wrong object');
+});
+
+test('a confirmed printing still gets its price, however thin the evidence', async () => {
+    const quotes = [listing(5000), listing(5100)];
+    const out = await aggregateQuotes(quotes, { context: { verified: true } });
+    assert.ok(out && out.price > 0, 'a confirmed card is priced on what the market shows');
+});
+
+test('quotes that matched the printing are trusted even when unconfirmed', async () => {
+    const quotes = [listing(12, { variantMatched: true }), listing(13, { variantMatched: true })];
+    const out = await aggregateQuotes(quotes, { context: { verified: false } });
+    assert.ok(out && out.price > 0, 'matching the printing is the tie the guard looks for');
+});
+
+test('a completed sale is evidence even when the printing was not confirmed', async () => {
+    const quotes = [listing(20, { basis: 'market', thin: false }), listing(22, { basis: 'market', thin: false })];
+    const out = await aggregateQuotes(quotes, { context: { verified: false } });
+    assert.ok(out && out.price > 0, 'something actually sold, which ties the number to reality');
+});

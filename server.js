@@ -785,7 +785,7 @@ async function ensureDefaultUser() {
 }
 initDB()
     .then(() => ensureDefaultUser())
-    .then(() => settleArtworkInBackground())
+    .then(() => reconcileCollection())
     .catch(err => console.error("DB Init Error:", err));
 
 /**
@@ -806,10 +806,71 @@ initDB()
  */
 const ARTWORK_BOOT_BUDGET = 400;
 const ARTWORK_BOOT_PAUSE_MS = 250;
+const EXTRACT_BOOT_BUDGET = 40;
 
-async function settleArtworkInBackground() {
+/**
+ * Bring the collection to the state it is supposed to be in, unprompted.
+ *
+ * Every step below existed already, and every one of them was behind a button
+ * in Settings. That is the same as not existing: pages of cards sat unread,
+ * rows the old key bug had doubled sat uncollapsed, and cards sat illustrated
+ * by crops of binder pages, each with its fix one click away that nobody was
+ * ever going to click. None of it needs a human decision — a page either holds
+ * several cards or it does not, two rows are either the same printing or they
+ * are not — so none of it should have been asking for one.
+ *
+ * Ordered deliberately: read the pages first so the cards inside them exist,
+ * collapse duplicates next so artwork is not looked up several times for the
+ * same card, then illustrate what is left.
+ *
+ * Every phase is budgeted and resumable. Work already done is skipped by its
+ * own query, so each boot continues where the last one stopped rather than
+ * starting again, and a crash-looping deploy cannot turn into thousands of
+ * model calls.
+ */
+async function reconcileCollection() {
     if (process.env.SKIP_ARTWORK_SWEEP === '1') return;
     setTimeout(async () => {
+        const userId = DEFAULT_USER_ID;
+
+        // ── Pages of cards become cards ──────────────────────────────
+        // Only when there is something to read them with; without a model
+        // configured this is a no-op rather than an error.
+        if (geminiModel && !gridRescanRunning) {
+            gridRescanRunning = true;
+            try {
+                const { rows } = await pool.query(`
+                    SELECT id, image_data, COALESCE(is_source_photo, 0) AS was_flagged
+                    FROM portfolio_cards
+                    WHERE user_id = $1 AND source_extracted_at IS NULL AND source_photo_id IS NULL
+                      AND image_data IS NOT NULL AND image_data <> ''
+                    ORDER BY COALESCE(is_source_photo, 0) DESC, id ASC
+                    LIMIT $2
+                `, [userId, EXTRACT_BOOT_BUDGET]);
+                if (rows.length) {
+                    console.log(`🔍 Reading ${rows.length} unread photo(s) in the background…`);
+                    const r = await readSourcePhotos(userId, rows);
+                    console.log(`🔍 Photos: ${r.added} card(s) added, ${r.pagesFound} were pages.`);
+                }
+            } catch (err) {
+                console.error('Boot extraction error:', err.message);
+            } finally {
+                gridRescanRunning = false;
+            }
+        }
+
+        // ── One row per printing ─────────────────────────────────────
+        try {
+            const merged = await mergeDuplicateGroups(userId);
+            if (merged.removedRows) {
+                console.log(`🧹 Folded ${merged.removedRows} duplicate row(s) into ${merged.mergedGroups} card(s).`);
+                invalidatePortfolioCache();
+            }
+        } catch (err) {
+            console.error('Boot merge error:', err.message);
+        }
+
+        // ── A proper picture on every card ───────────────────────────
         try {
             const { rows } = await pool.query(`
                 SELECT id, card_name, card_name_en, card_set, set_code, card_number, language, image_url
@@ -821,29 +882,27 @@ async function settleArtworkInBackground() {
                 LIMIT $2
             `, [MATCH_PRINTED, ARTWORK_BOOT_BUDGET]);
 
-            if (!rows.length) return;
-            console.log(`🖼️  Looking up artwork for ${rows.length} card(s) in the background…`);
-
-            let settled = 0;
-            for (const card of rows) {
-                try {
-                    const art = await resolveArtwork(card);
-                    if (art.url) {
-                        await updateCardImageUrl(card.id, art.url, art.match);
-                        settled++;
-                    }
-                } catch { /* a card we cannot settle keeps its own photo */ }
-                await new Promise(r => setTimeout(r, ARTWORK_BOOT_PAUSE_MS));
+            if (rows.length) {
+                console.log(`🖼️  Looking up artwork for ${rows.length} card(s) in the background…`);
+                let settled = 0;
+                for (const card of rows) {
+                    try {
+                        const art = await resolveArtwork(card);
+                        if (art.url) {
+                            await updateCardImageUrl(card.id, art.url, art.match);
+                            settled++;
+                        }
+                    } catch { /* a card we cannot settle keeps its own photo */ }
+                    await new Promise(r => setTimeout(r, ARTWORK_BOOT_PAUSE_MS));
+                }
+                if (settled) invalidatePortfolioCache();
+                console.log(`🖼️  Artwork: settled ${settled} of ${rows.length}.`);
             }
-
-            if (settled) {
-                invalidatePortfolioCache();
-                broadcast({ type: 'portfolio_updated' });
-            }
-            console.log(`🖼️  Artwork: settled ${settled} of ${rows.length}.`);
         } catch (err) {
             console.error('Artwork sweep error:', err.message);
         }
+
+        broadcast({ type: 'portfolio_updated' });
     }, 5000).unref?.();
 }
 
@@ -3137,7 +3196,7 @@ const PRICE_SOURCE_LABELS = {
  * a spinner. The returned object carries the same information as `sources`, so
  * a caller that only wants the outcome does not have to listen.
  */
-async function lookupMarketPrice(card, { onSource, fresh = false, interactive = false } = {}) {
+async function lookupMarketPrice(card, { onSource, fresh = false, interactive = false, verified } = {}) {
     if (!card?.card_name) return null;
 
     const key = priceCacheKey(card);
@@ -3151,7 +3210,10 @@ async function lookupMarketPrice(card, { onSource, fresh = false, interactive = 
         return { ...rest, cached: true };
     }
 
-    const ctx = priceContextFor(card);
+    // Whether the printing was ever confirmed is evidence about the price,
+    // not just a label on it: a pool of listings that matched nothing, for a
+    // card nobody could place, is not about this card at all.
+    const ctx = { ...priceContextFor(card), verified };
     const nonEnglish = isNonEnglish(card.language);
     const langLabel = languageLabel(card.language);
 
@@ -3279,7 +3341,7 @@ async function lookupMarketPrice(card, { onSource, fresh = false, interactive = 
  * that explains it. Nobody is asked to confirm anything.
  */
 async function priceCard(card, { verified, why = '', answered = true, onSource, fresh = false, interactive = false } = {}) {
-    const market = await lookupMarketPrice(card, { onSource, fresh, interactive });
+    const market = await lookupMarketPrice(card, { onSource, fresh, interactive, verified });
     const price = Number(market?.price) || 0;
 
     // When there is no price the reason worth showing is why the lookup came
@@ -5451,6 +5513,119 @@ app.get('/api/portfolio/source-photos', requireAuth, async (req, res) => {
 });
 
 /**
+ * Read every card out of a batch of source photos.
+ *
+ * Lifted out of the endpoint so the same work can happen without anybody
+ * asking for it. A page of cards sitting unread is the app failing at its one
+ * job, and that is not a state to leave behind a button.
+ */
+async function readSourcePhotos(userId, rows) {
+    let added = 0;
+    let alreadyHeld = 0;
+    let cardsSeen = 0;
+    let restored = 0;
+    let confirmedSingle = 0;
+    let pagesFound = 0;
+    let unreadable = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        broadcast({
+            type: 'extract_progress',
+            done: i, total: rows.length, added, cardsSeen,
+            message: `Reading photo ${i + 1} of ${rows.length}`,
+        });
+
+        try {
+            const buffer = dataUrlToBuffer(row.image_data);
+            if (!buffer) { unreadable++; continue; }
+
+            const vision = await analyzeImageBuffer(buffer, 'image/jpeg');
+            if (!vision?.ok) { unreadable++; continue; }
+
+            let cards = (vision.analysis?.cards || []).filter(c => hasMeaningfulCardName(c.card_name));
+            if (!cards.length) { unreadable++; continue; }
+
+            // One card means this row is a card. If the shape test had
+            // condemned it, that was a wrong guess and it comes back
+            // into the collection; if it had never been flagged, this
+            // is simply an ordinary card confirming what it already
+            // was. Either way it is stamped, so it is never re-read.
+            if (cards.length === 1) {
+                await pool.query(
+                    'UPDATE portfolio_cards SET is_source_photo = 0, source_cards_found = 1, source_extracted_at = NOW() WHERE id = $1',
+                    [row.id]);
+                if (row.was_flagged) restored++; else confirmedSingle++;
+                continue;
+            }
+
+            // Weakly-read cards get a second look at the crop, which is
+            // the only way a card number in small type survives being
+            // one twentieth of a frame.
+            const refined = await refineWeakCards(buffer, cards, 'image/jpeg');
+            cards = refined.cards;
+            cardsSeen += cards.length;
+
+            broadcastActivity('info', `Photo ${i + 1}: ${cards.length} cards found — adding them.`);
+
+            for (const rawCard of cards) {
+                if (!hasMeaningfulCardName(rawCard.card_name)) continue;
+
+                const { verified, why, answered } = await verifyWithReason(rawCard);
+                const card = verified || { ...rawCard, needs_review: true };
+
+                const existing = await findCardByVariant(storedVariantKey(card), userId);
+                if (existing) { alreadyHeld++; continue; }
+
+                const crop = await cropCardThumbnail(buffer, rawCard.box_2d, { rotation: rawCard.rotation });
+                const saved = await saveScannedCard(card, {
+                    userId: userId,
+                    thumbDataUrl: crop || '',
+                    needsReview: !verified,
+                    unverifiedReason: why,
+                    databasesAnswered: answered,
+                    forceSeparate: true,
+                });
+                if (saved?.id) {
+                    await pool.query(
+                        'UPDATE portfolio_cards SET source_photo_id = $2 WHERE id = $1', [saved.id, row.id]);
+                }
+                added++;
+                broadcastActivity('card_added_detail', `➕ ${card.card_name}`, saved);
+            }
+
+            // Several cards means this row is a page, whatever its shape
+            // suggested. Marking it here is what takes it off the grid;
+            // without this the page stayed on display next to every
+            // card just read out of it.
+            await pool.query(
+                'UPDATE portfolio_cards SET is_source_photo = 1, source_cards_found = $2, source_extracted_at = NOW() WHERE id = $1',
+                [row.id, cards.length]);
+            pagesFound++;
+        } catch (err) {
+            console.error(`  [Extract] photo ${row.id}:`, err.message);
+            unreadable++;
+        }
+
+        broadcast({ type: 'portfolio_updated' });
+    }
+
+    const parts = [];
+    if (pagesFound) parts.push(`${pagesFound} were pages of several cards`);
+    if (added) parts.push(`${added} card${added === 1 ? '' : 's'} added`);
+    if (alreadyHeld) parts.push(`${alreadyHeld} already in the collection`);
+    if (restored) parts.push(`${restored} turned out to be single cards and went back`);
+    if (confirmedSingle) parts.push(`${confirmedSingle} confirmed as single cards`);
+    if (unreadable) parts.push(`${unreadable} could not be read`);
+    broadcastActivity('extract_complete',
+        parts.length
+            ? `Read ${rows.length} photo${rows.length === 1 ? '' : 's'}: ${parts.join(', ')}.`
+            : 'Nothing new was found in those photos.');
+    broadcast({ type: 'portfolio_updated' });
+    return { added, alreadyHeld, cardsSeen, restored, confirmedSingle, pagesFound, unreadable };
+}
+
+/**
  * Read every card out of every source photo.
  *
  * This is the job the original uploads were for: a picture of a shelf goes in,
@@ -5536,110 +5711,8 @@ app.post('/api/portfolio/extract-source-photos', requireAuth, async (req, res) =
                 : 'Every photo has already been read.',
         });
 
-        (async () => {
-            let added = 0;
-            let alreadyHeld = 0;
-            let cardsSeen = 0;
-            let restored = 0;
-            let confirmedSingle = 0;
-            let pagesFound = 0;
-            let unreadable = 0;
-
-            for (let i = 0; i < rows.length; i++) {
-                const row = rows[i];
-                broadcast({
-                    type: 'extract_progress',
-                    done: i, total: rows.length, added, cardsSeen,
-                    message: `Reading photo ${i + 1} of ${rows.length}`,
-                });
-
-                try {
-                    const buffer = dataUrlToBuffer(row.image_data);
-                    if (!buffer) { unreadable++; continue; }
-
-                    const vision = await analyzeImageBuffer(buffer, 'image/jpeg');
-                    if (!vision?.ok) { unreadable++; continue; }
-
-                    let cards = (vision.analysis?.cards || []).filter(c => hasMeaningfulCardName(c.card_name));
-                    if (!cards.length) { unreadable++; continue; }
-
-                    // One card means this row is a card. If the shape test had
-                    // condemned it, that was a wrong guess and it comes back
-                    // into the collection; if it had never been flagged, this
-                    // is simply an ordinary card confirming what it already
-                    // was. Either way it is stamped, so it is never re-read.
-                    if (cards.length === 1) {
-                        await pool.query(
-                            'UPDATE portfolio_cards SET is_source_photo = 0, source_cards_found = 1, source_extracted_at = NOW() WHERE id = $1',
-                            [row.id]);
-                        if (row.was_flagged) restored++; else confirmedSingle++;
-                        continue;
-                    }
-
-                    // Weakly-read cards get a second look at the crop, which is
-                    // the only way a card number in small type survives being
-                    // one twentieth of a frame.
-                    const refined = await refineWeakCards(buffer, cards, 'image/jpeg');
-                    cards = refined.cards;
-                    cardsSeen += cards.length;
-
-                    broadcastActivity('info', `Photo ${i + 1}: ${cards.length} cards found — adding them.`);
-
-                    for (const rawCard of cards) {
-                        if (!hasMeaningfulCardName(rawCard.card_name)) continue;
-
-                        const { verified, why, answered } = await verifyWithReason(rawCard);
-                        const card = verified || { ...rawCard, needs_review: true };
-
-                        const existing = await findCardByVariant(storedVariantKey(card), req.user.id);
-                        if (existing) { alreadyHeld++; continue; }
-
-                        const crop = await cropCardThumbnail(buffer, rawCard.box_2d, { rotation: rawCard.rotation });
-                        const saved = await saveScannedCard(card, {
-                            userId: req.user.id,
-                            thumbDataUrl: crop || '',
-                            needsReview: !verified,
-                            unverifiedReason: why,
-                            databasesAnswered: answered,
-                            forceSeparate: true,
-                        });
-                        if (saved?.id) {
-                            await pool.query(
-                                'UPDATE portfolio_cards SET source_photo_id = $2 WHERE id = $1', [saved.id, row.id]);
-                        }
-                        added++;
-                        broadcastActivity('card_added_detail', `➕ ${card.card_name}`, saved);
-                    }
-
-                    // Several cards means this row is a page, whatever its shape
-                    // suggested. Marking it here is what takes it off the grid;
-                    // without this the page stayed on display next to every
-                    // card just read out of it.
-                    await pool.query(
-                        'UPDATE portfolio_cards SET is_source_photo = 1, source_cards_found = $2, source_extracted_at = NOW() WHERE id = $1',
-                        [row.id, cards.length]);
-                    pagesFound++;
-                } catch (err) {
-                    console.error(`  [Extract] photo ${row.id}:`, err.message);
-                    unreadable++;
-                }
-
-                broadcast({ type: 'portfolio_updated' });
-            }
-
-            const parts = [];
-            if (pagesFound) parts.push(`${pagesFound} were pages of several cards`);
-            if (added) parts.push(`${added} card${added === 1 ? '' : 's'} added`);
-            if (alreadyHeld) parts.push(`${alreadyHeld} already in the collection`);
-            if (restored) parts.push(`${restored} turned out to be single cards and went back`);
-            if (confirmedSingle) parts.push(`${confirmedSingle} confirmed as single cards`);
-            if (unreadable) parts.push(`${unreadable} could not be read`);
-            broadcastActivity('extract_complete',
-                parts.length
-                    ? `Read ${rows.length} photo${rows.length === 1 ? '' : 's'}: ${parts.join(', ')}.`
-                    : 'Nothing new was found in those photos.');
-            broadcast({ type: 'portfolio_updated' });
-        })().catch(err => console.error('Extraction error:', err))
+        readSourcePhotos(req.user.id, rows)
+            .catch(err => console.error('Extraction error:', err))
             .finally(() => { gridRescanRunning = false; });
     } catch (err) {
         gridRescanRunning = false;
